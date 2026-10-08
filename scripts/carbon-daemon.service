@@ -1,0 +1,15 @@
+# systemd user unit for the carbon daemon: `systemctl --user enable --now carbon-daemon`.
+# Copy to ~/.config/systemd/user/ and adjust ExecStart to where carbon is installed.
+[Unit]
+Description=carbon inference daemon (supervises one carbon serve)
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/carbon daemon --port 1900
+# the serve outlives daemon restarts and is re-adopted; stop it explicitly with `carbon daemon stop`
+KillMode=process
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

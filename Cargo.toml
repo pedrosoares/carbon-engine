@@ -1,0 +1,66 @@
+[package]
+name = "carbon-engine"
+version = "0.1.0"
+edition = "2021"
+authors = ["Carbonis Fundatus", "Pedro Augusto da Silva Soares"]
+license = "Apache-2.0"
+description = "Multi-GPU, multi-machine LLM / MoE inference engine with OpenAI and Anthropic compatible APIs"
+default-run = "carbon"
+
+[[bin]]
+name = "carbon"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+nccl = ["cuda", "candle-core/nccl", "dep:cudarc"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+
+[dependencies]
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+anyhow = "1"
+async-stream = "0.3"
+axum = "0.8"
+bincode = "1.3"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+clap = { version = "4", features = ["derive", "env"] }
+cudarc = { version = "0.19.8", optional = true, default-features = false, features = ["std", "driver", "nccl", "f16", "cuda-version-from-build-system", "dynamic-linking"] }
+futures = "0.3"
+float8 = "0.7"
+half = "2"
+libc = "0.2"
+memmap2 = "0.9"
+minijinja = { version = "2", features = ["loader", "json", "preserve_order"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+parking_lot = "0.12"
+rayon = "1"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+thiserror = "2"
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = { version = "2", features = ["json"] }
+uuid = { version = "1", features = ["v4", "v5"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
