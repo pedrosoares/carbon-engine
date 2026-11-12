@@ -243,6 +243,11 @@ element-wise ops 17%. After it (5.9 s): GEMMs 66%, recurrence 12%, attention 8%,
   loads and staging the tokens in shared memory all measured the same or worse; the kernel
   runs at about 0.3 instructions per cycle per SM and I have not found what bounds it.
 - The 250k cold prefill is 204 s: about half attention (n^2), half the linear part.
+- Int8 KV against bf16 KV, first measurement: the greedy next token after 250 growing prefixes
+  (600 characters apart, up to 44.5k tokens of this repository's README, PLAN and model code)
+  is the same for 245 (98.0%); the 5 differences are whitespace / punctuation / identifier
+  choices in code. No logit-level comparison yet (the server has no logprobs output), and a
+  planted fact is recalled at 6k and 60k tokens with int8 KV.
 - `scripts/cuda_kernels_host_test.cpp` no longer compiles (it lacks shims for what `quant.cu`
   gained on this branch: shared memory, shuffles); the GDN and attention host tests run.
 
@@ -298,7 +303,8 @@ element-wise ops 17%. After it (5.9 s): GEMMs 66%, recurrence 12%, attention 8%,
    of the linear part and far from the hardware's rate.
 2. Decode at depth: int8 MMA in the attention kernels instead of converting to half precision;
    device-side slot tables kept across steps (append-only) instead of rebuilt per step.
-3. Int8 KV quality check against bf16 KV (logit-level), and `--kv-dtype auto`.
+3. Int8 KV: a logit-level comparison with bf16 KV (needs logprobs output; next-token agreement
+   is 98.0% over 250 prefixes), and `--kv-dtype auto`.
 4. KV / state auto-sizing: room for prefill temporaries, single-user defaults for long windows.
 5. Plain decode (66 vs 73): fuse norm + prep and SiLU * up into kernel epilogues.
 4. Phase 6 sweep and README; phase 7 image input.

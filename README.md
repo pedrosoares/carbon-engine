@@ -244,8 +244,10 @@ layers' value heads in a tiled order). The `mmproj` image tower is not loaded ye
   for its six query heads; on pools of 131,072 slots or more a verify step's rows also share one
   pass (`CARBON_ATTN_ROWS_MIN`).
 - **`--kv-dtype q8`** keeps each key / value vector as 256 int8 values and an f32 scale: half
-  the memory and attention traffic of bf16. It is lossy (the text of a greedy run drifts from
-  the bf16 run after a few sentences) and has not been evaluated for quality beyond that.
+  the memory and attention traffic of bf16. It is lossy: the text of a greedy run drifts from
+  the bf16 run after a few sentences, and the greedy next token agrees with the bf16 cache on
+  245 of 250 prefixes of a 44k-token text (`scripts/next_token_agreement.py`). No benchmark-level
+  quality evaluation has been done.
 - **Prefix reuse**: recurrent state is snapshotted at every prefill chunk boundary, so a prompt
   that shares a long beginning with an earlier one resumes from the last boundary inside it.
 
