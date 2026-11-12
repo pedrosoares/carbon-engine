@@ -66,27 +66,38 @@ __device__ __forceinline__ u32 tc_int(int v) {
 template <>
 __device__ __forceinline__ u32 tc_int<ABF16>(int v) { return (u32)__float_as_int((float)v) >> 16; }
 
-// Elements e .. e + 3 of pool vector `vec` in A's dtype. Int8 pools give the raw codes (the
-// caller applies the vector's scale, `tc_pool_scale`, to whatever the codes are multiplied into).
-template <class A, bool Q8>
-__device__ __forceinline__ void tc_pool_quad(const u16* pool, long vec, int D, int e, u32* x) {
-    if (!Q8) {
-        u32 a = *(const u32*)(pool + vec * D + e), b = *(const u32*)(pool + vec * D + e + 2);
-        x[0] = a & 0xffffu;
-        x[1] = a >> 16;
-        x[2] = b & 0xffffu;
-        x[3] = b >> 16;
-        return;
+// Elements e .. e + 3 of pool vector `vec` (slot * KVH + kv head) in A's dtype; int8 pools give
+// the raw codes (the caller applies the vector's scale, `tc_pool_scale`, to whatever the codes
+// are multiplied into). Done in two steps, so a thread can issue all its loads before it converts any of them
+// (a load-convert-store loop waits a cache round trip per item): the raw words of elements
+// e .. e + 3, then their values in A's dtype.
+template <bool Q8>
+__device__ __forceinline__ void tc_pool_raw(const u16* pool, long vec, int D, int e, u32* w) {
+    if (Q8) {
+        w[0] = *(const u32*)((const signed char*)pool + vec * (D + Q8_PAD) + e);
+    } else {
+        w[0] = *(const u32*)(pool + vec * D + e);
+        w[1] = *(const u32*)(pool + vec * D + e + 2);
     }
-    u32 w = *(const u32*)((const signed char*)pool + vec * (D + Q8_PAD) + e);
+}
+template <class A, bool Q8>
+__device__ __forceinline__ void tc_pool_cvt(const u32* w, u32* x) {
+    if (Q8) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i) x[i] = tc_int<A>((int)(signed char)(w >> (8 * i)));
+        for (int i = 0; i < 4; ++i) x[i] = tc_int<A>((int)(signed char)(w[0] >> (8 * i)));
+    } else {
+        x[0] = w[0] & 0xffffu;
+        x[1] = w[0] >> 16;
+        x[2] = w[1] & 0xffffu;
+        x[3] = w[1] >> 16;
+    }
 }
 template <bool Q8>
 __device__ __forceinline__ float tc_pool_scale(const u16* pool, long vec, int D) {
     return Q8 ? *(const float*)((const signed char*)pool + vec * (D + Q8_PAD) + D) : 1.0f;
 }
 
+#define TC_SB 8   // staging items a thread loads before converting them
 #define TC_RV 40  // u16 per row of the transposed V tile: 20 words, conflict-free fragment loads
 
 // One block per (64-query tile, HB heads of one KV head); 4 warps of 16 query rows per head.
@@ -144,24 +155,60 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
     for (unsigned k0 = 0; k0 < kv_end; k0 += TC_BK) {
         int nk = min(kv_end - k0, (unsigned)TC_BK);
         __syncthreads();
-        // K: (key row, 4 dims) per item, lanes on consecutive dims
-        for (int i = threadIdx.x; i < TC_BK * (D / 4); i += blockDim.x) {
-            int row = i / (D / 4), c4 = i % (D / 4);
-            u32 x[4] = {0u, 0u, 0u, 0u};
-            if (row < nk) tc_pool_quad<A, Q8>(kc, (long)slots[s_start + k0 + row] * KVH + kvh, D, 4 * c4, x);
-            u32* dst = (u32*)(sk + row * RSK + 4 * c4);
-            dst[0] = x[0] | (x[1] << 16);
-            dst[1] = x[2] | (x[3] << 16);
-        }
-        // V: (key pair, 4 dims) per item, lanes on the 16 key pairs: word (dim, pair) of the tile
-        for (int i = threadIdx.x; i < (TC_BK / 2) * (DO / 4); i += blockDim.x) {
-            int rp = i % (TC_BK / 2), c4 = i / (TC_BK / 2);
-            u32 x[4] = {0u, 0u, 0u, 0u}, y[4] = {0u, 0u, 0u, 0u};
-            if (2 * rp < nk) tc_pool_quad<A, Q8>(vc, (long)slots[s_start + k0 + 2 * rp] * KVH + kvh, D, 4 * c4, x);
-            if (2 * rp + 1 < nk)
-                tc_pool_quad<A, Q8>(vc, (long)slots[s_start + k0 + 2 * rp + 1] * KVH + kvh, D, 4 * c4, y);
+        // K: (key row, 4 dims) per item, lanes on consecutive dims; V: (key pair, 4 dims) per
+        // item, lanes on the 16 key pairs: word (dim, pair) of the transposed tile. Batches of
+        // TC_SB items: every load of a batch is issued before the first conversion.
+        for (int base = threadIdx.x; base < TC_BK * (D / 4); base += TC_SB * blockDim.x) {
+            u32 w[TC_SB][Q8 ? 1 : 2], sl[TC_SB];
 #pragma unroll
-            for (int e = 0; e < 4; ++e) *(u32*)(sv + (4 * c4 + e) * TC_RV + 2 * rp) = x[e] | (y[e] << 16);
+            for (int it = 0; it < TC_SB; ++it) {
+                int i = base + it * blockDim.x, row = i / (D / 4);
+                sl[it] = (i < TC_BK * (D / 4) && row < nk) ? slots[s_start + k0 + row] : 0xffffffffu;
+            }
+#pragma unroll
+            for (int it = 0; it < TC_SB; ++it) {
+                int c4 = (base + it * blockDim.x) % (D / 4);
+                w[it][0] = 0u;
+                if (!Q8) w[it][1] = 0u;
+                if (sl[it] != 0xffffffffu) tc_pool_raw<Q8>(kc, (long)sl[it] * KVH + kvh, D, 4 * c4, w[it]);
+            }
+#pragma unroll
+            for (int it = 0; it < TC_SB; ++it) {
+                int i = base + it * blockDim.x, row = i / (D / 4), c4 = i % (D / 4);
+                if (i < TC_BK * (D / 4)) {
+                    u32 x[4];
+                    tc_pool_cvt<A, Q8>(w[it], x);
+                    u32* dst = (u32*)(sk + row * RSK + 4 * c4);
+                    dst[0] = x[0] | (x[1] << 16);
+                    dst[1] = x[2] | (x[3] << 16);
+                }
+            }
+        }
+        for (int base = threadIdx.x; base < (TC_BK / 2) * (DO / 4); base += (TC_SB / 2) * blockDim.x) {
+            // a thread's items share their key pair: two slots
+            const int r2 = 2 * (base % (TC_BK / 2));
+            const u32 sl[2] = {r2 < nk ? slots[s_start + k0 + r2] : 0xffffffffu,
+                               r2 + 1 < nk ? slots[s_start + k0 + r2 + 1] : 0xffffffffu};
+            u32 w[TC_SB][Q8 ? 1 : 2];
+#pragma unroll
+            for (int it = 0; it < TC_SB; ++it) {
+                int i = base + (it / 2) * blockDim.x, c4 = i / (TC_BK / 2);
+                w[it][0] = 0u;
+                if (!Q8) w[it][1] = 0u;
+                if (i < (TC_BK / 2) * (DO / 4) && sl[it & 1] != 0xffffffffu)
+                    tc_pool_raw<Q8>(vc, (long)sl[it & 1] * KVH + kvh, D, 4 * c4, w[it]);
+            }
+#pragma unroll
+            for (int it = 0; it < TC_SB; it += 2) {
+                int i = base + (it / 2) * blockDim.x, rp = i % (TC_BK / 2), c4 = i / (TC_BK / 2);
+                if (i < (TC_BK / 2) * (DO / 4)) {
+                    u32 x[4], y[4];
+                    tc_pool_cvt<A, Q8>(w[it], x);
+                    tc_pool_cvt<A, Q8>(w[it + 1], y);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) *(u32*)(sv + (4 * c4 + e) * TC_RV + 2 * rp) = x[e] | (y[e] << 16);
+                }
+            }
         }
         if (Q8 && threadIdx.x < TC_BK) {
             bool in = (int)threadIdx.x < nk;

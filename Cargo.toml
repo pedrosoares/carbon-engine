@@ -19,6 +19,10 @@ required-features = ["cuda"]
 name = "gdnbench"
 required-features = ["cuda"]
 
+[[example]]
+name = "attnbench"
+required-features = ["cuda"]
+
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
