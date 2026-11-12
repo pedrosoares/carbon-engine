@@ -698,24 +698,31 @@ pub fn kquant_tc_enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("CARBON_KQ_TC").is_ok_and(|v| v == "0") && kq_tc_ptx().is_ok())
 }
 
-/// Whether `t` rows of activations times an `n`-row weight go to the tensor-core GEMM instead of
-/// the per-row dp4a kernel. The GEMM's cost barely grows with `t`, but a warp walks its 16 rows'
-/// columns serially (small weights finish sooner on dp4a) and Q6_K needs four times the MMAs of
-/// Q4_K, so it only pays from 4 rows there. `CARBON_KQ_TC_MIN=a,b` sets the two thresholds.
-pub fn kquant_use_tc(kind: crate::gguf::KKind, n: usize, t: usize) -> bool {
-    static MIN: OnceLock<(usize, usize)> = OnceLock::new();
-    let (q4, q6) = *MIN.get_or_init(|| {
-        let v: Vec<usize> = std::env::var("CARBON_KQ_TC_MIN")
-            .ok()
-            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
-            .unwrap_or_default();
-        (v.first().copied().unwrap_or(2), v.get(1).copied().unwrap_or(2))
-    });
-    let min = match kind {
-        crate::gguf::KKind::Q4K => q4,
-        crate::gguf::KKind::Q6K => q6,
+static KQ_MULTI_TOKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tell the K-quant kernels whether decode steps of several tokens are expected (speculative
+/// decoding). Set once, before the first step: see [`kquant_use_tc`].
+pub fn kquant_expect_multi_token(on: bool) {
+    KQ_MULTI_TOKEN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether an `n`-row weight uses the tensor-core GEMM instead of the per-row dp4a kernel.
+/// The choice must not depend on the number of token rows: the two kernels add a row's terms
+/// in different orders, and a multi-token verify step has to reproduce exactly what
+/// single-token steps compute. So it follows the engine's mode: with speculative decoding most
+/// steps carry several tokens, which the GEMM takes at about the cost of one (dp4a's cost grows
+/// with every row); without it dp4a is about 10% faster. A warp of the GEMM walks its 16 weight
+/// rows' columns serially, so small weights stay on dp4a either way.
+/// `CARBON_KQ_TC_ROWS=N` sets the smallest weight (rows) for the GEMM regardless of the mode.
+pub fn kquant_use_tc(_kind: crate::gguf::KKind, n: usize, _t: usize) -> bool {
+    static MIN: OnceLock<Option<usize>> = OnceLock::new();
+    let forced = *MIN.get_or_init(|| std::env::var("CARBON_KQ_TC_ROWS").ok().and_then(|v| v.parse().ok()));
+    let min = match forced {
+        Some(m) => m,
+        None if KQ_MULTI_TOKEN.load(std::sync::atomic::Ordering::Relaxed) => 4096,
+        None => return false,
     };
-    (n >= 4096 || n * 256 >= 16 * 1024 * 1024) && t >= min && kquant_tc_enabled()
+    n >= min && kquant_tc_enabled()
 }
 
 /// Activations `x [T <= 8, cols]` quantized to 8 bits per 32 inputs, for [`kquant_gemv_prepared`].
@@ -733,6 +740,95 @@ pub fn kquant_gemv_prepared(prep: &Tensor, q: &crate::gguf::KQuant, dtype: DType
 pub fn kquant_exact() -> bool {
     static EXACT: OnceLock<bool> = OnceLock::new();
     *EXACT.get_or_init(|| std::env::var("CARBON_KQ_EXACT").is_ok_and(|v| v == "1"))
+}
+
+struct KqMulti<'a> {
+    weights: &'a [&'a crate::gguf::KQuant],
+    dtype: DType,
+    tc: bool,
+}
+
+impl candle_core::CustomOp1 for KqMulti<'_> {
+    fn name(&self) -> &'static str {
+        "carbon-kquant-multi"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, p: &CudaStorage, pl: &Layout) -> CResult<(CudaStorage, Shape)> {
+        let (t, stride) = pl.shape().dims2()?;
+        let ws = self.weights;
+        if ws.is_empty() || ws.len() > 4 || t > MAX_GEMV_ROWS {
+            candle_core::bail!("kquant multi: {} weights, {t} rows", ws.len());
+        }
+        let k = ws[0].cols;
+        if stride != kq_prep_stride(k) || ws.iter().any(|q| q.cols != k) {
+            candle_core::bail!("kquant multi: the weights do not share their input width");
+        }
+        let sides = ws.iter().map(|q| Side::new(&q.data, "weight")).collect::<CResult<Vec<_>>>()?;
+        for (q, side) in ws.iter().zip(&sides) {
+            if side.len() != q.rows * (k / 256) * q.kind.block_bytes() {
+                candle_core::bail!("kquant multi: weight size does not match its shape");
+            }
+        }
+        let views = sides.iter().map(|s| s.view::<u8>()).collect::<CResult<Vec<_>>>()?;
+        let dev = p.device().clone();
+        let sfx = suffix(self.dtype)?;
+        let f = if self.tc {
+            dev.get_or_load_custom_func(&format!("kq_gemm_tc_multi_{sfx}"), "carbon_kq_tc", kq_tc_ptx()?)?
+        } else {
+            kernel!(dev, format!("kq_gemv_i8_multi_{sfx}"))
+        };
+        let pv = view::<f32>(p, pl)?;
+        let mut n = [0i32; 4];
+        let mut kinds = 0i32;
+        for (i, q) in ws.iter().enumerate() {
+            n[i] = q.rows as i32;
+            kinds |= (q.kind as i32) << (4 * i);
+        }
+        let total: usize = ws.iter().map(|q| q.rows).sum();
+        let warps: usize = if self.tc { ws.iter().map(|q| q.rows.div_ceil(16)).sum() } else { total };
+        let cfg = LaunchConfig {
+            grid_dim: (warps.div_ceil(4) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k32, t32) = (k as i32, t as i32);
+        let out = with_out!(dev, self.dtype, t * total, |out| {
+            let mut b = f.builder();
+            // unused weight slots repeat the first pointer (their row count is 0)
+            for i in 0..4 {
+                b.arg(&views[i.min(views.len() - 1)]);
+            }
+            b.arg(&pv);
+            b.arg(&out);
+            b.arg(&n[0]);
+            b.arg(&n[1]);
+            b.arg(&n[2]);
+            b.arg(&n[3]);
+            b.arg(&kinds);
+            b.arg(&k32);
+            b.arg(&t32);
+            unsafe { b.launch(cfg) }.w()?;
+        });
+        Ok((out, Shape::from(t * total)))
+    }
+}
+
+/// Up to 4 packed K-quant weights times the same prepared activations, in one launch:
+/// `[T, rows]` per weight. A decode step otherwise pays each launch's ramp-up and tail.
+pub fn kquant_gemv_multi(prep: &Tensor, ws: &[&crate::gguf::KQuant], dtype: DType) -> CResult<Vec<Tensor>> {
+    let t = prep.dim(0)?;
+    // one kernel for the group whatever the number of rows (see `kquant_use_tc`)
+    let tc = ws.iter().any(|q| kquant_use_tc(q.kind, q.rows, t));
+    let flat = prep.apply_op1_no_bwd(&KqMulti { weights: ws, dtype, tc })?;
+    let mut out = Vec::with_capacity(ws.len());
+    let mut before = 0;
+    for q in ws {
+        out.push(flat.narrow(0, t * before, t * q.rows)?.reshape((t, q.rows))?);
+        before += q.rows;
+    }
+    Ok(out)
 }
 
 /// A packed K-quant weight times prepared activations ([`kquant_prep`]), on the kernel that
@@ -2051,11 +2147,12 @@ impl candle_core::CustomOp1 for GdnDecode<'_> {
                 bld.arg(&l.eps);
                 let gs = i32::from(l.gate_sigmoid) | (i32::from(l.v_tiled) << 1);
                 bld.arg(&gs);
-                // up to 8 threads per state column (GDN_MAX_PARTS, GDN_PART_ROWS in gdn.cu)
+                // several threads per state column (GDN_MAX_PARTS, GDN_PART_ROWS in gdn.cu); blocks
+                // of 1024 threads exceed the register budget of a launch
                 let jw = dv.div_ceil(32) * 32;
-                let parts = [8usize, 4, 2]
+                let parts = [4usize, 2]
                     .into_iter()
-                    .find(|&p| p * jw <= 1024 && dk.is_multiple_of(p) && dk / p <= 32)
+                    .find(|&p| p * jw <= 512 && dk.is_multiple_of(p) && dk / p <= 32)
                     .unwrap_or(1);
                 let cfg = LaunchConfig {
                     grid_dim: ((b * hv) as u32, 1, 1),

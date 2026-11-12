@@ -61,5 +61,31 @@ fn main() -> anyhow::Result<()> {
             println!("{line}");
         }
     }
+    // the model's pattern: many 50 MB weights one after the other, each its own launch
+    let mats: Vec<KQuant> = (0..60)
+        .map(|_| match weight(KKind::Q4K, 17408, 5120, &dev) {
+            Ok(QLinear::KQuant(q)) => Ok(q),
+            Ok(_) => unreachable!(),
+            Err(e) => Err(e),
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let gb = mats.iter().map(|q| q.data.elem_count()).sum::<usize>() as f64 / 1e9;
+    for t in [1usize, 3] {
+        let x = Tensor::rand(-1f32, 1.0, (t, 5120), &dev)?.to_dtype(DType::BF16)?;
+        let prep = k::kquant_prep(&x)?;
+        for tc in [false, true] {
+            let mut y = None;
+            let t0 = Instant::now();
+            let n = 20;
+            for _ in 0..n {
+                for q in &mats {
+                    y = Some(if tc { k::kquant_gemm_tc(&prep, q, DType::BF16)? } else { k::kquant_gemv_prepared(&prep, q, DType::BF16)? });
+                }
+            }
+            y.unwrap().to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()?;
+            let dt = t0.elapsed().as_secs_f64() / n as f64;
+            println!("60 x q4_k 17408x5120 in sequence  T={t}  {}  {:7.3} ms  {:6.0} GB/s", if tc { "tc  " } else { "dp4a" }, dt * 1e3, gb / dt);
+        }
+    }
     Ok(())
 }

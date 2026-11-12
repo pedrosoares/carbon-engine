@@ -104,9 +104,9 @@ code / math / json). RTX 5090, LM Studio runtime llama.cpp 2.71.
 |---|---|---|---|---|---|
 | LM Studio, no MTP | 73.1 | 72.9 | 72.7 | 72.6 | 72.8 |
 | LM Studio, MTP | 87.5 | 113.6 | 117.8 | 180.6 | 124.9 |
-| carbon, no MTP | 61.3 | 61.1 | 61.0 | 60.9 | 61.1 |
-| carbon, `--mtp --mtp-drafts 2` | 73.9 | 103.5 | 103.8 | 113.0 | 98.6 |
-| carbon, `--mtp --mtp-drafts 4 --mtp-min-prob 0.75` | 75.5 | 108.1 | 108.8 | 126.5 | 104.7 |
+| carbon, no MTP | 65.6 | 65.4 | 65.3 | 65.1 | 65.3 |
+| carbon, `--mtp --mtp-drafts 2` | 85.0 | 125.7 | 120.9 | 139.1 | 117.7 |
+| carbon, `--mtp --mtp-drafts 5 --mtp-min-prob 0.75` | 85.9 | 137.4 | 136.2 | 165.1 | 131.2 |
 
 At depth (mean of the four prompts; carbon with bf16 KV and 4 drafts, `--kv-tokens 70000`):
 
@@ -117,8 +117,10 @@ At depth (mean of the four prompts; carbon with bf16 KV and 4 drafts, `--kv-toke
 | carbon, MTP | 82.5 | 68.1 | not run | does not fit yet | does not fit yet |
 | carbon, no MTP | 54.4 | | about 39 (before a latency fix) | | |
 
-carbon does not beat LM Studio yet. It is 16% behind without MTP and 16% behind with it
-(30% on JSON), and its time to first token on long prompts is 2-3x longer.
+With MTP carbon is now ahead of LM Studio on the mean (+5%), on code (+21%) and math (+16%),
+and behind on story (-2%) and JSON (-9%). Without MTP it is 10% behind. The depth table below
+predates the last round of decode work (carbon rows not re-measured), and time to first token
+on long prompts is still 2-3x longer than LM Studio's.
 
 ### Phase 3: decode speed (in progress)
 
@@ -142,7 +144,23 @@ carbon does not beat LM Studio yet. It is 16% behind without MTP and 16% behind 
   model). `CARBON_KQ_TC_MIN=a,b` moves the thresholds, `CARBON_KQ_EXACT=1` selects the float
   reference kernel.
 
-### Phase 4: MTP (working, not yet ahead)
+### Phase 3/4 update: launch fusion, one-launch GDN chains, exact verify steps
+
+- Projections that share an input (gate + up, q/k/v, qkv/z/a/b) run in one launch
+  (`kq_gemv_i8_multi`, `kq_gemm_tc_multi`): plain decode 61 -> 65 tok/s. Sixty 50 MB weights
+  launched one by one read at 1.30 TB/s against 1.48 as one weight.
+- Multi-token steps: the GDN kernels walk a sequence's tokens inside one launch (state in
+  registers, each token's state written to its own slot), instead of one launch per token with
+  state copies between spare slots.
+- The dp4a and tensor-core kernels add a row's terms in different orders, so mixing them by
+  token count made MTP output drift from plain decoding at near-ties. The kernel now follows
+  the engine mode (tensor-core with `--mtp`, dp4a without; `CARBON_KQ_TC_ROWS` overrides).
+  With that, `--mtp` output is identical to plain greedy decoding on three 400-token prompts
+  (2 and 5 drafts). Summing in f64 would also fix it but made steps 2.5x slower.
+- A 3-token verify step now costs 17.9 ms (plain step on the same kernels: 16.8 ms).
+- GDN step blocks use 512 threads: 1024 exceeded a launch's register budget.
+
+### Phase 4: MTP (working)
 
 - `model/mtp.rs` `DenseMtp`: the dense Qwen3.5 head (`blk.64` + `nextn.*`), after llama.cpp's
   `graph_mtp`. `--mtp-shadow` measures 65-74% draft acceptance on a thinking-style prompt, 94% on
@@ -179,15 +197,16 @@ carbon does not beat LM Studio yet. It is 16% behind without MTP and 16% behind 
 - `cargo test --release`: 111 pass (72 unit, 25 parallel, 4 real_configs, 4 server, 6 vision).
 - `carbon devices --selftest`: all kernel checks pass in bf16 / f16 / f32, including the new
   Q4_K / Q6_K (float, dp4a and tensor-core paths) and multi-chunk decode attention checks.
-- `CARBON_TEST_DEVICE=cuda cargo test --features cuda --test parallel`: 2 of 28 fail
-  (`cuda_graphs_match_eager`, `mtp_speculation_accepts_and_rejects`, both
-  `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`). The original commit fails those two and two more on
-  this machine, so they predate this work; not investigated.
+- `CARBON_TEST_DEVICE=cuda cargo test --features cuda --test parallel -- --test-threads=1`:
+  27 pass, 1 ignored. With the default parallel test threads some CUDA-graph tests fail with
+  `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED` (tests capturing graphs on the same GPU at once); the
+  original commit does the same.
 
 ## Next steps, in order
 
-1. Decode launch fusion (phase 3) and the multi-token step's extras (phase 4): the two things
-   between carbon and LM Studio's MTP numbers.
+1. Remaining decode gaps: plain decode (65 vs 73: norm + prep and SiLU * up epilogues, small
+   launches), draft cost (about 1.2 ms each, 0.7 ms reading the LM head), story and JSON with MTP.
+   Re-measure depth.
 2. Int8 KV pool with int8 decode and prefill attention kernels (full 262,144 context), and a
    KV auto-size that leaves room for prefill.
 3. Prefill: attention throughput, fewer dequant passes, periodic recurrent-state snapshots.

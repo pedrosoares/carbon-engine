@@ -269,6 +269,18 @@ __device__ __forceinline__ int kq_dp4a(unsigned w, int x, int acc) {
 }
 #endif
 
+// One scale group's contribution to a row's sum, shared by the dp4a and tensor-core kernels.
+// The two kernels add the groups in different orders, so their results differ in the last
+// bits: a weight must use the same kernel for every token count (`kquant_use_tc`), or a
+// multi-token verify step would not reproduce what single-token steps compute. (Summing in f64
+// would make the order irrelevant, but f64 is throttled on consumer GPUs: 2.5x slower steps.)
+__device__ __forceinline__ float kq_term_q4k(float s, float m, float xs, float xsum, int isum) {
+    return (s * xs) * (float)isum - m * xsum;
+}
+__device__ __forceinline__ float kq_term_q6k(float f, float xs, float xsum, int isum) {
+    return (f * xs) * (float)isum - f * (32.0f * xsum);
+}
+
 template <class D>
 __device__ void kq_prep(const typename D::T* x, float* out, int k, int t) {
     long groups = (long)t * (k / 32);
@@ -302,11 +314,11 @@ __device__ void kq_prep(const typename D::T* x, float* out, int k, int t) {
     }
 }
 
+// one warp: row `row` of an n-row weight
 template <class D>
-__device__ void kq_gemv_i8(const u8* data, const float* prep, typename D::T* y, int n, int k, int t, int kind) {
-    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    long row = (long)blockIdx.x * (blockDim.x / 32) + warp;
-    if (row >= n) return;
+__device__ __forceinline__ void kq_gemv_i8_row(const u8* data, const float* prep, typename D::T* y, int n, int k,
+                                               int t, int kind, long row) {
+    int lane = threadIdx.x % 32;
     float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     const int units = k / 64, stride = KQ_PREP_STRIDE(k);
     if (kind == 0) {
@@ -337,7 +349,7 @@ __device__ void kq_gemv_i8(const u8* data, const float* prep, typename D::T* y, 
                 }
                 const float* xs = base + k / 4 + 2 * u;
                 const float* sm = base + k / 4 + k / 32 + 4 * u;
-                acc[ti] += s1 * xs[0] * (float)ia - m1 * (sm[0] + sm[1]) + s2 * xs[1] * (float)ib - m2 * (sm[2] + sm[3]);
+                acc[ti] += kq_term_q4k(s1, m1, xs[0], sm[0] + sm[1], ia) + kq_term_q4k(s2, m2, xs[1], sm[2] + sm[3], ib);
             }
         }
     } else {
@@ -371,8 +383,8 @@ __device__ void kq_gemv_i8(const u8* data, const float* prep, typename D::T* y, 
                 }
                 const float* xs = base + k / 4 + 2 * u;
                 const float* sm = base + k / 4 + k / 32 + 4 * u;
-                acc[ti] += sa0 * (xs[0] * (float)a0 - 32.0f * sm[0]) + sa1 * (xs[0] * (float)a1 - 32.0f * sm[1]) +
-                           sb0 * (xs[1] * (float)b0 - 32.0f * sm[2]) + sb1 * (xs[1] * (float)b1 - 32.0f * sm[3]);
+                acc[ti] += kq_term_q6k(sa0, xs[0], sm[0], a0) + kq_term_q6k(sa1, xs[0], sm[1], a1) +
+                           kq_term_q6k(sb0, xs[1], sm[2], b0) + kq_term_q6k(sb1, xs[1], sm[3], b1);
             }
         }
     }
@@ -380,6 +392,40 @@ __device__ void kq_gemv_i8(const u8* data, const float* prep, typename D::T* y, 
         float v = acc[ti];
         for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
         if (lane == 0) D::store(y, (long)ti * n + row, v);
+    }
+}
+
+template <class D>
+__device__ void kq_gemv_i8(const u8* data, const float* prep, typename D::T* y, int n, int k, int t, int kind) {
+    long row = (long)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= n) return;
+    kq_gemv_i8_row<D>(data, prep, y, n, k, t, kind, row);
+}
+
+// Up to 4 weights that read the same activations, in one launch (a decode step otherwise pays
+// each launch's ramp-up and tail: about 12% of the read rate on 50 MB weights). Rows are
+// numbered through the weights; weight s writes y + t * (rows before it).
+#define KQ_MULTI 4
+struct KqSeg {
+    const u8* data;
+    int n, kind;
+};
+
+template <class D>
+__device__ void kq_gemv_i8_multi(const u8* d0, const u8* d1, const u8* d2, const u8* d3, const float* prep,
+                                 typename D::T* y, int n0, int n1, int n2, int n3, int kinds, int k, int t) {
+    long row = (long)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const u8* data[KQ_MULTI] = {d0, d1, d2, d3};
+    const int n[KQ_MULTI] = {n0, n1, n2, n3};
+    long before = 0;
+#pragma unroll
+    for (int s = 0; s < KQ_MULTI; ++s) {
+        if (row < n[s]) {
+            kq_gemv_i8_row<D>(data[s], prep, y + before * t, n[s], k, t, (kinds >> (4 * s)) & 15, row);
+            return;
+        }
+        row -= n[s];
+        before += n[s];
     }
 }
 
@@ -409,6 +455,11 @@ __device__ void kq_gemv_i8(const u8* data, const float* prep, typename D::T* y, 
     extern "C" __global__ void kq_gemv_i8_##SUFFIX(const u8* w, const float* p, D::T* y, int n, int k,       \
                                                    int t, int kind) {                                         \
         kq_gemv_i8<D>(w, p, y, n, k, t, kind);                                                                \
+    }                                                                                                         \
+    extern "C" __global__ void kq_gemv_i8_multi_##SUFFIX(const u8* d0, const u8* d1, const u8* d2,           \
+                                                         const u8* d3, const float* p, D::T* y, int n0,      \
+                                                         int n1, int n2, int n3, int kinds, int k, int t) {  \
+        kq_gemv_i8_multi<D>(d0, d1, d2, d3, p, y, n0, n1, n2, n3, kinds, k, t);                               \
     }
 
 DEFINE_KERNELS(f32, F32)

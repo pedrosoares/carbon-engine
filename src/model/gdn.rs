@@ -263,7 +263,14 @@ impl GatedDeltaNet {
         let z = proj.pop().expect("z");
         let qkv = proj.pop().expect("qkv");
 
-        // multi-token decode: the fused step once per token position, in order
+        // multi-token decode: one launch walks each sequence's tokens in order (the state stays
+        // in registers between them and every token leaves it in its own slot)
+        if let Some((slots, links)) = &b.chain {
+            if let Some(y) = self.decode_fused(&qkv, &z, &braw, &araw, slots, &Some(links.clone()), st) {
+                return Ok(self.out.forward(&y)?);
+            }
+        }
+        // otherwise the fused step once per token position
         let multi = b.per_substep(&[&qkv, &z, &braw, &araw], |r, sub| {
             if let Some(prev) = &sub.prev_idx {
                 st.copy_rows(prev, &sub.state_idx)?;

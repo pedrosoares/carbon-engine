@@ -185,6 +185,9 @@ impl Engine {
             && ec.tp_size == 1
             && ec.rpc_workers.is_empty()
             && ec.devices[0].starts_with("cuda");
+        // verify steps carry several tokens: the K-quant kernels pick their multi-token GEMM
+        #[cfg(feature = "cuda")]
+        crate::kernels::cuda::kquant_expect_multi_token(ec.mtp_speculate && speculation_supported);
         if ec.mtp_speculate && !speculation_supported {
             tracing::warn!("--mtp needs a single local CUDA device: the MTP head only drafts");
         }

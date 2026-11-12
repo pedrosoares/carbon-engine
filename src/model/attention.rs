@@ -132,6 +132,10 @@ pub struct DeviceBatch {
     /// fused CUDA kernels): the sub-steps and, u32 `[T]`, where each token's row lands when the
     /// sub-steps' outputs are concatenated (to put them back in token order).
     pub substeps: Option<(Vec<SubStep>, Tensor)>,
+    /// Multi-token decode steps, for kernels that walk a sequence's tokens themselves (GDN):
+    /// per token row, u32 `[T]`, the recurrent-state slot it leaves its state in, and its chain
+    /// link (bit 0 fresh, bit 1 not the first row of its sequence, `>> 8` rows that follow).
+    pub chain: Option<(Tensor, Tensor)>,
 }
 
 impl DeviceBatch {
@@ -221,6 +225,10 @@ impl DeviceBatch {
                 )),
                 None => None,
             },
+            chain: match &self.chain {
+                Some((a, b)) => Some((a.copy()?, b.copy()?)),
+                None => None,
+            },
         })
     }
 
@@ -261,6 +269,14 @@ impl DeviceBatch {
                     }
                 }
                 ao.slice_set(bo, 0, 0)?;
+            }
+            (None, None) => {}
+            _ => bail!("batch does not fit the captured graph"),
+        }
+        match (&self.chain, &o.chain) {
+            (Some((a, al)), Some((b, bl))) if a.dims() == b.dims() => {
+                a.slice_set(b, 0, 0)?;
+                al.slice_set(bl, 0, 0)?;
             }
             (None, None) => {}
             _ => bail!("batch does not fit the captured graph"),
@@ -401,6 +417,22 @@ impl DeviceBatch {
         } else {
             None
         };
+        let chain = if multi {
+            let (mut slots, mut links) = (Vec::with_capacity(t), Vec::with_capacity(t));
+            for s in &meta.seqs {
+                for j in 0..s.q_len {
+                    slots.push(s.token_state_slots.get(j).copied().unwrap_or(s.state_slot));
+                    links.push(if j == 0 {
+                        u32::from(s.kv_len == s.q_len) | (((s.q_len - 1) as u32) << 8)
+                    } else {
+                        2
+                    });
+                }
+            }
+            Some((Tensor::from_vec(slots, t, device)?, Tensor::from_vec(links, t, device)?))
+        } else {
+            None
+        };
         let prefill = if device.is_cuda()
             && fused_decode_enabled()
             && !all_decode
@@ -463,6 +495,7 @@ impl DeviceBatch {
             mrope_layout: meta.mrope_layout.clone(),
             ple_emb: vec![],
             substeps,
+            chain,
         })
     }
 }

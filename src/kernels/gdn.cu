@@ -29,6 +29,15 @@ __device__ float gdn_block_sum(float v, float* red) {
     return t;
 }
 
+// Multi-token steps: `fresh[b]` also links the rows of one sequence (consecutive, in token order).
+//   bit 0   the sequence starts here: its state is zero
+//   bit 1   this row continues the chain of an earlier row, whose thread / block computes it
+//   >> 8    rows that follow this one in its chain
+// The head row reads the state in slot idx[b]; token j of the chain leaves its state in slot
+// idx[b + j] (rejected drafts roll back by dropping slots), and the state stays in registers
+// between the tokens.
+#define GDN_MAX_KM1 8
+
 // qkv [B, C]; conv pool [slots, KM1 * C]; taps [KM1 + 1, C]; act [B, C] f32.
 template <class D>
 __device__ void gdn_conv(const typename D::T* qkv, typename D::T* pool, const unsigned* idx, const unsigned* fresh,
@@ -36,18 +45,36 @@ __device__ void gdn_conv(const typename D::T* qkv, typename D::T* pool, const un
     long total = (long)B * C;
     for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long)gridDim.x * blockDim.x) {
         long b = i / C, c = i % C;
-        typename D::T* st = pool + (long)idx[b] * KM1 * C;
-        bool zero = fresh[b] != 0;
-        float x = D::load(qkv, i);
-        float acc = D::load(taps, (long)KM1 * C + c) * x;
-        for (int j = 0; j < KM1; ++j) {
-            float p = zero ? 0.0f : D::load(st, (long)j * C + c);
-            acc += D::load(taps, (long)j * C + c) * p;
+        unsigned link = fresh[b];
+        if (link & 2u) continue;
+        int len = 1 + (int)(link >> 8);
+        bool zero = (link & 1u) != 0;
+        float p[GDN_MAX_KM1];
+        const typename D::T* src = pool + (long)idx[b] * KM1 * C;
+#pragma unroll
+        for (int j = 0; j < GDN_MAX_KM1; ++j) p[j] = (j < KM1 && !zero) ? D::load(src, (long)j * C + c) : 0.0f;
+        for (int tk = 0; tk < len; ++tk) {
+            float x = D::load(qkv, i + (long)tk * C);
+            float acc = D::load(taps, (long)KM1 * C + c) * x;
+#pragma unroll
+            for (int j = 0; j < GDN_MAX_KM1; ++j)
+                if (j < KM1) acc += D::load(taps, (long)j * C + c) * p[j];
+            // shift: state rows become [prev[1..], x]
+#pragma unroll
+            for (int j = 0; j + 1 < GDN_MAX_KM1; ++j)
+                if (j + 1 < KM1) p[j] = p[j + 1];
+            if (KM1 > 0) {
+                // the state holds the model dtype: later steps read it back rounded
+                typename D::T r;
+                D::store(&r, 0, x);
+                p[KM1 - 1] = D::load(&r, 0);
+            }
+            typename D::T* dst = pool + (long)idx[b + tk] * KM1 * C;
+#pragma unroll
+            for (int j = 0; j < GDN_MAX_KM1; ++j)
+                if (j < KM1) D::store(dst, (long)j * C + c, p[j]);
+            act[i + (long)tk * C] = acc * gdn_sigmoid(acc);
         }
-        // shift: state rows become [prev[1..], x]
-        for (int j = 0; j + 1 < KM1; ++j) D::store(st, (long)j * C + c, zero ? 0.0f : D::load(st, (long)(j + 1) * C + c));
-        if (KM1 > 0) D::store(st, (long)(KM1 - 1) * C + c, x);
-        act[i] = acc * gdn_sigmoid(acc);
     }
 }
 
@@ -62,32 +89,11 @@ __device__ void gdn_step(const float* act, const typename D::T* z, const typenam
     int gate_sigmoid = flags & 1;
     __shared__ float sq[GDN_MAX_DK], sk[GDN_MAX_DK], so[GDN_MAX_DV], red[32];
     __shared__ float sm[GDN_MAX_PARTS][GDN_MAX_DV];
-    int b = blockIdx.x / HV, h = blockIdx.x % HV, kh = (flags & 2) ? h % HK : h / (HV / HK);
-    long C = 2L * HK * DK + (long)HV * DV;
-    const float* a = act + b * C;
-    float pq = 0.0f, pk = 0.0f;
-    for (int i = threadIdx.x; i < DK; i += blockDim.x) {
-        float qv = a[(long)kh * DK + i], kv = a[(long)HK * DK + (long)kh * DK + i];
-        sq[i] = qv;
-        sk[i] = kv;
-        pq += qv * qv;
-        pk += kv * kv;
-    }
-    float rq = rsqrtf(gdn_block_sum(pq, red) + 1e-6f) * rsqrtf((float)DK);
-    float rk = rsqrtf(gdn_block_sum(pk, red) + 1e-6f);
-    for (int i = threadIdx.x; i < DK; i += blockDim.x) {
-        sq[i] *= rq;
-        sk[i] *= rk;
-    }
-    __syncthreads();
-
-    float beta = gdn_sigmoid(D::load(braw, (long)b * HV + h));
-    float ga = D::load(araw, (long)b * HV + h) + dt_bias[h];
-    float softplus = fmaxf(ga, 0.0f) + logf(1.0f + expf(-fabsf(ga)));
-    float decay = expf(softplus * a_neg[h]);
-    bool zero = fresh[b] != 0;
-    float* S = ssm + (long)idx[b] * HV * DK * DV + (long)h * DK * DV;
-    const float* v = a + 2L * HK * DK + (long)h * DV;
+    const int b0 = blockIdx.x / HV, h = blockIdx.x % HV, kh = (flags & 2) ? h % HK : h / (HV / HK);
+    const unsigned link = fresh[b0];
+    if (link & 2u) return;
+    const int len = 1 + (int)(link >> 8);
+    const long C = 2L * HK * DK + (long)HV * DV;
 
     // The state update is DK x DV: with a block of P * JW threads (JW = DV rounded up to a warp),
     // thread (part, j) takes DK / P rows of column j and the parts add up through shared memory.
@@ -97,72 +103,107 @@ __device__ void gdn_step(const float* act, const typename D::T* z, const typenam
     int P = blockDim.x / JW;
     if (P > GDN_MAX_PARTS) P = GDN_MAX_PARTS;
     if (P > 1 && (DK % P != 0 || DK / P > GDN_PART_ROWS || JW < DV)) P = 1;
-    float pss = 0.0f;
-    if (P > 1) {
-        const int part = threadIdx.x / JW, j = threadIdx.x % JW;
-        const bool on = part < P && j < DV;
-        const int nr = DK / P, i0 = part * nr;
-        float sreg[GDN_PART_ROWS];
-        float mem = 0.0f;
-        if (on) {
-#pragma unroll
-            for (int r = 0; r < GDN_PART_ROWS; ++r) {
-                if (r < nr) {
-                    sreg[r] = zero ? 0.0f : S[(long)(i0 + r) * DV + j] * decay;
-                    mem += sk[i0 + r] * sreg[r];
-                }
-            }
-            sm[part][j] = mem;
+    const int part = threadIdx.x / JW, jc = threadIdx.x % JW;
+    const bool on = P > 1 && part < P && jc < DV;
+    const int nr = DK / P, i0 = part * nr;
+    float sreg[GDN_PART_ROWS];
+
+    for (int tk = 0; tk < len; ++tk) {
+        const int b = b0 + tk;
+        const float* a = act + b * C;
+        float pq = 0.0f, pk = 0.0f;
+        for (int i = threadIdx.x; i < DK; i += blockDim.x) {
+            float qv = a[(long)kh * DK + i], kv = a[(long)HK * DK + (long)kh * DK + i];
+            sq[i] = qv;
+            sk[i] = kv;
+            pq += qv * qv;
+            pk += kv * kv;
+        }
+        float rq = rsqrtf(gdn_block_sum(pq, red) + 1e-6f) * rsqrtf((float)DK);
+        float rk = rsqrtf(gdn_block_sum(pk, red) + 1e-6f);
+        for (int i = threadIdx.x; i < DK; i += blockDim.x) {
+            sq[i] *= rq;
+            sk[i] *= rk;
         }
         __syncthreads();
-        float tot = 0.0f;
-        if (on)
-            for (int q = 0; q < P; ++q) tot += sm[q][j];
-        __syncthreads();
-        if (on) {
-            float delta = (v[j] - tot) * beta, o = 0.0f;
-#pragma unroll
-            for (int r = 0; r < GDN_PART_ROWS; ++r) {
-                if (r < nr) {
-                    float sv = sreg[r] + sk[i0 + r] * delta;
-                    S[(long)(i0 + r) * DV + j] = sv;
-                    o += sq[i0 + r] * sv;
-                }
-            }
-            sm[part][j] = o;
-        }
-        __syncthreads();
-        if (on && part == 0) {
-            float o = 0.0f;
-            for (int q = 0; q < P; ++q) o += sm[q][j];
-            so[j] = o;
-            pss = o * o;
-        }
-    } else {
-        for (int j = threadIdx.x; j < DV; j += blockDim.x) {
+
+        float beta = gdn_sigmoid(D::load(braw, (long)b * HV + h));
+        float ga = D::load(araw, (long)b * HV + h) + dt_bias[h];
+        float softplus = fmaxf(ga, 0.0f) + logf(1.0f + expf(-fabsf(ga)));
+        float decay = expf(softplus * a_neg[h]);
+        const bool zero = tk == 0 && (link & 1u) != 0;
+        // read where the previous token (or step) left the state, write this token's slot
+        const float* Sr = ssm + (long)idx[tk == 0 ? b : b - 1] * HV * DK * DV + (long)h * DK * DV;
+        float* Sw = ssm + (long)idx[b] * HV * DK * DV + (long)h * DK * DV;
+        const float* v = a + 2L * HK * DK + (long)h * DV;
+
+        float pss = 0.0f;
+        if (P > 1) {
             float mem = 0.0f;
-            for (int i = 0; i < DK; ++i) mem += sk[i] * (zero ? 0.0f : S[(long)i * DV + j] * decay);
-            float delta = (v[j] - mem) * beta;
-            float o = 0.0f;
-            for (int i = 0; i < DK; ++i) {
-                float s = (zero ? 0.0f : S[(long)i * DV + j] * decay) + sk[i] * delta;
-                S[(long)i * DV + j] = s;
-                o += sq[i] * s;
+            if (on) {
+#pragma unroll
+                for (int r = 0; r < GDN_PART_ROWS; ++r) {
+                    if (r < nr) {
+                        // later tokens of a chain: the state is still in registers
+                        float prev = tk == 0 ? (zero ? 0.0f : Sr[(long)(i0 + r) * DV + jc]) : sreg[r];
+                        sreg[r] = prev * decay;
+                        mem += sk[i0 + r] * sreg[r];
+                    }
+                }
+                sm[part][jc] = mem;
             }
-            so[j] = o;
-            pss += o * o;
+            __syncthreads();
+            float tot = 0.0f;
+            if (on)
+                for (int q = 0; q < P; ++q) tot += sm[q][jc];
+            __syncthreads();
+            if (on) {
+                float delta = (v[jc] - tot) * beta, o = 0.0f;
+#pragma unroll
+                for (int r = 0; r < GDN_PART_ROWS; ++r) {
+                    if (r < nr) {
+                        float sv = sreg[r] + sk[i0 + r] * delta;
+                        sreg[r] = sv;
+                        Sw[(long)(i0 + r) * DV + jc] = sv;
+                        o += sq[i0 + r] * sv;
+                    }
+                }
+                sm[part][jc] = o;
+            }
+            __syncthreads();
+            if (on && part == 0) {
+                float o = 0.0f;
+                for (int q = 0; q < P; ++q) o += sm[q][jc];
+                so[jc] = o;
+                pss = o * o;
+            }
+        } else {
+            for (int j = threadIdx.x; j < DV; j += blockDim.x) {
+                float mem = 0.0f;
+                for (int i = 0; i < DK; ++i) mem += sk[i] * (zero ? 0.0f : Sr[(long)i * DV + j] * decay);
+                float delta = (v[j] - mem) * beta;
+                float o = 0.0f;
+                for (int i = 0; i < DK; ++i) {
+                    float sv = (zero ? 0.0f : Sr[(long)i * DV + j] * decay) + sk[i] * delta;
+                    Sw[(long)i * DV + j] = sv;
+                    o += sq[i] * sv;
+                }
+                so[j] = o;
+                pss += o * o;
+            }
         }
-    }
-    float inv = rsqrtf(gdn_block_sum(pss, red) / (float)DV + eps);
-    long base = (long)b * HV * DV + (long)h * DV;
-    for (int j = threadIdx.x; j < DV; j += blockDim.x) {
-        // the reference rounds to the model dtype after the norm and after the weight
-        typename D::T r;
-        D::store(&r, 0, so[j] * inv);
-        D::store(&r, 0, D::load(&r, 0) * D::load(norm_w, j));
-        float zg = D::load(z, base + j);
-        // output gate: silu(z), or sigmoid(z) (Qwen3.8 output_gate_type)
-        D::store(y, base + j, D::load(&r, 0) * (gate_sigmoid ? gdn_sigmoid(zg) : zg * gdn_sigmoid(zg)));
+        float inv = rsqrtf(gdn_block_sum(pss, red) / (float)DV + eps);
+        long base = (long)b * HV * DV + (long)h * DV;
+        for (int j = threadIdx.x; j < DV; j += blockDim.x) {
+            // the reference rounds to the model dtype after the norm and after the weight
+            typename D::T r;
+            D::store(&r, 0, so[j] * inv);
+            D::store(&r, 0, D::load(&r, 0) * D::load(norm_w, j));
+            float zg = D::load(z, base + j);
+            // output gate: silu(z), or sigmoid(z) (Qwen3.8 output_gate_type)
+            D::store(y, base + j, D::load(&r, 0) * (gate_sigmoid ? gdn_sigmoid(zg) : zg * gdn_sigmoid(zg)));
+        }
+        __syncthreads();
     }
 }
 

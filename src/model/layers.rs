@@ -330,11 +330,11 @@ pub use crate::weights::{dequant_fp8, dequant_nvfp4, Nvfp4};
 /// Run one of carbon's CUDA kernels; on failure warn once and return None so the caller falls
 /// back to the generic tensor-op path.
 #[cfg(feature = "cuda")]
-fn cuda_quant(
+fn cuda_quant<T>(
     x: &Tensor,
     what: &str,
-    f: impl FnOnce() -> candle_core::Result<Tensor>,
-) -> Option<Tensor> {
+    f: impl FnOnce() -> candle_core::Result<T>,
+) -> Option<T> {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     match f() {
         Ok(t) => Some(t),
@@ -407,17 +407,28 @@ impl QLinear {
             && qs.iter().filter(|q| matches!(q, Self::KQuant(_))).count() > 1
         {
             use crate::kernels::cuda as k;
-            if let Some(prep) = cuda_quant(x, "kquant prep", || k::kquant_prep(x)) {
-                return qs
-                    .iter()
-                    .map(|q| match q {
-                        Self::KQuant(kq) => match cuda_quant(x, "kquant", || k::kquant_gemv_with(&prep, kq, x.dtype())) {
-                            Some(y) => Ok(y),
-                            None => q.forward(x),
-                        },
-                        other => other.forward(x),
-                    })
-                    .collect();
+            let packed: Vec<&crate::gguf::KQuant> = qs
+                .iter()
+                .filter_map(|q| match q {
+                    Self::KQuant(kq) => Some(kq),
+                    _ => None,
+                })
+                .collect();
+            if packed.len() <= 4 {
+                // one activation prep and one launch for the packed projections
+                let ys = cuda_quant(x, "kquant multi", || {
+                    k::kquant_gemv_multi(&k::kquant_prep(x)?, &packed, x.dtype())
+                });
+                if let Some(ys) = ys {
+                    let mut ys = ys.into_iter();
+                    return qs
+                        .iter()
+                        .map(|q| match q {
+                            Self::KQuant(_) => Ok(ys.next().expect("one output per packed weight")),
+                            other => other.forward(x),
+                        })
+                        .collect();
+                }
             }
         }
         qs.iter().map(|q| q.forward(x)).collect()

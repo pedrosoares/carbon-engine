@@ -63,13 +63,13 @@ __device__ __forceinline__ int kq_mini(int a, int b) { return a < b ? a : b; }
 // split = 1: each warp of a block takes its own 16 rows and all the columns.
 // split = KQ_TC_WARPS: the block's warps share 16 rows and take a quarter of the columns each
 // (wide weights with few rows: a warp walks its columns serially), then add up their sums.
+// `tile`: the block's (split > 1) or the warp's 16-row tile of this weight.
 template <class D>
-__device__ void kq_gemm_tc(const u8* data, const float* prep, typename D::T* y, int n, int k, int t, int kind,
-                           int split) {
-    __shared__ unsigned stage[KQ_TC_WARPS][16][KQ_STAGE_WORDS];
-    __shared__ float red[KQ_TC_WARPS][32][4];
+__device__ __forceinline__ void kq_gemm_tc_tile(const u8* data, const float* prep, typename D::T* y, int n, int k,
+                                                int t, int kind, int split, long tile,
+                                                unsigned (*stage)[16][KQ_STAGE_WORDS], float (*red)[32][4]) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const long r0 = split > 1 ? (long)blockIdx.x * 16 : ((long)blockIdx.x * KQ_TC_WARPS + warp) * 16;
+    const long r0 = tile * 16;
     if (r0 >= n) return;
     // this warp's super-blocks
     const int nblk = k / 256;
@@ -122,10 +122,10 @@ __device__ void kq_gemm_tc(const u8* data, const float* prep, typename D::T* y, 
                 const float* sb = pb + k / 32 + 4 * u;
                 float xa0 = pa[2 * u], xa1 = pa[2 * u + 1], xb0 = pb[2 * u], xb1 = pb[2 * u + 1];
                 float ya0 = sa[0] + sa[1], ya1 = sa[2] + sa[3], yb0 = sb[0] + sb[1], yb1 = sb[2] + sb[3];
-                acc[0] += s1a * xa0 * (float)cl[0] - m1a * ya0 + s2a * xa1 * (float)ch[0] - m2a * ya1;
-                acc[1] += s1a * xb0 * (float)cl[1] - m1a * yb0 + s2a * xb1 * (float)ch[1] - m2a * yb1;
-                acc[2] += s1b * xa0 * (float)cl[2] - m1b * ya0 + s2b * xa1 * (float)ch[2] - m2b * ya1;
-                acc[3] += s1b * xb0 * (float)cl[3] - m1b * yb0 + s2b * xb1 * (float)ch[3] - m2b * yb1;
+                acc[0] += kq_term_q4k(s1a, m1a, xa0, ya0, cl[0]) + kq_term_q4k(s2a, m2a, xa1, ya1, ch[0]);
+                acc[1] += kq_term_q4k(s1a, m1a, xb0, yb0, cl[1]) + kq_term_q4k(s2a, m2a, xb1, yb1, ch[1]);
+                acc[2] += kq_term_q4k(s1b, m1b, xa0, ya0, cl[2]) + kq_term_q4k(s2b, m2b, xa1, ya1, ch[2]);
+                acc[3] += kq_term_q4k(s1b, m1b, xb0, yb0, cl[3]) + kq_term_q4k(s2b, m2b, xb1, yb1, ch[3]);
             }
             __syncwarp();
         }
@@ -169,11 +169,11 @@ __device__ void kq_gemm_tc(const u8* data, const float* prep, typename D::T* y, 
                     const int si = (j & 1) + 4 * hi + 2 * (j >> 1);
                     float fa = da * (float)sca[si], fb = db * (float)scb[si];
                     float xa = pa[2 * u + (j >> 1)], xb = pb[2 * u + (j >> 1)];
-                    float ya = 32.0f * pa[k / 32 + 4 * u + j], yb = 32.0f * pb[k / 32 + 4 * u + j];
-                    acc[0] += fa * (xa * (float)c[0] - ya);
-                    acc[1] += fa * (xb * (float)c[1] - yb);
-                    acc[2] += fb * (xa * (float)c[2] - ya);
-                    acc[3] += fb * (xb * (float)c[3] - yb);
+                    float ya = pa[k / 32 + 4 * u + j], yb = pb[k / 32 + 4 * u + j];
+                    acc[0] += kq_term_q6k(fa, xa, ya, c[0]);
+                    acc[1] += kq_term_q6k(fa, xb, yb, c[1]);
+                    acc[2] += kq_term_q6k(fb, xa, ya, c[2]);
+                    acc[3] += kq_term_q6k(fb, xb, yb, c[3]);
                 }
             }
         }
@@ -203,6 +203,50 @@ __device__ void kq_gemm_tc(const u8* data, const float* prep, typename D::T* y, 
         if (t0 + 1 < t) D::store(y, (long)(t0 + 1) * n + r0 + g + 8, acc[3]);
     }
 }
+
+
+template <class D>
+__device__ void kq_gemm_tc(const u8* data, const float* prep, typename D::T* y, int n, int k, int t, int kind,
+                           int split) {
+    __shared__ unsigned stage[KQ_TC_WARPS][16][KQ_STAGE_WORDS];
+    __shared__ float red[KQ_TC_WARPS][32][4];
+    const long tile = split > 1 ? (long)blockIdx.x : (long)blockIdx.x * KQ_TC_WARPS + threadIdx.x / 32;
+    kq_gemm_tc_tile<D>(data, prep, y, n, k, t, kind, split, tile, stage, red);
+}
+
+// Up to 4 weights that read the same activations in one launch (see kq_gemv_i8_multi); each
+// weight's rows are padded to whole 16-row tiles in the numbering. split = 1 only.
+template <class D>
+__device__ void kq_gemm_tc_multi(const u8* d0, const u8* d1, const u8* d2, const u8* d3, const float* prep,
+                                 typename D::T* y, int n0, int n1, int n2, int n3, int kinds, int k, int t) {
+    __shared__ unsigned stage[KQ_TC_WARPS][16][KQ_STAGE_WORDS];
+    __shared__ float red[KQ_TC_WARPS][32][4];
+    long tile = (long)blockIdx.x * KQ_TC_WARPS + threadIdx.x / 32;
+    const u8* data[4] = {d0, d1, d2, d3};
+    const int n[4] = {n0, n1, n2, n3};
+    long before = 0;
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        long tiles = (n[s] + 15) / 16;
+        if (tile < tiles) {
+            kq_gemm_tc_tile<D>(data[s], prep, y + before * t, n[s], k, t, (kinds >> (4 * s)) & 15, 1, tile, stage, red);
+            return;
+        }
+        tile -= tiles;
+        before += n[s];
+    }
+}
+
+#define DEFINE_KQ_TC_MULTI(SUFFIX, D)                                                                        \
+    extern "C" __global__ void kq_gemm_tc_multi_##SUFFIX(const u8* d0, const u8* d1, const u8* d2,           \
+                                                         const u8* d3, const float* p, D::T* y, int n0,      \
+                                                         int n1, int n2, int n3, int kinds, int k, int t) {  \
+        kq_gemm_tc_multi<D>(d0, d1, d2, d3, p, y, n0, n1, n2, n3, kinds, k, t);                               \
+    }
+
+DEFINE_KQ_TC_MULTI(f32, F32)
+DEFINE_KQ_TC_MULTI(bf16, BF16)
+DEFINE_KQ_TC_MULTI(f16, F16)
 
 #define DEFINE_KQ_TC(SUFFIX, D)                                                                              \
     extern "C" __global__ void kq_gemm_tc_##SUFFIX(const u8* w, const float* p, D::T* y, int n, int k,       \
