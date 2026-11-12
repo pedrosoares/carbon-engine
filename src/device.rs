@@ -385,6 +385,18 @@ pub fn kernel_selftest(device: &Device, dtype: DType) -> Vec<(&'static str, Resu
                 }),
             ));
             ops.push((
+                "carbon gated deltanet prefill (vs generic path)",
+                Box::new(move || {
+                    let (ey, es) = crate::model::gdn::fused_prefill_selftest(d, dtype)
+                        .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
+                    let tol = if dtype == DType::F32 { 1e-4 } else { 5e-2 };
+                    if ey > tol || es > tol {
+                        candle_core::bail!("mismatch: output rel err {ey:.2e}, state rel err {es:.2e}");
+                    }
+                    Ok(())
+                }),
+            ));
+            ops.push((
                 "carbon prefill attention (vs cpu)",
                 Box::new(move || check_flash_prefill(d, dtype)),
             ));

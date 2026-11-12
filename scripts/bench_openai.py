@@ -105,6 +105,7 @@ def main():
     ap.add_argument("--model", default="")
     ap.add_argument("--max-tokens", type=int, default=400)
     ap.add_argument("--context", type=int, default=0, help="filler tokens before each prompt")
+    ap.add_argument("--seed", type=int, default=1234, help="filler seed (a new one gives a cold prefix)")
     ap.add_argument("--prompts", default="story,code,math,json")
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--think", action="store_true", help="leave thinking on")
@@ -113,7 +114,7 @@ def main():
     ap.add_argument("--out", default="")
     a = ap.parse_args()
 
-    doc = filler(a.context) + "\n\nIgnore the text above. " if a.context else ""
+    doc = filler(a.context, a.seed) + "\n\nIgnore the text above. " if a.context else ""
     rows = []
     for name in a.prompts.split(","):
         for i in range(a.repeat):

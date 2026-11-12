@@ -2371,6 +2371,208 @@ impl candle_core::CustomOp1 for GdnDecode<'_> {
     }
 }
 
+// ---- prefill of one sequence on the fused kernels (gdn.cu: gdn_pre / gates / seq2 / post) ----
+
+struct GdnPrefill<'a> {
+    layer: &'a GdnLayer<'a>,
+    z: &'a Tensor,
+    braw: &'a Tensor,
+    araw: &'a Tensor,
+    /// u32 `[1]`: the sequence's state slot.
+    idx: &'a Tensor,
+    /// The sequence starts in this chunk: its state is zero.
+    zero: bool,
+}
+
+/// State rows a thread of `gdn_seq2` holds (gdn.cu).
+const GDN_SEQ_ROWS: usize = 32;
+/// Warps per block of `gdn_seq2` (gdn.cu).
+const GDN_SEQ_WARPS: usize = 4;
+
+/// Whether [`gdn_prefill`] handles this layer geometry.
+pub fn gdn_prefill_supported(hk: usize, hv: usize, dk: usize, dv: usize) -> bool {
+    matches!(dk, 32 | 64 | 128 | 256) && hk > 0 && hv.is_multiple_of(hk) && (hv * dv).is_multiple_of(32)
+}
+
+impl candle_core::CustomOp1 for GdnPrefill<'_> {
+    fn name(&self) -> &'static str {
+        "carbon-gdn-prefill"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, qkv: &CudaStorage, ql: &Layout) -> CResult<(CudaStorage, Shape)> {
+        let l = self.layer;
+        let (t, c) = ql.shape().dims2()?;
+        let (hk, hv, dk, dv) = (l.hk, l.hv, l.dk, l.dv);
+        if c != 2 * hk * dk + hv * dv || !gdn_prefill_supported(hk, hv, dk, dv) {
+            candle_core::bail!("gdn prefill: bad geometry");
+        }
+        let dtype = qkv.dtype();
+        let taps = Side::new(l.taps, "taps")?;
+        let kernel = taps.len() / c;
+        let sides = [
+            (Side::new(self.z, "z")?, t * hv * dv),
+            (Side::new(self.braw, "b")?, t * hv),
+            (Side::new(self.araw, "a")?, t * hv),
+            (Side::new(self.idx, "slot")?, 1),
+            (Side::new(l.dt_bias, "dt_bias")?, hv),
+            (Side::new(l.a_neg, "a_neg")?, hv),
+            (Side::new(l.norm_w, "norm")?, dv),
+        ];
+        if taps.len() != kernel * c || kernel == 0 || kernel > 9 || sides.iter().any(|(s, n)| s.len() != *n) {
+            candle_core::bail!("gdn prefill: input sizes do not match the layer");
+        }
+        let km1 = kernel - 1;
+        let [(z, _), (braw, _), (araw, _), (idx, _), (dt_bias, _), (a_neg, _), (norm_w, _)] = sides;
+        let conv_pool = Side::new(l.conv_pool, "conv pool")?;
+        let ssm_pool = Side::new(l.ssm_pool, "ssm pool")?;
+        if conv_pool.len() % (km1 * c).max(1) != 0 || ssm_pool.len() % (hv * dk * dv) != 0 {
+            candle_core::bail!("gdn prefill: state pools do not match the layer");
+        }
+        let dev = qkv.device().clone();
+        let sfx = suffix(dtype)?;
+        let load = |name: String| dev.get_or_load_custom_func(&name, "carbon_gdn", gdn_ptx()?);
+        let (f_pre, f_tail, f_gates, f_post) = (
+            load(format!("gdn_pre_{sfx}"))?,
+            load(format!("gdn_conv_tail_{sfx}"))?,
+            load(format!("gdn_gates_{sfx}"))?,
+            load(format!("gdn_post_{sfx}"))?,
+        );
+        let f_seq = load("gdn_seq2".to_string())?;
+        let act = unsafe { dev.alloc::<f32>(t * c)? };
+        let bd = unsafe { dev.alloc::<f32>(2 * t * hv)? };
+        let o = unsafe { dev.alloc::<f32>(t * hv * dv)? };
+        let idx = idx.view::<u32>()?;
+        let (dt_bias, a_neg) = (dt_bias.view::<f32>()?, a_neg.view::<f32>()?);
+        let ssm = ssm_pool.view::<f32>()?;
+        let (t32, c32, km1_32, zero) = (t as i32, c as i32, km1 as i32, i32::from(self.zero));
+        let (hk32, hv32, dk32, dv32) = (hk as i32, hv as i32, dk as i32, dv as i32);
+        let warps = |n: usize| LaunchConfig {
+            grid_dim: (n.div_ceil(8).clamp(1, 8192) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        macro_rules! go {
+            ($ty:ty) => {{
+                let xv = view::<$ty>(qkv, ql)?;
+                let pool = conv_pool.view::<$ty>()?;
+                let tv = taps.view::<$ty>()?;
+                let mut b = f_pre.builder();
+                b.arg(&xv);
+                b.arg(&pool);
+                b.arg(&idx);
+                b.arg(&tv);
+                b.arg(&act);
+                b.arg(&t32);
+                b.arg(&c32);
+                b.arg(&km1_32);
+                b.arg(&hk32);
+                b.arg(&dk32);
+                b.arg(&zero);
+                unsafe { b.launch(warps(t * (2 * hk + hv * dv / 32))) }.w()?;
+                drop(b);
+                // the conv state moves on only after gdn_pre has read it
+                let mut b = f_tail.builder();
+                b.arg(&xv);
+                b.arg(&pool);
+                b.arg(&idx);
+                b.arg(&t32);
+                b.arg(&c32);
+                b.arg(&km1_32);
+                b.arg(&zero);
+                unsafe { b.launch(grid_stride(c)) }.w()?;
+                drop(b);
+
+                let (zv, bv, av, nv) =
+                    (z.view::<$ty>()?, braw.view::<$ty>()?, araw.view::<$ty>()?, norm_w.view::<$ty>()?);
+                let mut b = f_gates.builder();
+                b.arg(&bv);
+                b.arg(&av);
+                b.arg(&dt_bias);
+                b.arg(&a_neg);
+                b.arg(&bd);
+                b.arg(&t32);
+                b.arg(&hv32);
+                unsafe { b.launch(grid_stride(t * hv)) }.w()?;
+                drop(b);
+
+                let flags = zero | (i32::from(l.v_tiled) << 1);
+                let mut b = f_seq.builder();
+                b.arg(&act);
+                b.arg(&bd);
+                b.arg(&ssm);
+                b.arg(&idx);
+                b.arg(&o);
+                b.arg(&t32);
+                b.arg(&c32);
+                b.arg(&hk32);
+                b.arg(&hv32);
+                b.arg(&dk32);
+                b.arg(&dv32);
+                b.arg(&flags);
+                // a warp holds 32 / (dk / GDN_SEQ_ROWS) state columns of a head; a block is
+                // GDN_SEQ_WARPS warps of one head
+                let bph = dv.div_ceil(GDN_SEQ_WARPS * 32 / (dk / GDN_SEQ_ROWS));
+                let cfg = LaunchConfig {
+                    grid_dim: ((hv * bph) as u32, 1, 1),
+                    block_dim: ((GDN_SEQ_WARPS * 32) as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe { b.launch(cfg) }.w()?;
+                drop(b);
+
+                let out = unsafe { dev.alloc::<$ty>(t * hv * dv)? };
+                let rows = (t * hv) as i64;
+                let gate = i32::from(l.gate_sigmoid);
+                let mut b = f_post.builder();
+                b.arg(&o);
+                b.arg(&zv);
+                b.arg(&nv);
+                b.arg(&out);
+                b.arg(&rows);
+                b.arg(&dv32);
+                b.arg(&l.eps);
+                b.arg(&gate);
+                unsafe { b.launch(warps(t * hv)) }.w()?;
+                drop(b);
+                CudaStorage::wrap_cuda_slice(out, dev.clone())
+            }};
+        }
+        let out = match dtype {
+            DType::F32 => go!(f32),
+            DType::BF16 => go!(bf16),
+            DType::F16 => go!(f16),
+            d => candle_core::bail!("gdn prefill: unsupported dtype {d:?}"),
+        };
+        Ok((out, Shape::from((t, hv * dv))))
+    }
+}
+
+/// A whole chunk of one sequence through a Gated DeltaNet layer: `qkv [T, conv_dim]`,
+/// `z [T, hv*dv]`, `braw` / `araw [T, hv]` (projection outputs, model dtype), `slot` u32 `[1]`.
+/// Reads the sequence's conv and recurrent state from its slot (zero when `start`), leaves the
+/// state after the chunk there and returns the gated, normalised core output `[T, hv*dv]`.
+pub fn gdn_prefill(
+    layer: &GdnLayer<'_>,
+    qkv: &Tensor,
+    z: &Tensor,
+    braw: &Tensor,
+    araw: &Tensor,
+    slot: &Tensor,
+    start: bool,
+) -> CResult<Tensor> {
+    let (z, braw, araw) = (z.contiguous()?, braw.contiguous()?, araw.contiguous()?);
+    qkv.contiguous()?.apply_op1_no_bwd(&GdnPrefill {
+        layer,
+        z: &z,
+        braw: &braw,
+        araw: &araw,
+        idx: &slot.contiguous()?,
+        zero: start,
+    })
+}
+
 /// One Gated DeltaNet decode step for `B` sequences (one token each): `qkv [B, conv_dim]`,
 /// `z [B, hv*dv]`, `braw`/`araw [B, hv]` (projection outputs, model dtype), `slots`/`fresh`
 /// u32 `[B]` (fresh = the sequence starts here, its state is treated as zero). Updates both
