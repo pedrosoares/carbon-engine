@@ -35,7 +35,7 @@ use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::Linear;
 use parking_lot::RwLock;
 
-pub struct MtpHead {
+pub struct FlashMtp {
     norm_e: RmsNorm,
     fc_e: Linear,
     norm_h: RmsNorm,
@@ -68,7 +68,7 @@ pub struct MtpHead {
     dtype: DType,
 }
 
-impl MtpHead {
+impl FlashMtp {
     /// The checkpoint's MTP head, or `None` when it has none (or it is not a Qwen3.8 model).
     pub fn load(src: &dyn WeightSource, cfg: &ModelConfig, max_seq_len: usize, p: &Placement) -> Result<Option<Self>> {
         let (Some(q), Some(moe)) = (cfg.qwen38.as_ref(), cfg.moe.as_ref()) else {
@@ -287,5 +287,174 @@ impl MtpHead {
         }
         let g = candle_nn::ops::sigmoid(&self.shared_gate.forward(x)?)?;
         Ok((out + self.shared.forward(x)?.broadcast_mul(&g)?)?)
+    }
+}
+
+/// The MTP head of dense Qwen3.5 / 3.6 / 3.8 checkpoints (`mtp.*`; GGUF `blk.N.nextn.*`), after
+/// llama.cpp's `graph_mtp` (`src/models/qwen35.cpp`): one full-attention decoder block.
+///
+/// ```text
+/// h = norm(H_i)                       the main model's final norm (a further draft step passes
+///                                     the head's own output, already normed)
+/// x = fc([norm_e(embed(tok[i+1])), norm_h(h)])
+/// x = x + attn(ln1(x));  x = x + mlp(ln2(x))
+/// out = mtp.norm(x)  -> LM head -> token i + 2;  `out` is the next draft step's h
+/// ```
+///
+/// Its KV pool is addressed with the main model's slots, as in [`FlashMtp`].
+pub struct DenseMtp {
+    final_norm: RmsNorm,
+    norm_e: RmsNorm,
+    norm_h: RmsNorm,
+    fc: super::layers::QLinear,
+    ln1: RmsNorm,
+    attn: Attention,
+    ln2: RmsNorm,
+    mlp: Mlp,
+    norm: RmsNorm,
+    rotary: Rotary,
+    kv: RwLock<Option<LayerKv>>,
+    kv_width: usize,
+    head_dim: usize,
+    hidden: usize,
+    device: Device,
+    dtype: DType,
+}
+
+impl DenseMtp {
+    fn load(src: &dyn WeightSource, cfg: &ModelConfig, max_seq_len: usize, p: &Placement) -> Result<Self> {
+        if p.world != 1 {
+            bail!("the MTP head runs on one device");
+        }
+        let l = "mtp.layers.0";
+        let norm = |name: &str| RmsNorm::load_model(src, name, cfg, p);
+        Ok(Self {
+            final_norm: norm(&format!("{}norm.weight", cfg.prefix))?,
+            norm_e: norm("mtp.pre_fc_norm_embedding.weight")?,
+            norm_h: norm("mtp.pre_fc_norm_hidden.weight")?,
+            fc: super::layers::QLinear::load(src, "mtp.fc", true, p)?,
+            ln1: norm(&format!("{l}.input_layernorm.weight"))?,
+            attn: Attention::load(src, cfg, &format!("{l}.self_attn"), p)?,
+            ln2: norm(&format!("{l}.post_attention_layernorm.weight"))?,
+            mlp: Mlp::load(src, &format!("{l}.mlp"), ["gate_proj", "up_proj", "down_proj"], &cfg.hidden_act, p)?,
+            norm: if src.contains("mtp.norm.weight") {
+                norm("mtp.norm.weight")?
+            } else {
+                norm(&format!("{}norm.weight", cfg.prefix))?
+            },
+            rotary: Rotary::new(cfg, max_seq_len, p)?,
+            kv: RwLock::new(None),
+            kv_width: cfg.num_kv_heads * cfg.head_dim,
+            head_dim: cfg.head_dim,
+            hidden: cfg.hidden_size,
+            device: p.device.clone(),
+            dtype: p.dtype,
+        })
+    }
+
+    /// The attention block's input for every token of the step.
+    fn block_input(&self, hidden: &Tensor, next_emb: &Tensor, chained: bool) -> Result<Tensor> {
+        let dev = &self.device;
+        let hidden = hidden.to_device(dev)?.to_dtype(self.dtype)?;
+        let h = if chained { hidden } else { self.final_norm.forward(&hidden)? };
+        let e = self.norm_e.forward(&next_emb.to_device(dev)?.to_dtype(self.dtype)?)?;
+        self.fc.forward(&Tensor::cat(&[&e, &self.norm_h.forward(&h)?], 1)?)
+    }
+
+    fn forward(&self, meta: &BatchMeta, hidden: &Tensor, next_emb: &Tensor, rows: &[u32], chained: bool) -> Result<(Tensor, Tensor)> {
+        let kv = self.kv.read();
+        let kv = kv.as_ref().context("MTP KV pool not allocated")?;
+        let dev = &self.device;
+        let x = self.block_input(hidden, next_emb, chained)?;
+        let b = DeviceBatch::build(meta, &self.rotary, self.kv_width, dev)?;
+        let a = self.attn.forward(&self.ln1.forward(&x)?, &b, kv)?;
+        if rows.is_empty() {
+            // a prompt chunk that samples nothing: only the KV mattered
+            let z = Tensor::zeros((0, self.hidden), self.dtype, dev)?;
+            return Ok((z.clone(), z));
+        }
+        // only the drafting rows need the rest of the block
+        let idx = Tensor::from_slice(rows, rows.len(), dev)?;
+        let x = (x.index_select(&idx, 0)? + a.index_select(&idx, 0)?)?;
+        let x = (&x + self.mlp.forward(&self.ln2.forward(&x)?)?)?;
+        let out = self.norm.forward(&x)?;
+        Ok((out.clone(), out))
+    }
+
+    fn fill_kv(&self, meta: &BatchMeta, hidden: &Tensor, next_emb: &Tensor) -> Result<()> {
+        let kv = self.kv.read();
+        let kv = kv.as_ref().context("MTP KV pool not allocated")?;
+        let x = self.block_input(hidden, next_emb, false)?;
+        let b = DeviceBatch::build(meta, &self.rotary, self.kv_width, &self.device)?;
+        self.attn.write_kv(&self.ln1.forward(&x)?, &b, kv)
+    }
+}
+
+/// A checkpoint's multi-token-prediction head.
+pub enum MtpHead {
+    /// Qwen3.8-Flash-Next (`qwen4_exp`).
+    Flash(Box<FlashMtp>),
+    /// Dense Qwen3.5 / 3.6 / 3.8.
+    Dense(Box<DenseMtp>),
+}
+
+impl MtpHead {
+    /// The checkpoint's MTP head, or `None` when it has none this engine runs.
+    pub fn load(src: &dyn WeightSource, cfg: &ModelConfig, max_seq_len: usize, p: &Placement) -> Result<Option<Self>> {
+        if let Some(f) = FlashMtp::load(src, cfg, max_seq_len, p)? {
+            return Ok(Some(Self::Flash(Box::new(f))));
+        }
+        if cfg.qwen38.is_none() && cfg.moe.is_none() && src.contains("mtp.fc.weight") {
+            return Ok(Some(Self::Dense(Box::new(DenseMtp::load(src, cfg, max_seq_len, p)?))));
+        }
+        Ok(None)
+    }
+
+    /// (Re)allocate the head's KV pool; `num_slots` = the main model's KV slots.
+    pub fn alloc_kv(&self, num_slots: usize) -> Result<()> {
+        match self {
+            Self::Flash(f) => f.alloc_kv(num_slots),
+            Self::Dense(d) => {
+                let mut kv = d.kv.write();
+                *kv = None;
+                *kv = Some(LayerKv::new(num_slots, d.kv_width / d.head_dim, d.head_dim, d.dtype, &d.device)?);
+                Ok(())
+            }
+        }
+    }
+
+    /// Bytes the KV pools take per token.
+    pub fn kv_bytes_per_token(&self) -> usize {
+        match self {
+            Self::Flash(f) => f.kv_bytes_per_token(),
+            Self::Dense(d) => 2 * d.kv_width * d.dtype.size_in_bytes(),
+        }
+    }
+
+    /// Run the head over every token of `meta` and return, for `rows`, the state the LM head
+    /// reads and the input of a further draft step (see the two heads). `chained`: `hidden` is
+    /// that second output of an earlier call rather than the main model's last-layer state.
+    pub fn forward(&self, meta: &BatchMeta, hidden: &Tensor, next_emb: &Tensor, rows: &[u32], chained: bool) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Flash(f) => f.forward(meta, hidden, next_emb, rows),
+            Self::Dense(d) => d.forward(meta, hidden, next_emb, rows, chained),
+        }
+    }
+
+    /// Only the head's KV for every token of `meta` (same inputs as an unchained `forward`).
+    pub fn fill_kv(&self, meta: &BatchMeta, hidden: &Tensor, next_emb: &Tensor) -> Result<()> {
+        match self {
+            Self::Flash(f) => f.fill_kv(meta, hidden, next_emb),
+            Self::Dense(d) => d.fill_kv(meta, hidden, next_emb),
+        }
+    }
+
+    /// Flash-Next: move the head's routed experts into the stage's expert slot cache.
+    #[cfg(feature = "cuda")]
+    pub fn attach_bank(&mut self, bank: super::moe::Bank, moe: &crate::config::MoeConfig, act: &str) -> Result<()> {
+        match self {
+            Self::Flash(f) => f.attach_bank(bank, moe, act),
+            Self::Dense(_) => Ok(()),
+        }
     }
 }

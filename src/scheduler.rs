@@ -840,12 +840,21 @@ impl Scheduler {
             .iter()
             .map(|&i| {
                 let r = &self.running[i];
-                let want = if r.wants_two_drafts() { 2 } else { 1 };
+                // chains of more than two drafts were already cut by confidence when drafted
+                let want = if self.engine.mtp_drafts() > 2 {
+                    usize::MAX
+                } else if r.wants_two_drafts() {
+                    2
+                } else {
+                    1
+                };
                 r.mtp_drafts.len().min(want).min((r.max_new - r.generated()).saturating_sub(1))
             })
             .min()
             .unwrap()
-            .min(self.engine.mtp_drafts());
+            .min(self.engine.mtp_drafts())
+            // the decode kernels take 8 rows per step
+            .min((8 / cnt).saturating_sub(1));
         let k = n + 1;
         if n == 0
             || idxs.iter().any(|&i| self.running[i].params.has_penalties())
@@ -1016,10 +1025,17 @@ impl Scheduler {
     }
 
     /// New drafts for `idxs` after a step: the head over the step's rows (`next` = each row's
-    /// successor), drafting from `rows`; then, with `--mtp-drafts 2`, one more draft step at the
-    /// next position from the head's own streams (its KV in the request's `mtp_next_slot`).
+    /// successor), drafting from `rows`; then further draft steps from the head's own output,
+    /// one position on each time. With `--mtp-drafts 2` there is one further step, taken while
+    /// two drafts pay (`wants_two_drafts`); with more, the chain goes on while every request's
+    /// last draft has at least `--mtp-min-prob`. The head's KV for the first drafted position
+    /// lives in the request's `mtp_next_slot` (the verify step reuses it); later positions use
+    /// slots freed again here, since the head rewrites its KV for the tokens that get verified.
     fn mtp_redraft(&mut self, meta: &BatchMeta, hidden: &Tensor, next: &[u32], rows: &[u32], idxs: &[usize]) -> Result<()> {
-        let (first, multi) = self.engine.mtp_draft(meta, hidden, next, rows)?;
+        let max = self.engine.mtp_drafts();
+        let chain = max > 2;
+        let p_min = self.engine.mtp_min_prob();
+        let (first, mut probs, mut multi) = self.engine.mtp_draft_scored(meta, hidden, next, rows, false, chain)?;
         for (q, &i) in idxs.iter().enumerate() {
             let r = &mut self.running[i];
             r.mtp_drafts = vec![match &self.engine.mtp_oracle {
@@ -1027,59 +1043,86 @@ impl Scheduler {
                 None => first[q],
             }];
         }
-        if self.engine.mtp_drafts() < 2
-            || !self.engine.mtp_speculates()
-            || idxs.is_empty()
-            || !idxs.iter().all(|&i| self.running[i].wants_two_drafts())
-        {
+        if max < 2 || !self.engine.mtp_speculates() || idxs.is_empty() {
             return Ok(());
         }
-        // every request needs its next position's slot for the head's KV there
-        let missing = idxs.iter().filter(|&&i| self.running[i].mtp_next_slot.is_none()).count();
-        let Some(mut extra) = self.alloc_slots(missing) else {
-            return Ok(());
-        };
-        let mut meta2 = BatchMeta {
-            is_decode: true,
-            ..Default::default()
-        };
-        let mut toks2 = Vec::with_capacity(idxs.len());
-        for &i in idxs {
-            let r = &mut self.running[i];
-            let slot = *r.mtp_next_slot.get_or_insert_with(|| extra.pop().unwrap());
-            let pos = r.slots.len();
-            let mut slots = r.slots.clone();
-            slots.push(slot);
-            meta2.positions.push(pos as u32);
-            meta2.out_loc.push(slot);
-            meta2.seqs.push(SeqMeta {
-                seq_id: r.id,
-                q_len: 1,
-                kv_len: pos + 1,
-                state_slot: r.state_slot,
-                slots: Arc::new(slots),
-                prev_tokens: vec![],
-                token_state_slots: vec![],
-            });
-            toks2.push(r.mtp_drafts[0]);
-        }
-        meta2.tokens = toks2.clone();
-        self.attach_mrope(&mut meta2, idxs);
-        let rows2: Vec<u32> = (0..idxs.len() as u32).collect();
-        let (second, _) = self.engine.mtp_draft(&meta2, &multi, &toks2, &rows2)?;
-        for (q, &i) in idxs.iter().enumerate() {
-            let r = &mut self.running[i];
-            let d = match &self.engine.mtp_oracle {
-                Some(f) => {
-                    let mut t = r.tokens.clone();
-                    t.push(r.mtp_drafts[0]);
-                    f(&t)
-                }
-                None => second[q],
+        // a verify step takes 8 rows
+        let max = max.min((8 / idxs.len()).saturating_sub(1));
+        let mut temp: Vec<Vec<u32>> = vec![vec![]; idxs.len()];
+        let mut result = Ok(());
+        for step in 1..max {
+            let go = if chain {
+                self.engine.mtp_oracle.is_some() || probs.iter().all(|&p| p >= p_min)
+            } else {
+                idxs.iter().all(|&i| self.running[i].wants_two_drafts())
             };
-            r.mtp_drafts.push(d);
+            if !go {
+                break;
+            }
+            // this step's input token (the last draft) sits at position pos + step - 1
+            let need = idxs
+                .iter()
+                .filter(|&&i| step > 1 || self.running[i].mtp_next_slot.is_none())
+                .count();
+            let Some(mut extra) = self.alloc_slots(need) else {
+                break;
+            };
+            let mut meta2 = BatchMeta {
+                is_decode: true,
+                ..Default::default()
+            };
+            let mut toks2 = Vec::with_capacity(idxs.len());
+            for (q, &i) in idxs.iter().enumerate() {
+                let r = &mut self.running[i];
+                let first_slot = *r.mtp_next_slot.get_or_insert_with(|| extra.pop().unwrap());
+                if step > 1 {
+                    temp[q].push(extra.pop().unwrap());
+                }
+                let pos = r.slots.len() + step - 1;
+                let mut slots = r.slots.clone();
+                slots.push(first_slot);
+                slots.extend(&temp[q]);
+                meta2.positions.push(pos as u32);
+                meta2.out_loc.push(*slots.last().unwrap());
+                meta2.seqs.push(SeqMeta {
+                    seq_id: r.id,
+                    q_len: 1,
+                    kv_len: pos + 1,
+                    state_slot: r.state_slot,
+                    slots: Arc::new(slots),
+                    prev_tokens: vec![],
+                    token_state_slots: vec![],
+                });
+                toks2.push(*r.mtp_drafts.last().unwrap());
+            }
+            meta2.tokens = toks2.clone();
+            self.attach_mrope(&mut meta2, idxs);
+            let rows2: Vec<u32> = (0..idxs.len() as u32).collect();
+            let (ids, p, m) = match self.engine.mtp_draft_scored(&meta2, &multi, &toks2, &rows2, true, chain) {
+                Ok(x) => x,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            (probs, multi) = (p, m);
+            for (q, &i) in idxs.iter().enumerate() {
+                let r = &mut self.running[i];
+                let d = match &self.engine.mtp_oracle {
+                    Some(f) => {
+                        let mut t = r.tokens.clone();
+                        t.extend(&r.mtp_drafts);
+                        f(&t)
+                    }
+                    None => ids[q],
+                };
+                r.mtp_drafts.push(d);
+            }
         }
-        Ok(())
+        for t in &temp {
+            self.alloc.free(t);
+        }
+        result
     }
 
     fn decode_step(&mut self) {

@@ -22,7 +22,7 @@ use crate::parallel::comm::Communicator;
 use crate::weights::WeightSource;
 use anyhow::{bail, Result};
 use attention::{Attention, DeviceBatch};
-use candle_core::{DType, Device, Module, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::Linear;
 use gdn::{GatedDeltaNet, LinearState};
 use layers::{Mlp, Placement, RmsNorm, Rotary};
@@ -710,7 +710,7 @@ pub struct ModelHead {
     norm: FinalNorm,
     /// Qwen3.8: the embedding is copied into this many residual streams.
     streams: usize,
-    lm_head: Linear,
+    lm_head: layers::QLinear,
     pub device: Device,
     pub dtype: DType,
 }
@@ -723,10 +723,12 @@ impl ModelHead {
         // stays in host memory and leaves the VRAM to the KV and expert caches
         let host_embed = untied && p.device.is_cuda();
         let embed = src.get(&name, if host_embed { &Device::Cpu } else { &p.device }, p.dtype)?;
-        let lm_head = if untied {
-            Linear::new(src.get("lm_head.weight", &p.device, p.dtype)?, None)
+        let lm_head = if untied && src.is_kquant("lm_head.weight") {
+            layers::QLinear::load(src, "lm_head", true, p)?
+        } else if untied {
+            layers::QLinear::Dense(Linear::new(src.get("lm_head.weight", &p.device, p.dtype)?, None))
         } else {
-            Linear::new(embed.clone(), None)
+            layers::QLinear::Dense(Linear::new(embed.clone(), None))
         };
         let (norm, streams) = match &cfg.qwen38 {
             Some(q) => (

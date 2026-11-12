@@ -191,9 +191,14 @@ struct EngineArgs {
     /// verified in the next step; output is unchanged (exact for greedy and for sampling).
     #[arg(long)]
     mtp: bool,
-    /// Drafts per verify step with `--mtp` (1-2).
+    /// Most drafts per verify step with `--mtp` (1-7). Up to 2, the second draft is taken while
+    /// its measured acceptance pays; above 2, the head keeps drafting while its last draft's
+    /// probability is at least `--mtp-min-prob`.
     #[arg(long, default_value_t = 2)]
     mtp_drafts: usize,
+    /// Confidence a draft needs for the head to draft one more (`--mtp-drafts` above 2).
+    #[arg(long, default_value_t = 0.6)]
+    mtp_min_prob: f32,
     /// Do not load the checkpoint's vision tower: no image input, its VRAM (~0.9 GB for
     /// Qwen3.6 / 3.8) goes to the KV and expert caches.
     #[arg(long)]
@@ -246,6 +251,7 @@ impl EngineArgs {
             mtp: self.mtp_shadow,
             mtp_speculate: self.mtp,
             mtp_drafts: self.mtp_drafts,
+            mtp_min_prob: self.mtp_min_prob,
             text_only: self.text_only,
         })
     }

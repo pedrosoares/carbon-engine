@@ -215,3 +215,243 @@ DEFINE_TC(bf16, ABF16, 256)
 DEFINE_TC(f16, AF16, 64)
 DEFINE_TC(f16, AF16, 128)
 DEFINE_TC(f16, AF16, 256)
+
+// ---- decode over long contexts: chunked, one pass over K and V per KV head ----
+//
+// paged_decode (attention.cu) runs one block per (row, query head): fine for many short
+// sequences, but a long context then has 128 threads walking all of it, once per query head.
+// Here the context is cut into chunks of PD_WARPS * PD_WP positions, one block each (a warp
+// takes PD_WP of them: a lone warp runs a few hundred instructions per tile at its own pace, so
+// short warp chunks keep a step's latency down), and the G = H / KVH
+// query heads that share a KV head are scored together, so K and V are read once:
+//
+//   S[16 pos x G]  = K[16 pos x D] Q^T        D/16 mma.m16n8k16 (Q^T fragments in registers)
+//   online softmax per head across the chunk's tiles
+//   O^T[D x G]    += V^T[D x 16 pos] P^T      D/16 mma.m16n8k16
+//
+// A tile's 16 K rows, then its 16 V rows, are staged in shared memory with coalesced loads
+// (fragments pick single elements of 16 rows; from global memory each load would touch 16 lines).
+// A block merges its warps and writes (m, l, O) per head to `part`; paged_decode_merge combines
+// the chunks.
+//   part [B, KVH, NC, PD_G, 2 + D] f32
+
+#ifndef CARBON_HOST_TEST
+#define PD_WP 64
+#define PD_WARPS 4
+#define PD_G 8
+#define PD_MAXD 256
+
+// Copy 16 pool rows into shared memory: all the loads are issued before the first store, so
+// their latencies overlap instead of adding up (a store may alias the next row's pointer).
+__device__ __forceinline__ void pd_stage(u32 (*st)[PD_MAXD / 2], const u16* pool, const unsigned* slots,
+                                         unsigned t0, unsigned s1, int KVH, int kvh, int D, int lane) {
+    const int per = D / 64;  // words per lane and row
+    const u32* rows[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        unsigned j = t0 + r < s1 ? t0 + r : s1 - 1;
+        rows[r] = (const u32*)(pool + ((long)slots[j] * KVH + kvh) * D);
+    }
+    u32 tmp[16][PD_MAXD / 64];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+#pragma unroll
+        for (int i = 0; i < PD_MAXD / 64; ++i) tmp[r][i] = i < per ? rows[r][lane + 32 * i] : 0u;
+    }
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+#pragma unroll
+        for (int i = 0; i < PD_MAXD / 64; ++i)
+            if (i < per) st[r][lane + 32 * i] = tmp[r][i];
+    }
+}
+
+// After the block's warps left (m, l) in sp and O^T in their stage rows: combine them into the
+// chunk's partial at `pb`. Thread i takes elements i, i + 128, ... of the D * PD_G outputs.
+__device__ __forceinline__ void pd_block_merge(u32 (*stage)[16][PD_MAXD / 2], float (*sp)[16][PD_G], float* pb,
+                                               int D) {
+    for (int e = threadIdx.x; e < D * PD_G; e += PD_WARPS * 32) {
+        int hh = e % PD_G, d = e / PD_G;
+        float mm = -1e30f;
+#pragma unroll
+        for (int w = 0; w < PD_WARPS; ++w) mm = fmaxf(mm, sp[w][0][hh]);
+        float o = 0.0f, ll = 0.0f;
+#pragma unroll
+        for (int w = 0; w < PD_WARPS; ++w) {
+            float wgt = __expf(sp[w][0][hh] - mm);
+            o += wgt * ((const float*)stage[w])[e];
+            ll += wgt * sp[w][1][hh];
+        }
+        float* ph = pb + (long)hh * (D + 2);
+        ph[2 + d] = o;
+        if (d == 0) {
+            ph[0] = mm;
+            ph[1] = ll;
+        }
+    }
+}
+
+template <class A>
+__device__ void paged_decode_tc(const u16* q, const u16* kc, const u16* vc, const unsigned* slots,
+                                const unsigned* starts, float* part, int H, int KVH, int D, float scale, int NCW) {
+    __shared__ u32 stage[PD_WARPS][16][PD_MAXD / 2];
+    __shared__ float sp[PD_WARPS][16][PD_G];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane >> 2, tg = lane & 3;
+    const int G = H / KVH, KS = D / 16;
+    const int c = blockIdx.x % NCW;
+    const int kvh = (blockIdx.x / NCW) % KVH, b = blockIdx.x / NCW / KVH;
+    const unsigned s0 = starts[b], s1 = starts[b + 1];
+    if (s0 + (unsigned)c * (PD_WARPS * PD_WP) >= s1) return;  // the whole block is past the end
+    const unsigned p0 = s0 + (unsigned)c * (PD_WARPS * PD_WP) + (unsigned)warp * PD_WP;
+    const unsigned p1 = p0 + PD_WP < s1 ? p0 + PD_WP : s1;
+
+    u32(*st)[PD_MAXD / 2] = stage[warp];
+    float(*pw)[PD_G] = sp[warp];
+    if (p0 >= s1) {
+        // this warp's part of the chunk is empty: weight exp(-inf) in the merge
+        if (lane < PD_G) {
+            pw[0][lane] = -1e30f;
+            pw[1][lane] = 0.0f;
+        }
+        for (int e = lane; e < D * PD_G; e += 32) ((float*)st)[e] = 0.0f;
+        __syncthreads();
+        pd_block_merge(stage, sp, part + ((((long)b * KVH + kvh) * NCW + c) * PD_G) * (D + 2), D);
+        return;
+    }
+    u32 qf[PD_MAXD / 16][2];
+    const u32* qr = (const u32*)(q + ((long)b * H + (long)kvh * G + (g < G ? g : 0)) * D);
+#pragma unroll
+    for (int ks = 0; ks < PD_MAXD / 16; ++ks) {
+        bool on = ks < KS && g < G;
+        qf[ks][0] = on ? qr[8 * ks + tg] : 0u;
+        qf[ks][1] = on ? qr[8 * ks + 4 + tg] : 0u;
+    }
+    float m0 = -1e30f, m1 = -1e30f, l0 = 0.0f, l1 = 0.0f;
+    float acc[PD_MAXD / 16][4];
+#pragma unroll
+    for (int ds = 0; ds < PD_MAXD / 16; ++ds) acc[ds][0] = acc[ds][1] = acc[ds][2] = acc[ds][3] = 0.0f;
+
+    for (unsigned t0 = p0; t0 < p1; t0 += 16) {
+        // positions past the end re-read the last one and get zero weight
+        pd_stage(st, kc, slots, t0, s1, KVH, kvh, D, lane);
+        __syncwarp();
+        float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int ks = 0; ks < PD_MAXD / 16; ++ks) {
+            if (ks < KS) {
+                u32 a[4] = {st[g][8 * ks + tg], st[g + 8][8 * ks + tg], st[g][8 * ks + 4 + tg],
+                            st[g + 8][8 * ks + 4 + tg]};
+                Mma<A>::run(s, a, qf[ks]);
+            }
+        }
+        bool va = t0 + g < p1, vb = t0 + g + 8 < p1;
+        float s00 = va ? s[0] * scale : -1e30f, s01 = va ? s[1] * scale : -1e30f;
+        float s10 = vb ? s[2] * scale : -1e30f, s11 = vb ? s[3] * scale : -1e30f;
+        // heads 2tg / 2tg+1 live in the 8 lanes with this tg
+        float t0m = fmaxf(s00, s10), t1m = fmaxf(s01, s11);
+#pragma unroll
+        for (int off = 4; off < 32; off <<= 1) {
+            t0m = fmaxf(t0m, __shfl_xor_sync(0xffffffff, t0m, off));
+            t1m = fmaxf(t1m, __shfl_xor_sync(0xffffffff, t1m, off));
+        }
+        float n0 = fmaxf(m0, t0m), n1 = fmaxf(m1, t1m);
+        float corr0 = __expf(m0 - n0), corr1 = __expf(m1 - n1);
+        float p00 = __expf(s00 - n0), p01 = __expf(s01 - n1), p10 = __expf(s10 - n0), p11 = __expf(s11 - n1);
+        float ls0 = p00 + p10, ls1 = p01 + p11;
+#pragma unroll
+        for (int off = 4; off < 32; off <<= 1) {
+            ls0 += __shfl_xor_sync(0xffffffff, ls0, off);
+            ls1 += __shfl_xor_sync(0xffffffff, ls1, off);
+        }
+        l0 = l0 * corr0 + ls0;
+        l1 = l1 * corr1 + ls1;
+        m0 = n0;
+        m1 = n1;
+        pw[g][2 * tg] = p00;
+        pw[g][2 * tg + 1] = p01;
+        pw[g + 8][2 * tg] = p10;
+        pw[g + 8][2 * tg + 1] = p11;
+        __syncwarp();
+        pd_stage(st, vc, slots, t0, s1, KVH, kvh, D, lane);
+        __syncwarp();
+        // P^T [16 pos x G]: rows 2tg, 2tg+1 (and +8) of column g
+        u32 pf[2] = {tc_pack<A>(pw[2 * tg][g], pw[2 * tg + 1][g]), tc_pack<A>(pw[8 + 2 * tg][g], pw[9 + 2 * tg][g])};
+        const u16* v0 = (const u16*)st[2 * tg];
+        const u16* v1 = (const u16*)st[2 * tg + 1];
+        const u16* v2 = (const u16*)st[8 + 2 * tg];
+        const u16* v3 = (const u16*)st[9 + 2 * tg];
+#pragma unroll
+        for (int ds = 0; ds < PD_MAXD / 16; ++ds) {
+            if (ds < KS) {
+                acc[ds][0] *= corr0;
+                acc[ds][1] *= corr1;
+                acc[ds][2] *= corr0;
+                acc[ds][3] *= corr1;
+                int da = 16 * ds + g, db = da + 8;
+                u32 a[4] = {(u32)v0[da] | ((u32)v1[da] << 16), (u32)v0[db] | ((u32)v1[db] << 16),
+                            (u32)v2[da] | ((u32)v3[da] << 16), (u32)v2[db] | ((u32)v3[db] << 16)};
+                Mma<A>::run(acc[ds], a, pf);
+            }
+        }
+        __syncwarp();
+    }
+    // merge the block's warps: each leaves (m, l) in sp and O^T [D x PD_G] in its stage rows
+    float* so = (float*)st;
+    if (g == 0) {
+        pw[0][2 * tg] = m0;
+        pw[0][2 * tg + 1] = m1;
+        pw[1][2 * tg] = l0;
+        pw[1][2 * tg + 1] = l1;
+    }
+#pragma unroll
+    for (int ds = 0; ds < PD_MAXD / 16; ++ds) {
+        if (ds < KS) {
+            int da = 16 * ds + g, db = da + 8;
+            so[da * PD_G + 2 * tg] = acc[ds][0];
+            so[da * PD_G + 2 * tg + 1] = acc[ds][1];
+            so[db * PD_G + 2 * tg] = acc[ds][2];
+            so[db * PD_G + 2 * tg + 1] = acc[ds][3];
+        }
+    }
+    __syncthreads();
+    pd_block_merge(stage, sp, part + ((((long)b * KVH + kvh) * NCW + c) * PD_G) * (D + 2), D);
+}
+
+// grid B * H blocks of D threads: thread d sums its element over the row's chunks
+template <class A>
+__device__ void paged_decode_merge(const float* part, const unsigned* starts, u16* out, int H, int KVH, int D,
+                                   int NCW) {
+    const int b = blockIdx.x / H, h = blockIdx.x % H, d = threadIdx.x;
+    if (d >= D) return;
+    const int G = H / KVH, kvh = h / G, hh = h % G;
+    const unsigned len = starts[b + 1] - starts[b];
+    int nc = (int)((len + PD_WARPS * PD_WP - 1) / (PD_WARPS * PD_WP));
+    if (nc > NCW) nc = NCW;
+    const float* p0 = part + ((((long)b * KVH + kvh) * NCW) * PD_G + hh) * (D + 2);
+    const long step = (long)PD_G * (D + 2);
+    float mm = -1e30f;
+    for (int c = 0; c < nc; ++c) mm = fmaxf(mm, p0[c * step]);
+    float ll = 0.0f, o = 0.0f;
+    for (int c = 0; c < nc; ++c) {
+        float w = __expf(p0[c * step] - mm);
+        ll += w * p0[c * step + 1];
+        o += w * p0[c * step + 2 + d];
+    }
+    A::store(out, ((long)b * H + h) * D + d, ll > 0.0f ? o / ll : 0.0f);
+}
+
+#define DEFINE_PD_TC(SUFFIX, A)                                                                               \
+    extern "C" __global__ void paged_decode_tc_##SUFFIX(const u16* q, const u16* k, const u16* v,            \
+                                                        const unsigned* slots, const unsigned* starts,        \
+                                                        float* part, int H, int KVH, int D, float scale,      \
+                                                        int NCW) {                                            \
+        paged_decode_tc<A>(q, k, v, slots, starts, part, H, KVH, D, scale, NCW);                              \
+    }                                                                                                         \
+    extern "C" __global__ void paged_decode_merge_##SUFFIX(const float* part, const unsigned* starts,        \
+                                                           u16* out, int H, int KVH, int D, int NCW) {        \
+        paged_decode_merge<A>(part, starts, out, H, KVH, D, NCW);                                             \
+    }
+
+DEFINE_PD_TC(bf16, ABF16)
+DEFINE_PD_TC(f16, AF16)
+#endif

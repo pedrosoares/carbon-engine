@@ -39,7 +39,7 @@ pub fn resolve(model: &Path, source: Source) -> Result<PathBuf> {
 
 /// `resolve`; `weights = false` fetches only configs and tokenizer files (`--dummy-weight`).
 pub fn resolve_with(model: &Path, source: Source, weights: bool) -> Result<PathBuf> {
-    if model.is_dir() {
+    if model.is_dir() || crate::gguf::find(model).is_some() {
         return Ok(model.to_path_buf());
     }
     let spec = model.to_string_lossy().to_string();

@@ -12,6 +12,8 @@
 
 #define GDN_MAX_DK 256
 #define GDN_MAX_DV 256
+#define GDN_MAX_PARTS 8   // threads per state column in gdn_step
+#define GDN_PART_ROWS 32  // most state rows one of them takes
 
 __device__ __forceinline__ float gdn_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
@@ -55,9 +57,12 @@ template <class D>
 __device__ void gdn_step(const float* act, const typename D::T* z, const typename D::T* braw,
                          const typename D::T* araw, float* ssm, const unsigned* idx, const unsigned* fresh,
                          const float* dt_bias, const float* a_neg, const typename D::T* norm_w, typename D::T* y,
-                         int HK, int HV, int DK, int DV, float eps, int gate_sigmoid) {
+                         int HK, int HV, int DK, int DV, float eps, int flags) {
+    // flags: bit 0 = sigmoid output gate, bit 1 = value heads tiled over the key heads
+    int gate_sigmoid = flags & 1;
     __shared__ float sq[GDN_MAX_DK], sk[GDN_MAX_DK], so[GDN_MAX_DV], red[32];
-    int b = blockIdx.x / HV, h = blockIdx.x % HV, kh = h / (HV / HK);
+    __shared__ float sm[GDN_MAX_PARTS][GDN_MAX_DV];
+    int b = blockIdx.x / HV, h = blockIdx.x % HV, kh = (flags & 2) ? h % HK : h / (HV / HK);
     long C = 2L * HK * DK + (long)HV * DV;
     const float* a = act + b * C;
     float pq = 0.0f, pk = 0.0f;
@@ -84,19 +89,69 @@ __device__ void gdn_step(const float* act, const typename D::T* z, const typenam
     float* S = ssm + (long)idx[b] * HV * DK * DV + (long)h * DK * DV;
     const float* v = a + 2L * HK * DK + (long)h * DV;
 
+    // The state update is DK x DV: with a block of P * JW threads (JW = DV rounded up to a warp),
+    // thread (part, j) takes DK / P rows of column j and the parts add up through shared memory.
+    // One thread per column walking all DK rows twice is latency-bound (24 us for 128 x 128).
+    int JW = ((DV + 31) / 32) * 32;
+    if (JW > (int)blockDim.x) JW = blockDim.x;
+    int P = blockDim.x / JW;
+    if (P > GDN_MAX_PARTS) P = GDN_MAX_PARTS;
+    if (P > 1 && (DK % P != 0 || DK / P > GDN_PART_ROWS || JW < DV)) P = 1;
     float pss = 0.0f;
-    for (int j = threadIdx.x; j < DV; j += blockDim.x) {
+    if (P > 1) {
+        const int part = threadIdx.x / JW, j = threadIdx.x % JW;
+        const bool on = part < P && j < DV;
+        const int nr = DK / P, i0 = part * nr;
+        float sreg[GDN_PART_ROWS];
         float mem = 0.0f;
-        for (int i = 0; i < DK; ++i) mem += sk[i] * (zero ? 0.0f : S[(long)i * DV + j] * decay);
-        float delta = (v[j] - mem) * beta;
-        float o = 0.0f;
-        for (int i = 0; i < DK; ++i) {
-            float s = (zero ? 0.0f : S[(long)i * DV + j] * decay) + sk[i] * delta;
-            S[(long)i * DV + j] = s;
-            o += sq[i] * s;
+        if (on) {
+#pragma unroll
+            for (int r = 0; r < GDN_PART_ROWS; ++r) {
+                if (r < nr) {
+                    sreg[r] = zero ? 0.0f : S[(long)(i0 + r) * DV + j] * decay;
+                    mem += sk[i0 + r] * sreg[r];
+                }
+            }
+            sm[part][j] = mem;
         }
-        so[j] = o;
-        pss += o * o;
+        __syncthreads();
+        float tot = 0.0f;
+        if (on)
+            for (int q = 0; q < P; ++q) tot += sm[q][j];
+        __syncthreads();
+        if (on) {
+            float delta = (v[j] - tot) * beta, o = 0.0f;
+#pragma unroll
+            for (int r = 0; r < GDN_PART_ROWS; ++r) {
+                if (r < nr) {
+                    float sv = sreg[r] + sk[i0 + r] * delta;
+                    S[(long)(i0 + r) * DV + j] = sv;
+                    o += sq[i0 + r] * sv;
+                }
+            }
+            sm[part][j] = o;
+        }
+        __syncthreads();
+        if (on && part == 0) {
+            float o = 0.0f;
+            for (int q = 0; q < P; ++q) o += sm[q][j];
+            so[j] = o;
+            pss = o * o;
+        }
+    } else {
+        for (int j = threadIdx.x; j < DV; j += blockDim.x) {
+            float mem = 0.0f;
+            for (int i = 0; i < DK; ++i) mem += sk[i] * (zero ? 0.0f : S[(long)i * DV + j] * decay);
+            float delta = (v[j] - mem) * beta;
+            float o = 0.0f;
+            for (int i = 0; i < DK; ++i) {
+                float s = (zero ? 0.0f : S[(long)i * DV + j] * decay) + sk[i] * delta;
+                S[(long)i * DV + j] = s;
+                o += sq[i] * s;
+            }
+            so[j] = o;
+            pss += o * o;
+        }
     }
     float inv = rsqrtf(gdn_block_sum(pss, red) / (float)DV + eps);
     long base = (long)b * HV * DV + (long)h * DV;

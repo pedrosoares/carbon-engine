@@ -816,17 +816,19 @@ impl Attention {
     pub fn forward(&self, x: &Tensor, b: &DeviceBatch, kv: &LayerKv) -> Result<Tensor> {
         let t = b.num_tokens;
         let (h, kvh, d) = (self.heads, self.kv_heads, self.head_dim);
+        let mut qkv = QLinear::forward_many(&[&self.q, &self.k, &self.v], x)?;
+        let v = qkv.pop().expect("v").reshape((t, kvh * d))?;
+        let mut k = qkv.pop().expect("k").reshape((t, kvh, d))?;
+        let qp = qkv.pop().expect("q");
         let (mut q, gate) = if self.output_gate {
-            let qg = self.q.forward(x)?.reshape((t, h, 2 * d))?;
+            let qg = qp.reshape((t, h, 2 * d))?;
             (
                 qg.narrow(2, 0, d)?,
                 Some(qg.narrow(2, d, d)?.reshape((t, h * d))?),
             )
         } else {
-            (self.q.forward(x)?.reshape((t, h, d))?, None)
+            (qp.reshape((t, h, d))?, None)
         };
-        let mut k = self.k.forward(x)?.reshape((t, kvh, d))?;
-        let v = self.v.forward(x)?.reshape((t, kvh * d))?;
         if let (Some(qn), Some(kn)) = (&self.q_norm, &self.k_norm) {
             q = qn.forward(&q)?;
             k = kn.forward(&k)?;

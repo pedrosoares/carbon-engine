@@ -965,12 +965,12 @@ fn mtp_kv_only_pass_matches_full_pass() {
         if kv_only {
             engine.mtp_fill_kv(&m, &hidden, &prompt[1..]).unwrap();
         } else {
-            engine.mtp_draft(&m, &hidden, &prompt[1..], &[]).unwrap();
+            engine.mtp_draft(&m, &hidden, &prompt[1..], &[], false).unwrap();
         }
         // the last prompt token, then a draft for the token after an arbitrary next token
         let m = meta(&prompt[n - 1..], n - 1);
         let (_, hidden) = engine.forward_hidden(m.clone(), &prompt[n - 1..], &[0]).unwrap();
-        let (d, multi) = engine.mtp_draft(&m, &hidden, &[7], &[0]).unwrap();
+        let (d, multi) = engine.mtp_draft(&m, &hidden, &[7], &[0], false).unwrap();
         (d[0], multi.to_dtype(candle_core::DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap())
     };
     let (full, a) = draft_after(false);

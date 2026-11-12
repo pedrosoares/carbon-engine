@@ -52,6 +52,9 @@ pub struct EngineConfig {
     pub mtp_speculate: bool,
     /// Drafts per verify step (1..=MTP_MAX_DRAFTS).
     pub mtp_drafts: usize,
+    /// With more than two drafts per step: the head keeps drafting while its last draft's
+    /// probability is at least this (`--mtp-min-prob`).
+    pub mtp_min_prob: f32,
     /// Skip the checkpoint's vision tower (no image input, its VRAM left to the caches).
     pub text_only: bool,
 }
@@ -78,13 +81,14 @@ impl EngineConfig {
             mtp: false,
             mtp_speculate: false,
             mtp_drafts: 1,
+            mtp_min_prob: 0.6,
             text_only: false,
         }
     }
 }
 
 /// Most drafts per verify step (`--mtp-drafts`).
-pub const MTP_MAX_DRAFTS: usize = 2;
+pub const MTP_MAX_DRAFTS: usize = 7;
 
 /// Tests only: a draft from the request's tokens so far (see `Engine::mtp_oracle`).
 pub type MtpOracle = std::sync::Arc<dyn Fn(&[u32]) -> u32 + Send + Sync>;
@@ -112,6 +116,7 @@ pub struct Engine {
     /// slots hold drafts' states during verify steps.
     mtp_speculate: bool,
     mtp_max_drafts: usize,
+    mtp_min_prob: f32,
     pub spare_states: usize,
     /// Tests only: replaces the MTP head's draft with `oracle(request tokens so far)`, so the
     /// accept path of speculative decoding can be exercised with a random head.
@@ -353,6 +358,7 @@ impl Engine {
             dtype: head_dtype,
             mtp_speculate: ec.mtp_speculate && mtp.is_some() && speculation_supported,
             mtp_max_drafts: ec.mtp_drafts.clamp(1, MTP_MAX_DRAFTS),
+            mtp_min_prob: ec.mtp_min_prob,
             mtp,
             spare_states,
             mtp_oracle: None,
@@ -436,15 +442,43 @@ impl Engine {
     /// Greedy MTP drafts for `rows`: runs the head over every token of the step (`hidden` from
     /// `forward_hidden`, or a previous draft step's streams; `next[i]` the token after token `i`)
     /// and returns, per row, its guess for the token after `next[row]`, and the head's streams
-    /// for those rows (the input of a further draft step).
-    pub fn mtp_draft(&self, meta: &BatchMeta, hidden: &Tensor, next: &[u32], rows: &[u32]) -> Result<(Vec<u32>, Tensor)> {
+    /// for those rows (the input of a further draft step). `chained`: `hidden` is such an output.
+    pub fn mtp_draft(&self, meta: &BatchMeta, hidden: &Tensor, next: &[u32], rows: &[u32], chained: bool) -> Result<(Vec<u32>, Tensor)> {
+        let (ids, _, multi) = self.mtp_draft_scored(meta, hidden, next, rows, chained, false)?;
+        Ok((ids, multi))
+    }
+
+    /// [`Engine::mtp_draft`], also returning each draft's probability when `scored`.
+    pub fn mtp_draft_scored(
+        &self,
+        meta: &BatchMeta,
+        hidden: &Tensor,
+        next: &[u32],
+        rows: &[u32],
+        chained: bool,
+        scored: bool,
+    ) -> Result<(Vec<u32>, Vec<f32>, Tensor)> {
         let m = self.mtp.as_ref().context("no MTP head")?;
         let emb = self.head.embed_single(next)?;
-        let (mixed, multi) = m.forward(meta, hidden, &emb, rows)?;
+        let (mixed, multi) = m.forward(meta, hidden, &emb, rows, chained)?;
         if rows.is_empty() {
-            return Ok((vec![], multi));
+            return Ok((vec![], vec![], multi));
         }
-        Ok((self.head.project(&mixed)?.argmax(1)?.to_vec1::<u32>()?, multi))
+        let logits = self.head.project(&mixed)?;
+        let ids = logits.argmax(1)?.to_vec1::<u32>()?;
+        let probs = if scored {
+            // p(argmax) = 1 / sum(exp(logit - max))
+            let max = logits.max_keepdim(1)?;
+            logits.broadcast_sub(&max)?.exp()?.sum(1)?.recip()?.to_vec1::<f32>()?
+        } else {
+            vec![]
+        };
+        Ok((ids, probs, multi))
+    }
+
+    /// Probability below which a chain of more than two drafts stops (`--mtp-min-prob`).
+    pub fn mtp_min_prob(&self) -> f32 {
+        self.mtp_min_prob
     }
 
     /// Only the MTP head's KV for the step's tokens (`mtp_draft`'s inputs, no draft).

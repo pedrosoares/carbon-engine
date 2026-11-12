@@ -41,6 +41,10 @@ pub struct LinearAttnConfig {
     pub k_head_dim: usize,
     pub v_head_dim: usize,
     pub conv_kernel: usize,
+    /// Value heads are stored tiled over the key heads (`k0 k1 .. k0 k1 ..`, GGUF) instead of
+    /// grouped by key head: value head `h` reads key head `h % num_k_heads`.
+    #[serde(default)]
+    pub v_tiled: bool,
 }
 
 impl LinearAttnConfig {
@@ -410,6 +414,13 @@ impl ModelConfig {
 
     /// `from_dir` with `--hf-overrides` applied to `config.json` first.
     pub fn from_dir_with(dir: &Path, overrides: Option<&Value>) -> Result<Self> {
+        if let Some(file) = crate::gguf::find(dir) {
+            let mut v = crate::gguf::Gguf::open(&file)?.hf_config()?;
+            if let Some(o) = overrides {
+                apply_overrides(&mut v, o)?;
+            }
+            return Self::from_hf(&v);
+        }
         let path = dir.join("config.json");
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -610,6 +621,7 @@ impl ModelConfig {
                 v_head_dim: get_usize(v, "linear_value_head_dim")
                     .context("linear_value_head_dim")?,
                 conv_kernel: get_usize(v, "linear_conv_kernel_dim").unwrap_or(4),
+                v_tiled: v.get("linear_v_tiled").and_then(|x| x.as_bool()).unwrap_or(false),
             })
         } else {
             None

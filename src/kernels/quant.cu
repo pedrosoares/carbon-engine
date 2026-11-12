@@ -135,6 +135,254 @@ __device__ void fp8_gemv(const u8* w, const float* scale, const typename D::T* x
     }
 }
 
+// ---- GGUF K-quants: rows of 256-weight super-blocks, kind 0 = Q4_K (144 bytes), 1 = Q6_K (224:
+// the file's 210-byte block padded so both kinds are read as aligned 32-bit words) ----
+//
+// Q4_K block: f16 d, f16 dmin, 12 bytes of 6-bit (scale, min) per 32-weight sub-block, 128 code
+// bytes; sub-blocks 2p / 2p+1 are the low / high nibbles of bytes [32p, 32p+32):
+//   w = d * scale * code - dmin * min
+// Q6_K block: ql[128], qh[64], i8 scales[16] (per 16 weights), f16 d; codes are 6 bits, biased 32:
+//   w = d * scale * (code - 32)
+
+#define Q4K_BLOCK 144
+#define Q6K_BLOCK 224
+
+__device__ __forceinline__ float kq_half(const u8* p) { return f16_to_f32((u16)(p[0] | (p[1] << 8))); }
+
+__device__ __forceinline__ void q4k_scale_min(int j, const u8* q, float d, float dmin, float* s, float* m) {
+    unsigned sc, mn;
+    if (j < 4) {
+        sc = q[j] & 63;
+        mn = q[j + 4] & 63;
+    } else {
+        sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        mn = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+    *s = d * (float)sc;
+    *m = dmin * (float)mn;
+}
+
+// weight `l` (0..32) of 32-weight group `j` (0..8) of a Q6_K block
+__device__ __forceinline__ float q6k_weight(const u8* b, int j, int l, float d) {
+    int half = j >> 2, which = j & 3;
+    const u8* ql = b + 64 * half;
+    u8 lo = ql[l + 32 * (which & 1)];
+    int nib = which >= 2 ? (lo >> 4) : (lo & 15);
+    int hb = (b[128 + 32 * half + l] >> (2 * which)) & 3;
+    int sc = (signed char)b[192 + 8 * half + (l >> 4) + 2 * which];
+    return d * (float)sc * (float)((nib | (hb << 4)) - 32);
+}
+
+// out [n, k]; one thread per 32-weight group
+template <class D>
+__device__ void kq_dequant(const u8* data, typename D::T* out, int n, int k, int kind) {
+    long groups = (long)n * (k / 32);
+    long row_bytes = (long)(k / 256) * (kind ? Q6K_BLOCK : Q4K_BLOCK);
+    for (long g = (long)blockIdx.x * blockDim.x + threadIdx.x; g < groups; g += (long)gridDim.x * blockDim.x) {
+        long row = g / (k / 32);
+        int s = (int)(g % (k / 32)), blk = s >> 3, j = s & 7;
+        long o = row * k + (long)s * 32;
+        if (kind == 0) {
+            const u8* b = data + row * row_bytes + (long)blk * Q4K_BLOCK;
+            float sc, mn;
+            q4k_scale_min(j, b + 4, kq_half(b), kq_half(b + 2), &sc, &mn);
+            const u8* q = b + 16 + 32 * (j >> 1);
+            int shift = (j & 1) * 4;
+            for (int l = 0; l < 32; ++l) D::store(out, o + l, sc * (float)((q[l] >> shift) & 15) - mn);
+        } else {
+            const u8* b = data + row * row_bytes + (long)blk * Q6K_BLOCK;
+            float d = kq_half(b + 208);
+            for (int l = 0; l < 32; ++l) D::store(out, o + l, q6k_weight(b, j, l, d));
+        }
+    }
+}
+
+// y[t, r] = sum_c x[t, c] * W[r, c]; one warp per output row, up to 8 rows of x. Each lane takes
+// whole 64-weight units (Q4_K: a sub-block pair, 32 code bytes; Q6_K: two 32-weight groups).
+template <class D>
+__device__ void kq_gemv(const u8* data, const typename D::T* x, typename D::T* y, int n, int k, int t, int kind) {
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    long row = (long)blockIdx.x * (blockDim.x / 32) + warp;
+    if (row >= n) return;
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int units = k / 64;
+    if (kind == 0) {
+        const u8* rp = data + row * (long)(k / 256) * Q4K_BLOCK;
+        for (int u = lane; u < units; u += 32) {
+            int blk = u >> 2, pair = u & 3;
+            const u8* b = rp + (long)blk * Q4K_BLOCK;
+            float d = kq_half(b), dmin = kq_half(b + 2), s1, m1, s2, m2;
+            q4k_scale_min(2 * pair, b + 4, d, dmin, &s1, &m1);
+            q4k_scale_min(2 * pair + 1, b + 4, d, dmin, &s2, &m2);
+            const u8* q = b + 16 + 32 * pair;
+            int col = u * 64;
+            for (int l = 0; l < 32; ++l) {
+                u8 c = q[l];
+                float lo = s1 * (float)(c & 15) - m1, hi = s2 * (float)(c >> 4) - m2;
+                for (int ti = 0; ti < t; ++ti) {
+                    acc[ti] += lo * D::load(x, (long)ti * k + col + l) + hi * D::load(x, (long)ti * k + col + 32 + l);
+                }
+            }
+        }
+    } else {
+        const u8* rp = data + row * (long)(k / 256) * Q6K_BLOCK;
+        for (int u = lane; u < units; u += 32) {
+            int blk = u >> 2, j = (u & 3) * 2;
+            const u8* b = rp + (long)blk * Q6K_BLOCK;
+            float d = kq_half(b + 208);
+            int col = u * 64;
+            for (int l = 0; l < 32; ++l) {
+                float w0 = q6k_weight(b, j, l, d), w1 = q6k_weight(b, j + 1, l, d);
+                for (int ti = 0; ti < t; ++ti) {
+                    acc[ti] += w0 * D::load(x, (long)ti * k + col + l) + w1 * D::load(x, (long)ti * k + col + 32 + l);
+                }
+            }
+        }
+    }
+    for (int ti = 0; ti < t; ++ti) {
+        float v = acc[ti];
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+        if (lane == 0) D::store(y, (long)ti * n + row, v);
+    }
+}
+
+// ---- K-quant GEMV on 8-bit activations (the fast path) ----
+//
+// kq_prep quantizes x per 32 inputs: x ~ xs * xq with xq in [-127, 127]. Per row of x the
+// prepared buffer holds (in float units) [xq: k bytes][xs: k/32][sums: k/16], sums being
+// xs * sum(xq) over each 16 inputs (the K-quants' offset terms).
+// kq_gemv_i8 then takes 4 weights per dp4a: the packed codes are split into byte lanes with two
+// masks, so a row costs about one instruction per weight and stays memory-bound.
+
+#define KQ_PREP_STRIDE(k) ((k) / 4 + (k) / 32 + (k) / 16)
+
+#ifndef CARBON_HOST_TEST
+__device__ __forceinline__ int kq_dp4a(unsigned w, int x, int acc) {
+    int r;
+    asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(w), "r"(x), "r"(acc));
+    return r;
+}
+#else
+__device__ __forceinline__ int kq_dp4a(unsigned w, int x, int acc) {
+    for (int i = 0; i < 4; ++i) acc += (int)((w >> (8 * i)) & 0xff) * (int)(signed char)((x >> (8 * i)) & 0xff);
+    return acc;
+}
+#endif
+
+template <class D>
+__device__ void kq_prep(const typename D::T* x, float* out, int k, int t) {
+    long groups = (long)t * (k / 32);
+    for (long g = (long)blockIdx.x * blockDim.x + threadIdx.x; g < groups; g += (long)gridDim.x * blockDim.x) {
+        int ti = (int)(g / (k / 32)), s = (int)(g % (k / 32));
+        const long xo = (long)ti * k + (long)s * 32;
+        float v[32], mx = 0.0f;
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            v[l] = D::load(x, xo + l);
+            mx = fmaxf(mx, fabsf(v[l]));
+        }
+        float* base = out + (long)ti * KQ_PREP_STRIDE(k);
+        float inv = mx > 0.0f ? 127.0f / mx : 0.0f, xs = mx / 127.0f;
+        unsigned* xq = (unsigned*)base + s * 8;
+        int sum[2] = {0, 0};
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            unsigned word = 0;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                int q = __float2int_rn(v[4 * w + b] * inv);
+                sum[w >> 2] += q;
+                word |= ((unsigned)q & 0xff) << (8 * b);
+            }
+            xq[w] = word;
+        }
+        base[k / 4 + s] = xs;
+        base[k / 4 + k / 32 + 2 * s] = xs * (float)sum[0];
+        base[k / 4 + k / 32 + 2 * s + 1] = xs * (float)sum[1];
+    }
+}
+
+template <class D>
+__device__ void kq_gemv_i8(const u8* data, const float* prep, typename D::T* y, int n, int k, int t, int kind) {
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    long row = (long)blockIdx.x * (blockDim.x / 32) + warp;
+    if (row >= n) return;
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const int units = k / 64, stride = KQ_PREP_STRIDE(k);
+    if (kind == 0) {
+        const unsigned* rp = (const unsigned*)(data + row * (long)(k / 256) * Q4K_BLOCK);
+        for (int u = lane; u < units; u += 32) {
+            int blk = u >> 2, pair = u & 3;
+            const unsigned* b = rp + blk * (Q4K_BLOCK / 4);
+            unsigned h0 = b[0];
+            float d = f16_to_f32((u16)(h0 & 0xffff)), dmin = f16_to_f32((u16)(h0 >> 16)), s1, m1, s2, m2;
+            q4k_scale_min(2 * pair, (const u8*)(b + 1), d, dmin, &s1, &m1);
+            q4k_scale_min(2 * pair + 1, (const u8*)(b + 1), d, dmin, &s2, &m2);
+            const unsigned* q = b + 4 + 8 * pair;
+            unsigned lo[8], hi[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                unsigned w = q[i];
+                lo[i] = w & 0x0F0F0F0Fu;
+                hi[i] = (w >> 4) & 0x0F0F0F0Fu;
+            }
+            for (int ti = 0; ti < t; ++ti) {
+                const float* base = prep + (long)ti * stride;
+                const int* xq = (const int*)base + u * 16;
+                int ia = 0, ib = 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    ia = kq_dp4a(lo[i], xq[i], ia);
+                    ib = kq_dp4a(hi[i], xq[8 + i], ib);
+                }
+                const float* xs = base + k / 4 + 2 * u;
+                const float* sm = base + k / 4 + k / 32 + 4 * u;
+                acc[ti] += s1 * xs[0] * (float)ia - m1 * (sm[0] + sm[1]) + s2 * xs[1] * (float)ib - m2 * (sm[2] + sm[3]);
+            }
+        }
+    } else {
+        const unsigned* rp = (const unsigned*)(data + row * (long)(k / 256) * Q6K_BLOCK);
+        for (int u = lane; u < units; u += 32) {
+            int blk = u >> 2, half = (u >> 1) & 1, sh = (u & 1) * 4;
+            const unsigned* b = rp + blk * (Q6K_BLOCK / 4);
+            const unsigned* ql = b + 16 * half;
+            const unsigned* qh = b + 32 + 8 * half;
+            const signed char* sc = (const signed char*)(b + 48) + 8 * half + (u & 1) * 4;
+            float d = f16_to_f32((u16)(b[52] & 0xffff));
+            unsigned wa[8], wb[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                unsigned h = qh[i] >> sh;
+                wa[i] = ((ql[i] >> sh) & 0x0F0F0F0Fu) | ((h & 0x03030303u) << 4);
+                wb[i] = ((ql[8 + i] >> sh) & 0x0F0F0F0Fu) | (((h >> 2) & 0x03030303u) << 4);
+            }
+            // scales per 16 weights: group a (which = 2*hi) and b (which + 1), each in two halves
+            float sa0 = d * (float)sc[0], sa1 = d * (float)sc[1], sb0 = d * (float)sc[2], sb1 = d * (float)sc[3];
+            for (int ti = 0; ti < t; ++ti) {
+                const float* base = prep + (long)ti * stride;
+                const int* xq = (const int*)base + u * 16;
+                int a0 = 0, a1 = 0, b0 = 0, b1 = 0;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    a0 = kq_dp4a(wa[i], xq[i], a0);
+                    a1 = kq_dp4a(wa[4 + i], xq[4 + i], a1);
+                    b0 = kq_dp4a(wb[i], xq[8 + i], b0);
+                    b1 = kq_dp4a(wb[4 + i], xq[12 + i], b1);
+                }
+                const float* xs = base + k / 4 + 2 * u;
+                const float* sm = base + k / 4 + k / 32 + 4 * u;
+                acc[ti] += sa0 * (xs[0] * (float)a0 - 32.0f * sm[0]) + sa1 * (xs[0] * (float)a1 - 32.0f * sm[1]) +
+                           sb0 * (xs[1] * (float)b0 - 32.0f * sm[2]) + sb1 * (xs[1] * (float)b1 - 32.0f * sm[3]);
+            }
+        }
+    }
+    for (int ti = 0; ti < t; ++ti) {
+        float v = acc[ti];
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+        if (lane == 0) D::store(y, (long)ti * n + row, v);
+    }
+}
+
 #define DEFINE_KERNELS(SUFFIX, D)                                                                            \
     extern "C" __global__ void nvfp4_dequant_##SUFFIX(const u8* p, const u8* s, float g, D::T* o, int n,     \
                                                       int k) { nvfp4_dequant<D>(p, s, g, o, n, k); }          \
@@ -147,6 +395,20 @@ __device__ void fp8_gemv(const u8* w, const float* scale, const typename D::T* x
     extern "C" __global__ void fp8_gemv_##SUFFIX(const u8* w, const float* s, const D::T* x, D::T* y, int n, \
                                                  int k, int t, int sc, int b0, int b1) {                     \
         fp8_gemv<D>(w, s, x, y, n, k, t, sc, b0, b1);                                                         \
+    }                                                                                                         \
+    extern "C" __global__ void kq_dequant_##SUFFIX(const u8* w, D::T* o, int n, int k, int kind) {           \
+        kq_dequant<D>(w, o, n, k, kind);                                                                      \
+    }                                                                                                         \
+    extern "C" __global__ void kq_gemv_##SUFFIX(const u8* w, const D::T* x, D::T* y, int n, int k, int t,    \
+                                                int kind) {                                                   \
+        kq_gemv<D>(w, x, y, n, k, t, kind);                                                                   \
+    }                                                                                                         \
+    extern "C" __global__ void kq_prep_##SUFFIX(const D::T* x, float* o, int k, int t) {                     \
+        kq_prep<D>(x, o, k, t);                                                                               \
+    }                                                                                                         \
+    extern "C" __global__ void kq_gemv_i8_##SUFFIX(const u8* w, const float* p, D::T* y, int n, int k,       \
+                                                   int t, int kind) {                                         \
+        kq_gemv_i8<D>(w, p, y, n, k, t, kind);                                                                \
     }
 
 DEFINE_KERNELS(f32, F32)

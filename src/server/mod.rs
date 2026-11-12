@@ -49,10 +49,15 @@ pub struct SamplingDefaults {
 impl SamplingDefaults {
     /// Read `generation_config.json` (the checkpoint's recommended sampling).
     pub fn from_model_dir(dir: &Path) -> Self {
-        let v: Value = std::fs::read_to_string(dir.join("generation_config.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(Value::Null);
+        let v: Value = match crate::gguf::find(dir) {
+            Some(file) => crate::gguf::Gguf::open(&file)
+                .map(|g| g.generation_config())
+                .unwrap_or(Value::Null),
+            None => std::fs::read_to_string(dir.join("generation_config.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(Value::Null),
+        };
         let f = |k: &str| v.get(k).and_then(|x| x.as_f64()).map(|x| x as f32);
         let sample = v.get("do_sample").and_then(|x| x.as_bool()).unwrap_or(true);
         Self {

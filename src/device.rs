@@ -354,6 +354,14 @@ pub fn kernel_selftest(device: &Device, dtype: DType) -> Vec<(&'static str, Resu
                 "carbon fp8 kernels (gemv + dequant vs cpu)",
                 Box::new(move || check_quant_kernels(d, dtype, false)),
             ));
+            ops.push((
+                "carbon q4_k kernels (gemv + dequant vs cpu)",
+                Box::new(move || check_kquant_kernels(d, dtype, crate::gguf::KKind::Q4K)),
+            ));
+            ops.push((
+                "carbon q6_k kernels (gemv + dequant vs cpu)",
+                Box::new(move || check_kquant_kernels(d, dtype, crate::gguf::KKind::Q6K)),
+            ));
             for (name, fmt) in [
                 ("carbon moe kernels, dense experts (vs cpu)", 0),
                 ("carbon moe kernels, fp8 experts (vs cpu)", 1),
@@ -441,6 +449,64 @@ fn check_quant_kernels(d: &Device, dtype: DType, nvfp4: bool) -> candle_core::Re
     let (ew, ey) = (rel(&w_gpu, &w_ref)?, rel(&y_gpu, &y_ref)?);
     if ew > tol || ey > tol {
         candle_core::bail!("mismatch vs cpu: dequant rel err {ew:.2e}, gemv rel err {ey:.2e}");
+    }
+    Ok(())
+}
+
+/// Compare the GGUF K-quant kernels (random blocks with finite scales) with the CPU decoder.
+#[cfg(feature = "cuda")]
+fn check_kquant_kernels(d: &Device, dtype: DType, kind: crate::gguf::KKind) -> candle_core::Result<()> {
+    use crate::gguf::{dequant_kquant, KKind, KQuant};
+    use crate::kernels::cuda as k;
+    let cpu = Device::Cpu;
+    // 9 super-blocks per row: 36 units of 64 weights, so lanes take one or two each
+    let (n, kk) = (40usize, 9 * 256usize);
+    let block = kind.block_bytes();
+    let row_bytes = kk / 256 * block;
+    let mut bytes = Tensor::rand(0f32, 255.99, n * row_bytes, &cpu)?.to_dtype(DType::U8)?.to_vec1::<u8>()?;
+    for (i, b) in bytes.chunks_exact_mut(block).enumerate() {
+        let d16 = half::f16::from_f32(0.001 + 0.0001 * (i % 13) as f32).to_le_bytes();
+        match kind {
+            KKind::Q4K => {
+                b[0..2].copy_from_slice(&d16);
+                b[2..4].copy_from_slice(&half::f16::from_f32(0.002).to_le_bytes());
+            }
+            KKind::Q6K => b[208..210].copy_from_slice(&d16),
+        }
+    }
+    let w_ref = Tensor::from_vec(dequant_kquant(kind, &bytes, n, kk), (n, kk), &cpu)?;
+    let q = KQuant { kind, data: Tensor::from_vec(bytes, (n, row_bytes), &cpu)?.to_device(d)?, rows: n, cols: kk };
+    let rel = |a: &Tensor, b: &Tensor| -> candle_core::Result<f32> {
+        let a = a.to_device(&cpu)?.to_dtype(DType::F32)?;
+        let diff = (&a - b)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        Ok(diff / (b.abs()?.max_all()?.to_scalar::<f32>()? + 1e-6))
+    };
+    let tol = if dtype == DType::F32 { 1e-4 } else { 2e-2 };
+    let ew = rel(&k::kquant_dequant(&q, dtype)?, &w_ref)?;
+    if ew > tol {
+        candle_core::bail!("mismatch vs cpu: dequant rel err {ew:.2e}");
+    }
+    for t in [1usize, 3, 8] {
+        let x = Tensor::rand(-1f32, 1.0, (t, kk), &cpu)?.to_dtype(dtype)?;
+        let y_ref = x.to_dtype(DType::F32)?.matmul(&w_ref.t()?)?;
+        let xd = x.to_device(d)?;
+        let ey = rel(&k::kquant_gemv_exact(&xd, &q)?, &y_ref)?;
+        if ey > tol {
+            candle_core::bail!("mismatch vs cpu: gemv ({t} rows) rel err {ey:.2e}");
+        }
+        // 8-bit activations: the error is the activations' rounding, not the kernel's
+        let ei = rel(&k::kquant_gemv_prepared(&k::kquant_prep(&xd)?, &q, dtype)?, &y_ref)?;
+        if ei > 3e-2 {
+            candle_core::bail!("mismatch vs cpu: 8-bit gemv ({t} rows) rel err {ei:.2e}");
+        }
+        if k::kquant_tc_enabled() {
+            let prep = k::kquant_prep(&xd)?;
+            let a = k::kquant_gemv_prepared(&prep, &q, DType::F32)?.to_device(&cpu)?;
+            let et = rel(&k::kquant_gemm_tc(&prep, &q, DType::F32)?, &a)?;
+            if et > 1e-4 {
+                candle_core::bail!("tensor-core gemm ({t} rows) differs from the dp4a kernel: rel err {et:.2e}");
+            }
+        }
     }
     Ok(())
 }
@@ -662,9 +728,19 @@ fn check_gdn_sequence(d: &Device) -> candle_core::Result<()> {
 /// Compare carbon's fused paged decode attention with a CPU softmax reference (GQA, ragged).
 #[cfg(feature = "cuda")]
 fn check_paged_decode(d: &Device, dtype: DType) -> candle_core::Result<()> {
+    // short ragged rows; then several chunks of the chunked kernel at Qwen3.5's head geometry
+    check_paged_decode_with(d, dtype, (8, 2, 128, 300), &[1, 17, 200])?;
+    check_paged_decode_with(d, dtype, (12, 2, 256, 2000), &[3, 600, 1337])
+}
+
+#[cfg(feature = "cuda")]
+fn check_paged_decode_with(
+    d: &Device,
+    dtype: DType,
+    (h, kvh, hd, pool): (usize, usize, usize, usize),
+    lens: &[usize],
+) -> candle_core::Result<()> {
     let cpu = Device::Cpu;
-    let (h, kvh, hd, pool) = (8usize, 2usize, 128usize, 300usize);
-    let lens = [1usize, 17, 200];
     let q = Tensor::randn(0f32, 1.0, (lens.len(), h, hd), &cpu)?.to_dtype(dtype)?;
     let k = Tensor::randn(0f32, 1.0, (pool, kvh * hd), &cpu)?.to_dtype(dtype)?;
     let v = Tensor::randn(0f32, 1.0, (pool, kvh * hd), &cpu)?.to_dtype(dtype)?;
