@@ -605,57 +605,20 @@ __device__ void paged_decode_merge(const float* part, const unsigned* starts, u1
 #define PDR_WARPS 6   // 48 columns: 8 rows of 6 heads
 #define PDR_POS 256
 
-// Stage 16 pool rows for the whole block: thread i takes words i, i + blockDim, ..., eight at a
-// time (loads issued before their stores). Blocks have 1 to PDR_WARPS warps.
-template <class A, bool Q8>
-__device__ __forceinline__ void pdr_stage(u32 (*st)[PD_MAXD / 2], const u16* pool, const unsigned* slots,
-                                          unsigned t0, unsigned s1, int KVH, int kvh, int D) {
-    const int rw = Q8 ? D / 4 : D / 2, total = 16 * rw;
-    for (int base = threadIdx.x; base < total; base += 8 * blockDim.x) {
-        u32 tmp[8];
-        float sc[8];
-#pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            int w = base + k * blockDim.x;
-            tmp[k] = 0u;
-            sc[k] = 0.0f;
-            if (w < total) {
-                int r = w / rw;
-                unsigned j = t0 + r < s1 ? t0 + r : s1 - 1;
-                long vec = (long)slots[j] * KVH + kvh;
-                if (Q8) {
-                    const u32* row = (const u32*)((const signed char*)pool + vec * (D + Q8_PAD));
-                    tmp[k] = row[w % rw];
-                    sc[k] = *(const float*)(row + rw);
-                } else {
-                    tmp[k] = ((const u32*)(pool + vec * D))[w % rw];
-                }
-            }
-        }
-#pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            int w = base + k * blockDim.x;
-            if (w < total) {
-                int r = w / rw, c = w % rw;
-                if (Q8) {
-                    u32 x = tmp[k];
-                    st[r][2 * c] = tc_pack<A>((float)(signed char)(x & 0xff) * sc[k],
-                                              (float)(signed char)((x >> 8) & 0xff) * sc[k]);
-                    st[r][2 * c + 1] = tc_pack<A>((float)(signed char)((x >> 16) & 0xff) * sc[k],
-                                                  (float)(signed char)(x >> 24) * sc[k]);
-                } else {
-                    st[r][c] = tmp[k];
-                }
-            }
-        }
-    }
-}
+#define PDR_KW (PD_MAXD / 2 + 4)  // words per staged K row: padded, conflict-free fragment loads
+#define PDR_VS 24                 // u16 per row of the transposed V tile (12 words, likewise)
+#define PDR_SB 8                  // staging items a thread loads before converting them
 
+// Per 16-position tile the block stages K [pos][dim] and V transposed [dim][pos] in one pass
+// (every thread issues a batch of loads before it converts any), int8 pools as their codes:
+// a position's K scale multiplies its scores and its V scale its probabilities.
 template <class A, bool Q8>
 __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc, const unsigned* slots,
                                      const unsigned* starts, const unsigned* links, float* part, int H, int KVH,
                                      int D, float scale, int NCW, int pairs) {
-    __shared__ u32 st[16][PD_MAXD / 2];
+    __shared__ u32 sk[16][PDR_KW];
+    __shared__ u16 sv[PD_MAXD * PDR_VS];
+    __shared__ float ksc[16], vsc[16];
     __shared__ float sp[PDR_WARPS][16][PD_G];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane >> 2, tg = lane & 3;
     const int G = H / KVH, KS = D / 16;
@@ -673,6 +636,8 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
     const int ncol = R * G;
     const int colq = 8 * warp + g, col0 = 8 * warp + 2 * tg, col1 = col0 + 1;
     const bool live0 = col0 < ncol, live1 = col1 < ncol;
+    // a block may have more warps than its columns need: the others only help staging
+    const bool work = 8 * warp < ncol;
     const int j0 = live0 ? col0 / G : 0, j1 = live1 ? col1 / G : 0;
     // positions (relative to s0) row j may see
     const unsigned len0 = pd_hi(starts, b + j0, pairs) - pd_lo(starts, b + j0, pairs);
@@ -692,23 +657,87 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
 #pragma unroll
     for (int ds = 0; ds < PD_MAXD / 16; ++ds) acc[ds][0] = acc[ds][1] = acc[ds][2] = acc[ds][3] = 0.0f;
     float(*pw)[PD_G] = sp[warp];
+    constexpr int W = Q8 ? 1 : 2;
+    const int KI = 16 * (D / 4), VI = 8 * (D / 4);  // staging items: (row, 4 dims), (row pair, 4 dims)
 
     for (unsigned t0 = p0; t0 < p1; t0 += 16) {
-        pdr_stage<A, Q8>(st, kc, slots, t0, s1, KVH, kvh, D);
+        const int nk = (int)min(s1 - t0, 16u);
+        for (int base = threadIdx.x; base < KI; base += PDR_SB * blockDim.x) {
+            u32 sl[PDR_SB], w[PDR_SB][W];
+#pragma unroll
+            for (int it = 0; it < PDR_SB; ++it) {
+                int i = base + it * blockDim.x, row = i / (D / 4);
+                sl[it] = (i < KI && row < nk) ? slots[t0 + row] : 0xffffffffu;
+            }
+#pragma unroll
+            for (int it = 0; it < PDR_SB; ++it) {
+                int c4 = (base + it * blockDim.x) % (D / 4);
+#pragma unroll
+                for (int x = 0; x < W; ++x) w[it][x] = 0u;
+                if (sl[it] != 0xffffffffu) tc_pool_raw<Q8>(kc, (long)sl[it] * KVH + kvh, D, 4 * c4, w[it]);
+            }
+#pragma unroll
+            for (int it = 0; it < PDR_SB; ++it) {
+                int i = base + it * blockDim.x, row = i / (D / 4), c4 = i % (D / 4);
+                if (i < KI) {
+                    u32 x[4];
+                    tc_pool_cvt<A, Q8>(w[it], x);
+                    sk[row][2 * c4] = x[0] | (x[1] << 16);
+                    sk[row][2 * c4 + 1] = x[2] | (x[3] << 16);
+                }
+            }
+        }
+        for (int base = threadIdx.x; base < VI; base += (PDR_SB / 2) * blockDim.x) {
+            u32 sl[PDR_SB], w[PDR_SB][W];
+#pragma unroll
+            for (int it = 0; it < PDR_SB; ++it) {
+                int i = base + (it / 2) * blockDim.x, row = 2 * (i % 8) + (it & 1);
+                sl[it] = (i < VI && row < nk) ? slots[t0 + row] : 0xffffffffu;
+            }
+#pragma unroll
+            for (int it = 0; it < PDR_SB; ++it) {
+                int c4 = (base + (it / 2) * blockDim.x) / 8;
+#pragma unroll
+                for (int x = 0; x < W; ++x) w[it][x] = 0u;
+                if (sl[it] != 0xffffffffu) tc_pool_raw<Q8>(vc, (long)sl[it] * KVH + kvh, D, 4 * c4, w[it]);
+            }
+#pragma unroll
+            for (int it = 0; it < PDR_SB; it += 2) {
+                int i = base + (it / 2) * blockDim.x, rp = i % 8, c4 = i / 8;
+                if (i < VI) {
+                    u32 x[4], y[4];
+                    tc_pool_cvt<A, Q8>(w[it], x);
+                    tc_pool_cvt<A, Q8>(w[it + 1], y);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) *(u32*)(sv + (4 * c4 + e) * PDR_VS + 2 * rp) = x[e] | (y[e] << 16);
+                }
+            }
+        }
+        if (Q8 && threadIdx.x < 16) {
+            const bool in = (int)threadIdx.x < nk;
+            const long vec = in ? (long)slots[t0 + threadIdx.x] * KVH + kvh : 0;
+            ksc[threadIdx.x] = in ? tc_pool_scale<Q8>(kc, vec, D) : 0.0f;
+            vsc[threadIdx.x] = in ? tc_pool_scale<Q8>(vc, vec, D) : 0.0f;
+        }
         __syncthreads();
+        if (!work) {
+            __syncthreads();
+            continue;
+        }
         float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
         for (int ks = 0; ks < PD_MAXD / 16; ++ks) {
             if (ks < KS) {
-                u32 a[4] = {st[g][8 * ks + tg], st[g + 8][8 * ks + tg], st[g][8 * ks + 4 + tg],
-                            st[g + 8][8 * ks + 4 + tg]};
+                u32 a[4] = {sk[g][8 * ks + tg], sk[g + 8][8 * ks + tg], sk[g][8 * ks + 4 + tg],
+                            sk[g + 8][8 * ks + 4 + tg]};
                 Mma<A>::run(s, a, qf[ks]);
             }
         }
         // positions g and g + 8 of the tile, relative to the table's start
         const unsigned ia = t0 - s0 + g, ib = ia + 8;
-        float s00 = (live0 && ia < len0) ? s[0] * scale : -1e30f, s01 = (live1 && ia < len1) ? s[1] * scale : -1e30f;
-        float s10 = (live0 && ib < len0) ? s[2] * scale : -1e30f, s11 = (live1 && ib < len1) ? s[3] * scale : -1e30f;
+        const float sca = Q8 ? scale * ksc[g] : scale, scb = Q8 ? scale * ksc[g + 8] : scale;
+        float s00 = (live0 && ia < len0) ? s[0] * sca : -1e30f, s01 = (live1 && ia < len1) ? s[1] * sca : -1e30f;
+        float s10 = (live0 && ib < len0) ? s[2] * scb : -1e30f, s11 = (live1 && ib < len1) ? s[3] * scb : -1e30f;
         float t0m = fmaxf(s00, s10), t1m = fmaxf(s01, s11);
 #pragma unroll
         for (int off = 4; off < 32; off <<= 1) {
@@ -730,18 +759,15 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
         l1 = l1 * corr1 + ls1;
         m0 = n0;
         m1 = n1;
-        pw[g][2 * tg] = p00;
-        pw[g][2 * tg + 1] = p01;
-        pw[g + 8][2 * tg] = p10;
-        pw[g + 8][2 * tg + 1] = p11;
-        __syncthreads();  // every warp is done with the staged keys
-        pdr_stage<A, Q8>(st, vc, slots, t0, s1, KVH, kvh, D);
-        __syncthreads();
+        // int8 V rows are staged as codes: their scale goes into the probabilities
+        const float va = Q8 ? vsc[g] : 1.0f, vb = Q8 ? vsc[g + 8] : 1.0f;
+        pw[g][2 * tg] = p00 * va;
+        pw[g][2 * tg + 1] = p01 * va;
+        pw[g + 8][2 * tg] = p10 * vb;
+        pw[g + 8][2 * tg + 1] = p11 * vb;
+        __syncwarp();
+        // P^T [16 pos x 8 columns]: rows 2tg, 2tg+1 (and +8) of column g
         u32 pf[2] = {tc_pack<A>(pw[2 * tg][g], pw[2 * tg + 1][g]), tc_pack<A>(pw[8 + 2 * tg][g], pw[9 + 2 * tg][g])};
-        const u16* v0 = (const u16*)st[2 * tg];
-        const u16* v1 = (const u16*)st[2 * tg + 1];
-        const u16* v2 = (const u16*)st[8 + 2 * tg];
-        const u16* v3 = (const u16*)st[9 + 2 * tg];
 #pragma unroll
         for (int ds = 0; ds < PD_MAXD / 16; ++ds) {
             if (ds < KS) {
@@ -749,13 +775,13 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
                 acc[ds][1] *= corr1;
                 acc[ds][2] *= corr0;
                 acc[ds][3] *= corr1;
-                int da = 16 * ds + g, db = da + 8;
-                u32 a[4] = {(u32)v0[da] | ((u32)v1[da] << 16), (u32)v0[db] | ((u32)v1[db] << 16),
-                            (u32)v2[da] | ((u32)v3[da] << 16), (u32)v2[db] | ((u32)v3[db] << 16)};
+                const u16* va_ = sv + (16 * ds + g) * PDR_VS + 2 * tg;
+                const u16* vb_ = va_ + 8 * PDR_VS;
+                u32 a[4] = {*(const u32*)va_, *(const u32*)vb_, *(const u32*)(va_ + 8), *(const u32*)(vb_ + 8)};
                 Mma<A>::run(acc[ds], a, pf);
             }
         }
-        __syncthreads();  // ... and with the staged values
+        __syncthreads();  // every warp is done with the staged tile
     }
     // partials of this lane's two columns: (row b + j, head) in paged_decode_merge's layout
     float* h0 = part + ((((long)(b + j0) * KVH + kvh) * NCW + c) * PD_G + col0 % G) * (D + 2);

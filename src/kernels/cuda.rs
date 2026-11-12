@@ -881,6 +881,8 @@ struct PagedDecode {
     links: Option<Tensor>,
     /// Most rows one sequence has in this step (1 without links).
     max_rows: usize,
+    /// The row-shared kernel whatever the pool size.
+    force_rows: bool,
 }
 
 /// Multi-token steps give every row of a sequence the same slot table (an (offset, end) pair per
@@ -909,6 +911,13 @@ pub fn allow_paged_shared_tables(on: bool) {
 fn attn_rows_min() -> usize {
     static MIN: OnceLock<usize> = OnceLock::new();
     *MIN.get_or_init(|| std::env::var("CARBON_ATTN_ROWS_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(131072))
+}
+
+/// Fewest warps of a `paged_decode_tc_rows` block: warps beyond a step's (row, head) columns
+/// only stage K and V, which is most of a block's work at one or two rows.
+fn pdr_min_warps() -> usize {
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("CARBON_ATTN_ROWS_WARPS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 6))
 }
 
 /// f32 scratch of at least `len` elements on `dev`, shared by every decode-attention call that
@@ -1019,7 +1028,8 @@ impl CustomOp3 for PagedDecode {
             let ncw = pool_slots.div_ceil(PD_WP).max(1);
             // large pools: the row-shared kernel for every step, single-row ones included (each
             // row its own group), so a verify step reproduces single-token steps bit for bit
-            let rows_kernel = pool_slots >= attn_rows_min() && g_heads * MAX_GEMV_ROWS <= 48;
+            let rows_kernel =
+                (self.force_rows || pool_slots >= attn_rows_min()) && g_heads * MAX_GEMV_ROWS <= 48;
             let own_links;
             let links = if !rows_kernel {
                 None
@@ -1091,10 +1101,11 @@ impl CustomOp3 for PagedDecode {
                     bld.arg(&pairs32);
                     let cfg = LaunchConfig {
                         grid_dim: ((b * kvh * ncw) as u32, 1, 1),
-                        // the row-shared kernel: one warp per 8 (row, head) columns
                         block_dim: (
                             if links.is_some() {
-                                32 * (self.max_rows.clamp(1, MAX_GEMV_ROWS) * g_heads).div_ceil(8) as u32
+                                // one warp per 8 (row, head) columns, and more to help staging
+                                32 * (self.max_rows.clamp(1, MAX_GEMV_ROWS) * g_heads).div_ceil(8).max(pdr_min_warps())
+                                    as u32
                             } else {
                                 128
                             },
@@ -1206,6 +1217,24 @@ pub fn paged_decode(
     links: Option<&Tensor>,
     max_rows: usize,
 ) -> CResult<Tensor> {
+    paged_decode_with(q, k_pool, v_pool, slots, starts, kv_heads, scale, links, max_rows, false)
+}
+
+/// [`paged_decode`]; `force_rows` takes the row-shared kernel whatever the pool size (self-check
+/// and benchmarks: the engine picks by pool size alone, so that a model's steps all agree).
+#[allow(clippy::too_many_arguments)]
+pub fn paged_decode_with(
+    q: &Tensor,
+    k_pool: &Tensor,
+    v_pool: &Tensor,
+    slots: &Tensor,
+    starts: &Tensor,
+    kv_heads: usize,
+    scale: f32,
+    links: Option<&Tensor>,
+    max_rows: usize,
+    force_rows: bool,
+) -> CResult<Tensor> {
     let (b, h, d) = q.dims3()?;
     let scratch = if paged_decode_tc_supported(h, kv_heads, d, q.dtype()) {
         // sized for a decode step's 8 rows, so every batch shape shares one buffer
@@ -1225,6 +1254,7 @@ pub fn paged_decode(
             scratch,
             links: links.map(|l| l.contiguous()).transpose()?,
             max_rows: if links.is_some() { max_rows } else { 1 },
+            force_rows,
         },
     )
 }

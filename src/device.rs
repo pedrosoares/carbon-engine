@@ -805,7 +805,71 @@ fn check_gdn_sequence(d: &Device) -> candle_core::Result<()> {
 fn check_paged_decode(d: &Device, dtype: DType) -> candle_core::Result<()> {
     // short ragged rows; then several chunks of the chunked kernel at Qwen3.5's head geometry
     check_paged_decode_with(d, dtype, (8, 2, 128, 300), &[1, 17, 200])?;
-    check_paged_decode_with(d, dtype, (12, 2, 256, 2000), &[3, 600, 1337])
+    check_paged_decode_with(d, dtype, (12, 2, 256, 2000), &[3, 600, 1337])?;
+    if crate::kernels::cuda::paged_decode_tc_supported(12, 2, 256, dtype) {
+        // the row-shared kernel (verify steps on large pools), bf16 / f16 and int8 pools
+        for q8 in [false, true] {
+            check_paged_decode_rows(d, dtype, q8, 1, 530)?;
+            check_paged_decode_rows(d, dtype, q8, 4, 701)?;
+        }
+    }
+    Ok(())
+}
+
+/// `rows` token rows of one sequence in one step: row j attends to the first `len + j` slots of
+/// a shared table (several 256-position chunks, the last one ragged).
+#[cfg(feature = "cuda")]
+fn check_paged_decode_rows(d: &Device, dtype: DType, q8: bool, rows: usize, len: usize) -> candle_core::Result<()> {
+    let cpu = Device::Cpu;
+    let (h, kvh, hd, pool) = (12usize, 2usize, 256usize, 2000usize);
+    let q = Tensor::randn(0f32, 1.0, (rows, h, hd), &cpu)?.to_dtype(dtype)?;
+    let k = Tensor::randn(0f32, 1.0, (pool, kvh * hd), &cpu)?.to_dtype(dtype)?;
+    let v = Tensor::randn(0f32, 1.0, (pool, kvh * hd), &cpu)?.to_dtype(dtype)?;
+    let ((k_dev, k), (v_dev, v)) =
+        if q8 { (q8_pool(&k, kvh, hd)?, q8_pool(&v, kvh, hd)?) } else { ((k.clone(), k), (v.clone(), v)) };
+    let slots: Vec<u32> = (0..len + rows - 1).map(|j| (pool - 1 - j * 3 % pool) as u32).collect();
+    let starts: Vec<u32> = if rows == 1 {
+        vec![0, len as u32]
+    } else {
+        (0..rows).flat_map(|j| [0u32, (len + j) as u32]).collect()
+    };
+    let links: Vec<u32> = (0..rows).map(|j| if j == 0 { ((rows - 1) as u32) << 8 } else { 2 }).collect();
+    let scale = 1.0 / (hd as f32).sqrt();
+    let got = crate::kernels::cuda::paged_decode_with(
+        &q.to_device(d)?,
+        &k_dev.to_device(d)?,
+        &v_dev.to_device(d)?,
+        &Tensor::new(&slots[..], d)?,
+        &Tensor::new(&starts[..], d)?,
+        kvh,
+        scale,
+        Some(&Tensor::new(&links[..], d)?),
+        rows,
+        true,
+    )?
+    .to_device(&cpu)?
+    .to_dtype(DType::F32)?;
+    let (q, k, v) = (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?, v.to_dtype(DType::F32)?);
+    let mut worst = 0f32;
+    for b in 0..rows {
+        let idx = Tensor::new(&slots[..len + b], &cpu)?;
+        let kb = k.index_select(&idx, 0)?.reshape(((), kvh, hd))?;
+        let vb = v.index_select(&idx, 0)?.reshape(((), kvh, hd))?;
+        for hh in 0..h {
+            let g = hh / (h / kvh);
+            let qh = q.get(b)?.get(hh)?.reshape((1, hd))?;
+            let kh = kb.narrow(1, g, 1)?.squeeze(1)?;
+            let vh = vb.narrow(1, g, 1)?.squeeze(1)?;
+            let p = candle_nn::ops::softmax_last_dim(&(qh.matmul(&kh.t()?)? * scale as f64)?)?;
+            let want = p.matmul(&vh)?.squeeze(0)?;
+            let diff = (got.get(b)?.get(hh)? - want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            worst = if diff.is_nan() { f32::INFINITY } else { worst.max(diff) };
+        }
+    }
+    if worst > 3e-2 {
+        candle_core::bail!("row-shared kernel ({rows} rows, int8 kv {q8}): max abs err {worst:.2e}");
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
