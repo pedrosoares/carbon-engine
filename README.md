@@ -240,7 +240,7 @@ layers' value heads in a tiled order). The `mmproj` image tower is not loaded ye
   runs). Without `--mtp` the dp4a kernel is used (about 10% faster for single tokens), and its
   rounding differs in the last bits.
 - **Decode attention** is chunked (256 positions per block) and reads K and V once per KV head
-  for its six query heads; on pools of 65,536 slots or more a verify step's rows also share one
+  for its six query heads; on pools of 131,072 slots or more a verify step's rows also share one
   pass (`CARBON_ATTN_ROWS_MIN`).
 - **`--kv-dtype q8`** keeps each key / value vector as 256 int8 values and an f32 scale: half
   the memory and attention traffic of bf16. It is lossy (the text of a greedy run drifts from

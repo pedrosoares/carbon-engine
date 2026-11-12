@@ -908,7 +908,7 @@ pub fn allow_paged_shared_tables(on: bool) {
 /// which only pays once reading K and V dominates. `CARBON_ATTN_ROWS_MIN` overrides.
 fn attn_rows_min() -> usize {
     static MIN: OnceLock<usize> = OnceLock::new();
-    *MIN.get_or_init(|| std::env::var("CARBON_ATTN_ROWS_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(65536))
+    *MIN.get_or_init(|| std::env::var("CARBON_ATTN_ROWS_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(131072))
 }
 
 /// f32 scratch of at least `len` elements on `dev`, shared by every decode-attention call that

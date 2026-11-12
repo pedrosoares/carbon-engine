@@ -213,7 +213,7 @@ LM Studio's.
 
 ### Phase 5 update 2: row-shared decode attention, shared slot tables, prefix cache
 
-- `paged_decode_tc_rows`: on pools of 65,536 slots or more, a block takes all token rows of a
+- `paged_decode_tc_rows`: on pools of 131,072 slots or more, a block takes all token rows of a
   sequence and a 256-position chunk, stages each K / V tile once and scores 8 (row, head)
   columns per warp (blocks are sized to the step's rows). Used for single-row steps too, so
   verify steps stay bit-identical to single-token steps.
