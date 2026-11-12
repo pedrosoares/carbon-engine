@@ -118,6 +118,7 @@ At depth (decode tok/s, story / json; carbon with `--kv-dtype q8 --mtp --mtp-dra
 | LM Studio, no MTP | 72.8 | | 37.0 / 37.0 | 24.6 / 24.5 |
 | carbon, first int8 KV build | 139.0 | 116.1 | 53.6 / 83.8 | 40.2 / 56.2 |
 | carbon, row-shared attention + shared slot tables | 132.4 | 115.6 | 58.5 / 109.2 | 44.0 / 80.1 |
+| carbon, now (decode attention round) | 140.2 | 122.8 | 65.6 / 126.5 | 49.6 / 95.3 |
 
 Time to first token (seconds):
 
@@ -212,6 +213,28 @@ Studio's to 128k (12.2 s vs 11.3 s at 32k, 73 s vs 72 s at 128k) and 1.4x slower
   dims), each staging the same K / V rows itself: 12 blocks per KV head re-read and convert
   the prefix, and the scores are computed twice for head dim 256.
 
+### Phase 5 update 4: decode attention at depth
+
+Profile of a verify step at 128k before this round (graphs off, kernels only): attention 40%
+(0.55 - 0.77 ms per layer launch), the K-quant GEMMs 49%, GDN 4%. The GPU is busy 96% of the
+step: the host work that used to grow with the context is gone since the shared slot tables.
+
+- `paged_decode_tc_rows` restaged: K and V of a tile in one pass (2 block barriers per tile
+  instead of 4), int8 codes staged exactly with the scales applied to scores / probabilities,
+  V transposed and K rows padded (fragment loads without bank conflicts).
+- Blocks have at least 4 warps; the ones without columns only stage. A single-row step had one
+  warp doing all the staging.
+- Per layer over 129k positions (`attnbench decode`): 1 row 0.59 -> 0.35 ms, 3 rows 0.56 ->
+  0.38, 6 rows 0.77 -> 0.53; 250k, 3 rows: 1.09 -> 0.75 ms. About 700 GB/s of int8 K / V; a
+  bf16 pool is read at 1.2 TB/s by the same kernel, so the int8 conversion is what is left.
+  Of the 0.38 ms: staging 0.10, MMAs and softmax 0.15 - 0.2, launch + merge + barriers 0.07.
+- Did not help: skipping the accumulator rescale; two warps per column group on different
+  halves of a 32-position tile (0.44 ms: larger blocks, fewer per SM).
+- The benchmark at a 32k context flatters (the pool of one layer fits the L2 cache and the
+  benchmark re-reads it); 129k and 250k are representative.
+- Next-token agreement on a frozen 44k-token text (250 prefixes): bf16 KV vs int8 KV 97.2%,
+  bf16 vs int8 on the row-shared kernel 96.8%, the two int8 kernels with each other 96.4%.
+
 ### Phase 5 update 3: prefill speed
 
 Profile of a cold 16k prefill before this round (9.6 s): cuBLAS GEMMs 43% (about 250 TFLOPS,
@@ -301,8 +324,9 @@ element-wise ops 17%. After it (5.9 s): GEMMs 66%, recurrence 12%, attention 8%,
 1. Prefill beyond 128k: attention is n^2 and at 107 TFLOPS (more (query, head) rows per staged
    tile needs fewer registers per thread, e.g. Q in shared memory); the GDN recurrence is 12%
    of the linear part and far from the hardware's rate.
-2. Decode at depth: int8 MMA in the attention kernels instead of converting to half precision;
-   device-side slot tables kept across steps (append-only) instead of rebuilt per step.
+2. Decode at depth: 16 layers x 0.75 ms of attention per step at 250k next to about 15 ms of
+   GEMMs. Left: int8 MMA for Q K^T (no conversion, but Q becomes 8-bit), and the fixed cost
+   per launch (the grid covers the whole pool; the merge kernel walks every chunk).
 3. Int8 KV: a logit-level comparison with bf16 KV (needs logprobs output; next-token agreement
    is 98.0% over 250 prefixes), and `--kv-dtype auto`.
 4. KV / state auto-sizing: room for prefill temporaries, single-user defaults for long windows.

@@ -242,7 +242,7 @@ layers' value heads in a tiled order). The `mmproj` image tower is not loaded ye
   rounding differs in the last bits.
 - **Decode attention** is chunked (256 positions per block) and reads K and V once per KV head
   for its six query heads; on pools of 131,072 slots or more a verify step's rows also share one
-  pass (`CARBON_ATTN_ROWS_MIN`).
+  pass (`CARBON_ATTN_ROWS_MIN`), about 0.38 ms per layer over 129k positions.
 - **`--kv-dtype q8`** keeps each key / value vector as 256 int8 values and an f32 scale: half
   the memory and attention traffic of bf16. It is lossy: the text of a greedy run drifts from
   the bf16 run after a few sentences, and the greedy next token agrees with the bf16 cache on
@@ -263,7 +263,7 @@ greedy answers with thinking off (`scripts/bench_openai.py`; `PLAN.md` has the f
 | decode tok/s at depth (story / json) | 32k | 128k | 250k |
 |---|---|---|---|
 | LM Studio (MTP on to about 100k; it cannot load more with MTP) | 78 / 154 | 37 / 37 (no MTP) | 25 / 25 (no MTP) |
-| carbon, full-window configuration above | 76 / 147 | 59 / 109 | 44 / 80 |
+| carbon, full-window configuration above | 78 / 152 | 66 / 127 | 50 / 95 |
 
 | time to first token, cold prompt (s) | 32k | 128k | 250k |
 |---|---|---|---|
