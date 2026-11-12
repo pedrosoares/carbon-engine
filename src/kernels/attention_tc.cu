@@ -78,18 +78,25 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
     __shared__ u16 sk[TC_BK * RSK];
     __shared__ u16 sv[TC_BK * RSV];
 
+    // A block of HB * 128 threads takes HB consecutive query heads (HB divides G = H / KVH, so
+    // they share a KV head), 4 warps each, and stages every K / V tile once for all of them:
+    // staging, with the int8 conversion, is about half of a single-head block's work. The
+    // kernel's registers cap a block near 384 threads.
+    const int HB = blockDim.x / 128;
+    const int wq = (threadIdx.x / 32) % 4;  // which 16 of the tile's 64 queries
     int bid = blockIdx.x;
     int ds = bid % NSPLIT;
     bid /= NSPLIT;
-    int h = bid % H, tile = bid / H;
+    const int hgroups = H / HB;
+    int h = (bid % hgroups) * HB + threadIdx.x / 128, tile = bid / hgroups;
     int kvh = h / (H / KVH);
     unsigned b = tiles[2 * tile], q0 = tiles[2 * tile + 1];
     unsigned q_start = seqinfo[4 * b], q_len = seqinfo[4 * b + 1], s_start = seqinfo[4 * b + 2],
              kv_len = seqinfo[4 * b + 3];
     unsigned prefix = kv_len - q_len;
     unsigned nq = min(q_len - q0, (unsigned)TC_BQ);
-    int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane >> 2, t = lane & 3;
-    unsigned r0 = q0 + warp * 16 + g, r1 = r0 + 8;  // query rows (within the sequence) of this lane
+    int lane = threadIdx.x % 32, g = lane >> 2, t = lane & 3;
+    unsigned r0 = q0 + wq * 16 + g, r1 = r0 + 8;  // query rows (within the sequence) of this lane
 
     // Q fragments (A operand, row-major 16 x 16 per k-step)
     u32 qa[KS][4];
@@ -107,7 +114,7 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
     for (int i = 0; i < NT; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
     float m0 = -1e30f, m1 = -1e30f, l0 = 0.0f, l1 = 0.0f;
     unsigned qpos0 = prefix + r0, qpos1 = prefix + r1;
-    unsigned warp_last = prefix + q0 + warp * 16 + 15;
+    unsigned warp_last = prefix + q0 + wq * 16 + 15;
     unsigned kv_end = min(kv_len, prefix + q0 + nq);
 
     for (unsigned k0 = 0; k0 < kv_end; k0 += TC_BK) {

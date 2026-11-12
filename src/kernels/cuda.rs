@@ -2416,7 +2416,7 @@ impl CustomOp3 for FlashPrefill<'_> {
                 "carbon_attn_tc",
                 attn_tc_ptx()?,
             )?;
-            // one block per (tile, head, slice of up to 128 output dims)
+            // one block per (tile, head, slice of up to 128 output dims); see `group` below
             (f, n_tiles * h * d.div_ceil(128))
         } else {
             let f = dev.get_or_load_custom_func(
@@ -2433,9 +2433,19 @@ impl CustomOp3 for FlashPrefill<'_> {
             tiles.view::<u32>()?,
         );
         let (h32, kvh32, d32) = (h as i32, kvh as i32, d as i32);
+        // tensor cores: heads that share a KV head go in one block (4 warps each) and share the
+        // staged K / V tiles: 3 per block, 2 at head dim 256, whose kernel holds more registers
+        // (a launch's register budget caps threads x registers). `CARBON_PREFILL_GROUP=N` caps it.
+        static GROUP: OnceLock<usize> = OnceLock::new();
+        let cap = *GROUP.get_or_init(|| {
+            std::env::var("CARBON_PREFILL_GROUP").ok().and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 3)
+        });
+        let max_group = cap.min(if d > 128 { 2 } else { 3 });
+        let g = h / kvh;
+        let hb = if tc { (1..=max_group).rev().find(|n| g.is_multiple_of(*n)).unwrap_or(1) } else { 1 };
         let cfg = LaunchConfig {
-            grid_dim: (blocks as u32, 1, 1),
-            block_dim: (128, 1, 1),
+            grid_dim: ((blocks / hb) as u32, 1, 1),
+            block_dim: ((hb * 128) as u32, 1, 1),
             shared_mem_bytes: 0,
         };
         macro_rules! go {
