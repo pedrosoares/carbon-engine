@@ -196,6 +196,10 @@ struct EngineArgs {
     /// probability is at least `--mtp-min-prob`.
     #[arg(long, default_value_t = 2)]
     mtp_drafts: usize,
+    /// KV cache format on CUDA devices: `model` (the activation dtype) or `q8` (int8 with a scale
+    /// per vector: half the memory and attention traffic; single local GPU, sm_80+).
+    #[arg(long, default_value = "model")]
+    kv_dtype: String,
     /// Confidence a draft needs for the head to draft one more (`--mtp-drafts` above 2).
     #[arg(long, default_value_t = 0.6)]
     mtp_min_prob: f32,
@@ -252,6 +256,11 @@ impl EngineArgs {
             mtp_speculate: self.mtp,
             mtp_drafts: self.mtp_drafts,
             mtp_min_prob: self.mtp_min_prob,
+            kv_q8: match self.kv_dtype.as_str() {
+                "q8" | "int8" => true,
+                "model" | "auto" => false,
+                other => anyhow::bail!("unknown --kv-dtype '{other}' (model | q8)"),
+            },
             text_only: self.text_only,
         })
     }

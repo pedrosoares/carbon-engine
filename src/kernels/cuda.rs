@@ -875,6 +875,25 @@ struct PagedDecode {
     starts: Tensor,
     kv_heads: usize,
     scale: f32,
+    /// The chunked kernel's partials (`attn_scratch`), when that kernel runs.
+    scratch: Option<Tensor>,
+}
+
+/// f32 scratch of at least `len` elements on `dev`, shared by every decode-attention call that
+/// asks for this size. The chunked kernel writes its per-chunk partials there and the merge
+/// kernel reads them right after, on the same stream, so layers can share it. Allocating per
+/// call would make every captured CUDA graph keep one buffer per layer and batch shape
+/// (gigabytes at long contexts). Buffers are never freed: a captured graph holds their address.
+fn attn_scratch(dev: &candle_core::Device, len: usize) -> CResult<Tensor> {
+    static POOL: OnceLock<parking_lot::Mutex<Vec<(String, Tensor)>>> = OnceLock::new();
+    let key = format!("{:?}", dev.location());
+    let mut pool = POOL.get_or_init(Default::default).lock();
+    if let Some((_, t)) = pool.iter().find(|(k, t)| *k == key && t.elem_count() == len) {
+        return Ok(t.clone());
+    }
+    let t = Tensor::zeros(len, DType::F32, dev)?;
+    pool.push((key, t.clone()));
+    Ok(t)
 }
 
 /// Contiguous range of a u32 CUDA tensor that lives outside the op's inputs.
@@ -917,14 +936,21 @@ impl CustomOp3 for PagedDecode {
     ) -> CResult<(CudaStorage, Shape)> {
         let (b, h, d) = ql.shape().dims3()?;
         let kvh = self.kv_heads;
-        if kl.shape() != vl.shape() || kl.shape().dims2()?.1 != kvh * d {
+        let dtype = q.dtype();
+        // int8 pools: D int8 + an f32 scale per vector, read by the tensor-core kernel only
+        let q8 = k.dtype() == DType::U8;
+        let width = if q8 { kvh * (d + crate::kvcache::Q8_PAD) } else { kvh * d };
+        if kl.shape() != vl.shape() || kl.shape().dims2()?.1 != width {
             candle_core::bail!("paged decode: bad kv shape {:?}", kl.shape());
         }
         if !paged_decode_supported(h, kvh, d) {
             candle_core::bail!("paged decode: unsupported head geometry h={h} kvh={kvh} d={d}");
         }
-        let dtype = q.dtype();
-        if k.dtype() != dtype || v.dtype() != dtype {
+        if q8 {
+            if v.dtype() != DType::U8 || !d.is_multiple_of(128) || !paged_decode_tc_supported(h, kvh, d, dtype) {
+                candle_core::bail!("paged decode: int8 KV needs the tensor-core kernel (head dim 128 or 256)");
+            }
+        } else if k.dtype() != dtype || v.dtype() != dtype {
             candle_core::bail!("paged decode: q/k/v dtypes differ");
         }
         let dev = q.device().clone();
@@ -952,7 +978,7 @@ impl CustomOp3 for PagedDecode {
             let pool_slots = kl.shape().dims2()?.0;
             let ncw = pool_slots.div_ceil(PD_WP).max(1);
             let f_tc = dev.get_or_load_custom_func(
-                &format!("paged_decode_tc_{}", suffix(dtype)?),
+                &format!("paged_decode_tc_{}{}", if q8 { "q8_" } else { "" }, suffix(dtype)?),
                 "carbon_attn_tc",
                 attn_tc_ptx()?,
             )?;
@@ -961,16 +987,29 @@ impl CustomOp3 for PagedDecode {
                 "carbon_attn_tc",
                 attn_tc_ptx()?,
             )?;
-            let part = unsafe { dev.alloc::<f32>(b * kvh * ncw * PD_G * (d + 2))? };
+            let scratch = self.scratch.as_ref().ok_or_else(|| candle_core::Error::Msg("paged decode: no scratch".into()))?;
+            let part_side = Side::new(scratch, "scratch")?;
+            if part_side.len() < b * kvh * ncw * PD_G * (d + 2) {
+                candle_core::bail!("paged decode: scratch too small");
+            }
+            let part = part_side.view::<f32>()?;
             let ncw32 = ncw as i32;
             macro_rules! go_tc {
                 ($ty:ty) => {{
-                    let (qv, kv, vv) = (view::<$ty>(q, ql)?, view::<$ty>(k, kl)?, view::<$ty>(v, vl)?);
+                    let qv = view::<$ty>(q, ql)?;
                     let out = unsafe { dev.alloc::<$ty>(b * h * d)? };
                     let mut bld = f_tc.builder();
                     bld.arg(&qv);
-                    bld.arg(&kv);
-                    bld.arg(&vv);
+                    let (k8, v8, kh, vh);
+                    if q8 {
+                        (k8, v8) = (view::<u8>(k, kl)?, view::<u8>(v, vl)?);
+                        bld.arg(&k8);
+                        bld.arg(&v8);
+                    } else {
+                        (kh, vh) = (view::<$ty>(k, kl)?, view::<$ty>(v, vl)?);
+                        bld.arg(&kh);
+                        bld.arg(&vh);
+                    }
                     bld.arg(&slots);
                     bld.arg(&starts);
                     bld.arg(&part);
@@ -1083,6 +1122,14 @@ pub fn paged_decode(
     kv_heads: usize,
     scale: f32,
 ) -> CResult<Tensor> {
+    let (b, h, d) = q.dims3()?;
+    let scratch = if paged_decode_tc_supported(h, kv_heads, d, q.dtype()) {
+        // sized for a decode step's 8 rows, so every batch shape shares one buffer
+        let ncw = k_pool.dim(0)?.div_ceil(PD_WP).max(1);
+        Some(attn_scratch(q.device(), b.max(MAX_GEMV_ROWS) * kv_heads * ncw * PD_G * (d + 2))?)
+    } else {
+        None
+    };
     q.contiguous()?.apply_op3_no_bwd(
         &k_pool.contiguous()?,
         &v_pool.contiguous()?,
@@ -1091,8 +1138,73 @@ pub fn paged_decode(
             starts: starts.contiguous()?,
             kv_heads,
             scale,
+            scratch,
         },
     )
+}
+
+struct KvQ8Write<'a> {
+    pool: &'a Tensor,
+    kv_heads: usize,
+}
+
+impl CustomOp2 for KvQ8Write<'_> {
+    fn name(&self) -> &'static str {
+        "carbon-kv-q8-write"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, x: &CudaStorage, xl: &Layout, idx: &CudaStorage, il: &Layout) -> CResult<(CudaStorage, Shape)> {
+        let (t, width) = xl.shape().dims2()?;
+        let kvh = self.kv_heads;
+        let d = width / kvh.max(1);
+        let w = il.shape().elem_count() / t.max(1);
+        let pool = Side::new(self.pool, "kv pool")?;
+        if kvh == 0 || width != kvh * d || d > 256 || il.shape().elem_count() != t * w || w == 0
+            || pool.len() % (kvh * (d + crate::kvcache::Q8_PAD)) != 0
+        {
+            candle_core::bail!("kv q8 write: bad shapes {:?} / {:?}", xl.shape(), il.shape());
+        }
+        let dev = x.device().clone();
+        let dtype = x.dtype();
+        let f = dev.get_or_load_custom_func(&format!("kv_q8_write_{}", suffix(dtype)?), "carbon_attn_tc", attn_tc_ptx()?)?;
+        let (pv, iv) = (pool.view::<u8>()?, view::<u32>(idx, il)?);
+        let (kvh32, d32, w32) = (kvh as i32, d as i32, w as i32);
+        let cfg = LaunchConfig {
+            grid_dim: ((t * kvh) as u32, 1, 1),
+            block_dim: ((d.div_ceil(32) * 32) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        macro_rules! go {
+            ($ty:ty) => {{
+                let xv = view::<$ty>(x, xl)?;
+                let mut b = f.builder();
+                b.arg(&xv);
+                b.arg(&pv);
+                b.arg(&iv);
+                b.arg(&kvh32);
+                b.arg(&d32);
+                b.arg(&w32);
+                unsafe { b.launch(cfg) }.w()?;
+            }};
+        }
+        match dtype {
+            DType::BF16 => go!(bf16),
+            DType::F16 => go!(f16),
+            d => candle_core::bail!("kv q8 write: unsupported dtype {d:?}"),
+        }
+        // nothing to return: the pool was written in place
+        let out = unsafe { dev.alloc::<u32>(1)? };
+        Ok((CudaStorage::wrap_cuda_slice(out, dev), Shape::from(1)))
+    }
+}
+
+/// Quantize new keys or values `x [T, kv_heads * D]` into an int8 pool at the slots of
+/// `scatter_idx` (`[T, W]` u32, a row's elements all its slot).
+pub fn kv_q8_write(x: &Tensor, pool: &Tensor, scatter_idx: &Tensor, kv_heads: usize) -> CResult<()> {
+    x.contiguous()?.apply_op2_no_bwd(&scatter_idx.contiguous()?, &KvQ8Write { pool, kv_heads })?;
+    Ok(())
 }
 
 // ---- MoE decode: device routing + grouped expert GEMVs over raw weight pointers (moe.cu) ----
@@ -2276,14 +2388,20 @@ impl CustomOp3 for FlashPrefill<'_> {
     ) -> CResult<(CudaStorage, Shape)> {
         let (t, h, d) = ql.shape().dims3()?;
         let kvh = self.kv_heads;
-        if kl.shape() != vl.shape() || kl.shape().dims2()?.1 != kvh * d {
+        let dtype = q.dtype();
+        let q8 = k.dtype() == DType::U8;
+        let width = if q8 { kvh * (d + crate::kvcache::Q8_PAD) } else { kvh * d };
+        if kl.shape() != vl.shape() || kl.shape().dims2()?.1 != width {
             candle_core::bail!("flash prefill: bad kv shape {:?}", kl.shape());
         }
         if !paged_decode_supported(h, kvh, d) {
             candle_core::bail!("flash prefill: unsupported head geometry h={h} kvh={kvh} d={d}");
         }
-        let dtype = q.dtype();
-        if k.dtype() != dtype || v.dtype() != dtype {
+        if q8 {
+            if v.dtype() != DType::U8 || !prefill_on_tensor_cores(q.device(), dtype, d) {
+                candle_core::bail!("flash prefill: int8 KV needs the tensor-core kernel");
+            }
+        } else if k.dtype() != dtype || v.dtype() != dtype {
             candle_core::bail!("flash prefill: q/k/v dtypes differ");
         }
         let slots = Side::new(self.slots, "slots")?;
@@ -2294,7 +2412,7 @@ impl CustomOp3 for FlashPrefill<'_> {
         let tc = prefill_on_tensor_cores(&dev, dtype, d);
         let (f, blocks) = if tc {
             let f = dev.get_or_load_custom_func(
-                &format!("flash_prefill_tc_{}_d{d}", suffix(dtype)?),
+                &format!("flash_prefill_tc_{}{}_d{d}", if q8 { "q8_" } else { "" }, suffix(dtype)?),
                 "carbon_attn_tc",
                 attn_tc_ptx()?,
             )?;
@@ -2322,17 +2440,21 @@ impl CustomOp3 for FlashPrefill<'_> {
         };
         macro_rules! go {
             ($ty:ty) => {{
-                let (qv, kv, vv) = (
-                    view::<$ty>(q, ql)?,
-                    view::<$ty>(k, kl)?,
-                    view::<$ty>(v, vl)?,
-                );
+                let qv = view::<$ty>(q, ql)?;
                 // zeroed: rows no tile covers (none, when the tables are consistent) stay finite
                 let out = dev.alloc_zeros::<$ty>(t * h * d)?;
                 let mut b = f.builder();
                 b.arg(&qv);
-                b.arg(&kv);
-                b.arg(&vv);
+                let (k8, v8, kh, vh);
+                if q8 {
+                    (k8, v8) = (view::<u8>(k, kl)?, view::<u8>(v, vl)?);
+                    b.arg(&k8);
+                    b.arg(&v8);
+                } else {
+                    (kh, vh) = (view::<$ty>(k, kl)?, view::<$ty>(v, vl)?);
+                    b.arg(&kh);
+                    b.arg(&vh);
+                }
                 b.arg(&sv);
                 b.arg(&iv);
                 b.arg(&tv);

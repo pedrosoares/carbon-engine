@@ -747,9 +747,12 @@ fn prefix_snapshots_reuse_state_exactly(arch: &str) {
             base.len() + 5,
             "{name}: continuation resumes after the first turn"
         );
+        // long prompts also leave a snapshot at every prefill chunk boundary: with 7-token
+        // chunks the last one inside the shared 30-token prefix is at 28
+        let inside = if budget < 30 { 30 / budget * budget } else { 0 };
         assert_eq!(
-            cached[3], 0,
-            "{name}: no snapshot inside the shared 30-token prefix"
+            cached[3], inside,
+            "{name}: resumes from the last chunk boundary inside the shared 30-token prefix"
         );
         assert_eq!(cached[4], cont.len() - 1, "{name}: repeated continuation");
     }

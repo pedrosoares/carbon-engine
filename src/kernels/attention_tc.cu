@@ -51,7 +51,21 @@ __device__ __forceinline__ u32 tc_pack(float lo, float hi) {
 #define TC_BQ 64
 #define TC_BK 32
 
-template <class A, int D, int DO>
+// int8 KV pools (Q8): a row holds, per KV head, D int8 values and the f32 scale that maps them
+// back (D + 4 bytes); the kernels convert rows to the activation dtype as they stage them in
+// shared memory, so the tensor-core math is the same for both pool formats.
+#define Q8_PAD 4
+
+// Elements e, e + 1 of pool vector `vec` (slot * KVH + kv head) as a packed pair of A's dtype.
+template <class A, bool Q8>
+__device__ __forceinline__ u32 tc_pool_pair(const u16* pool, long vec, int D, int e) {
+    if (!Q8) return *(const u32*)(pool + vec * D + e);
+    const signed char* b = (const signed char*)pool + vec * (D + Q8_PAD);
+    float sc = *(const float*)(b + D);
+    return tc_pack<A>((float)b[e] * sc, (float)b[e + 1] * sc);
+}
+
+template <class A, int D, int DO, bool Q8>
 __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, const unsigned* slots,
                                  const unsigned* seqinfo, const unsigned* tiles, u16* out, int H, int KVH,
                                  float scale) {
@@ -102,14 +116,14 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
         for (int i = threadIdx.x; i < TC_BK * (D / 2); i += blockDim.x) {
             int row = i / (D / 2), cw = i % (D / 2);
             u32 w = 0;
-            if (row < nk) w = *(const u32*)(kc + ((long)slots[s_start + k0 + row] * KVH + kvh) * D + 2 * cw);
+            if (row < nk) w = tc_pool_pair<A, Q8>(kc, (long)slots[s_start + k0 + row] * KVH + kvh, D, 2 * cw);
             *(u32*)(sk + row * RSK + 2 * cw) = w;
         }
         for (int i = threadIdx.x; i < TC_BK * (DO / 2); i += blockDim.x) {
             int row = i / (DO / 2), cw = i % (DO / 2);
             u32 w = 0;
             if (row < nk)
-                w = *(const u32*)(vc + ((long)slots[s_start + k0 + row] * KVH + kvh) * D + ds * DO + 2 * cw);
+                w = tc_pool_pair<A, Q8>(vc, (long)slots[s_start + k0 + row] * KVH + kvh, D, ds * DO + 2 * cw);
             *(u32*)(sv + row * RSV + 2 * cw) = w;
         }
         __syncthreads();
@@ -206,7 +220,14 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
     extern "C" __global__ void flash_prefill_tc_##SUFFIX##_d##D(                                               \
         const u16* q, const u16* k, const u16* v, const unsigned* slots, const unsigned* seqinfo,              \
         const unsigned* tiles, u16* out, int H, int KVH, float scale) {                                        \
-        flash_prefill_tc<A, D, (D > 128 ? 128 : D)>(q, k, v, slots, seqinfo, tiles, out, H, KVH, scale);      \
+        flash_prefill_tc<A, D, (D > 128 ? 128 : D), false>(q, k, v, slots, seqinfo, tiles, out, H, KVH,      \
+                                                           scale);                                             \
+    }                                                                                                          \
+    extern "C" __global__ void flash_prefill_tc_q8_##SUFFIX##_d##D(                                            \
+        const u16* q, const u16* k, const u16* v, const unsigned* slots, const unsigned* seqinfo,              \
+        const unsigned* tiles, u16* out, int H, int KVH, float scale) {                                        \
+        flash_prefill_tc<A, D, (D > 128 ? 128 : D), true>(q, k, v, slots, seqinfo, tiles, out, H, KVH,       \
+                                                          scale);                                              \
     }
 
 DEFINE_TC(bf16, ABF16, 64)
@@ -243,20 +264,50 @@ DEFINE_TC(f16, AF16, 256)
 
 // Copy 16 pool rows into shared memory: all the loads are issued before the first store, so
 // their latencies overlap instead of adding up (a store may alias the next row's pointer).
+// Q8 rows are converted to A's dtype on the way (4 int8 per load, two staged words).
+template <class A, bool Q8>
 __device__ __forceinline__ void pd_stage(u32 (*st)[PD_MAXD / 2], const u16* pool, const unsigned* slots,
                                          unsigned t0, unsigned s1, int KVH, int kvh, int D, int lane) {
-    const int per = D / 64;  // words per lane and row
-    const u32* rows[16];
+    long vec[16];
 #pragma unroll
     for (int r = 0; r < 16; ++r) {
         unsigned j = t0 + r < s1 ? t0 + r : s1 - 1;
-        rows[r] = (const u32*)(pool + ((long)slots[j] * KVH + kvh) * D);
+        vec[r] = (long)slots[j] * KVH + kvh;
     }
+    if (Q8) {
+        const int per = D / 128;  // int8 words per lane and row
+        u32 tmp[16][PD_MAXD / 128];
+        float sc[16];
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            const u32* row = (const u32*)((const signed char*)pool + vec[r] * (D + Q8_PAD));
+            sc[r] = *(const float*)(row + D / 4);
+#pragma unroll
+            for (int i = 0; i < PD_MAXD / 128; ++i) tmp[r][i] = i < per ? row[lane + 32 * i] : 0u;
+        }
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+#pragma unroll
+            for (int i = 0; i < PD_MAXD / 128; ++i) {
+                if (i < per) {
+                    u32 w = tmp[r][i];
+                    int word = 2 * (lane + 32 * i);
+                    st[r][word] = tc_pack<A>((float)(signed char)(w & 0xff) * sc[r],
+                                             (float)(signed char)((w >> 8) & 0xff) * sc[r]);
+                    st[r][word + 1] = tc_pack<A>((float)(signed char)((w >> 16) & 0xff) * sc[r],
+                                                 (float)(signed char)(w >> 24) * sc[r]);
+                }
+            }
+        }
+        return;
+    }
+    const int per = D / 64;  // words per lane and row
     u32 tmp[16][PD_MAXD / 64];
 #pragma unroll
     for (int r = 0; r < 16; ++r) {
+        const u32* row = (const u32*)(pool + vec[r] * D);
 #pragma unroll
-        for (int i = 0; i < PD_MAXD / 64; ++i) tmp[r][i] = i < per ? rows[r][lane + 32 * i] : 0u;
+        for (int i = 0; i < PD_MAXD / 64; ++i) tmp[r][i] = i < per ? row[lane + 32 * i] : 0u;
     }
 #pragma unroll
     for (int r = 0; r < 16; ++r) {
@@ -291,7 +342,7 @@ __device__ __forceinline__ void pd_block_merge(u32 (*stage)[16][PD_MAXD / 2], fl
     }
 }
 
-template <class A>
+template <class A, bool Q8>
 __device__ void paged_decode_tc(const u16* q, const u16* kc, const u16* vc, const unsigned* slots,
                                 const unsigned* starts, float* part, int H, int KVH, int D, float scale, int NCW) {
     __shared__ u32 stage[PD_WARPS][16][PD_MAXD / 2];
@@ -333,7 +384,7 @@ __device__ void paged_decode_tc(const u16* q, const u16* kc, const u16* vc, cons
 
     for (unsigned t0 = p0; t0 < p1; t0 += 16) {
         // positions past the end re-read the last one and get zero weight
-        pd_stage(st, kc, slots, t0, s1, KVH, kvh, D, lane);
+        pd_stage<A, Q8>(st, kc, slots, t0, s1, KVH, kvh, D, lane);
         __syncwarp();
         float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
@@ -372,7 +423,7 @@ __device__ void paged_decode_tc(const u16* q, const u16* kc, const u16* vc, cons
         pw[g + 8][2 * tg] = p10;
         pw[g + 8][2 * tg + 1] = p11;
         __syncwarp();
-        pd_stage(st, vc, slots, t0, s1, KVH, kvh, D, lane);
+        pd_stage<A, Q8>(st, vc, slots, t0, s1, KVH, kvh, D, lane);
         __syncwarp();
         // P^T [16 pos x G]: rows 2tg, 2tg+1 (and +8) of column g
         u32 pf[2] = {tc_pack<A>(pw[2 * tg][g], pw[2 * tg + 1][g]), tc_pack<A>(pw[8 + 2 * tg][g], pw[9 + 2 * tg][g])};
@@ -440,12 +491,42 @@ __device__ void paged_decode_merge(const float* part, const unsigned* starts, u1
     A::store(out, ((long)b * H + h) * D + d, ll > 0.0f ? o / ll : 0.0f);
 }
 
+// Quantize new K or V rows into a Q8 pool. grid T * KVH blocks of D threads; x [T, KVH * D],
+// idx [T, W]: the slot of row t is idx[t * W] (the batch's scatter table).
+template <class A>
+__device__ void kv_q8_write(const u16* x, signed char* pool, const unsigned* idx, int KVH, int D, int W) {
+    __shared__ float red[8];
+    const int t = blockIdx.x / KVH, kvh = blockIdx.x % KVH, d = threadIdx.x;
+    const bool on = d < D;
+    float v = on ? A::load(x, ((long)t * KVH + kvh) * D + d) : 0.0f;
+    float m = fabsf(v);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off));
+    if (threadIdx.x % 32 == 0) red[threadIdx.x / 32] = m;
+    __syncthreads();
+    float mx = 0.0f;
+    for (int w = 0; w < (int)(blockDim.x / 32); ++w) mx = fmaxf(mx, red[w]);
+    signed char* row = pool + ((long)idx[(long)t * W] * KVH + kvh) * (D + Q8_PAD);
+    if (on) row[d] = (signed char)__float2int_rn(mx > 0.0f ? v * (127.0f / mx) : 0.0f);
+    if (d == 0) *(float*)(row + D) = mx / 127.0f;
+}
+
 #define DEFINE_PD_TC(SUFFIX, A)                                                                               \
     extern "C" __global__ void paged_decode_tc_##SUFFIX(const u16* q, const u16* k, const u16* v,            \
                                                         const unsigned* slots, const unsigned* starts,        \
                                                         float* part, int H, int KVH, int D, float scale,      \
                                                         int NCW) {                                            \
-        paged_decode_tc<A>(q, k, v, slots, starts, part, H, KVH, D, scale, NCW);                              \
+        paged_decode_tc<A, false>(q, k, v, slots, starts, part, H, KVH, D, scale, NCW);                       \
+    }                                                                                                         \
+    extern "C" __global__ void paged_decode_tc_q8_##SUFFIX(const u16* q, const u16* k, const u16* v,         \
+                                                           const unsigned* slots, const unsigned* starts,     \
+                                                           float* part, int H, int KVH, int D, float scale,   \
+                                                           int NCW) {                                         \
+        paged_decode_tc<A, true>(q, k, v, slots, starts, part, H, KVH, D, scale, NCW);                        \
+    }                                                                                                         \
+    extern "C" __global__ void kv_q8_write_##SUFFIX(const u16* x, signed char* pool, const unsigned* idx,    \
+                                                    int KVH, int D, int W) {                                  \
+        kv_q8_write<A>(x, pool, idx, KVH, D, W);                                                              \
     }                                                                                                         \
     extern "C" __global__ void paged_decode_merge_##SUFFIX(const float* part, const unsigned* starts,        \
                                                            u16* out, int H, int KVH, int D, int NCW) {        \

@@ -104,23 +104,33 @@ code / math / json). RTX 5090, LM Studio runtime llama.cpp 2.71.
 |---|---|---|---|---|---|
 | LM Studio, no MTP | 73.1 | 72.9 | 72.7 | 72.6 | 72.8 |
 | LM Studio, MTP | 87.5 | 113.6 | 117.8 | 180.6 | 124.9 |
-| carbon, no MTP | 65.6 | 65.4 | 65.3 | 65.1 | 65.3 |
-| carbon, `--mtp --mtp-drafts 2` | 85.0 | 125.7 | 120.9 | 139.1 | 117.7 |
-| carbon, `--mtp --mtp-drafts 5 --mtp-min-prob 0.75` | 85.9 | 137.4 | 136.2 | 165.1 | 131.2 |
+| carbon, no MTP | 66.2 | 66.0 | 65.9 | 65.7 | 66.0 |
+| carbon, `--mtp --mtp-drafts 5 --mtp-min-prob 0.75` | 91.4 | 145.5 | 149.4 | 174.2 | 140.1 |
+| carbon, `--mtp --mtp-drafts 7 --mtp-min-prob 0.5` | 92.5 | 147.1 | 148.8 | 179.8 | 142.0 |
 
-At depth (mean of the four prompts; carbon with bf16 KV and 4 drafts, `--kv-tokens 70000`):
+At depth (decode tok/s; carbon with `--kv-dtype q8 --mtp --mtp-drafts 5 --mtp-min-prob 0.75
+--max-running-requests 2 --state-snapshots 4`, which holds the full 262,144-token window in
+28 GiB; story / json where only two prompts were run):
 
-| engine | 32k | 60k | 91k | 129k | 253k |
-|---|---|---|---|---|---|
-| LM Studio, MTP | 104.7 | | 86.7 | does not fit | does not fit |
-| LM Studio, no MTP | | | | 37.0 | 24.5 |
-| carbon, MTP | 82.5 | 68.1 | not run | does not fit yet | does not fit yet |
-| carbon, no MTP | 54.4 | | about 39 (before a latency fix) | | |
+| engine | 32k (4 prompts) | 91k | 129k | 253k |
+|---|---|---|---|---|
+| LM Studio, MTP | 104.7 | 86.7 | does not fit | does not fit |
+| LM Studio, no MTP | | | 37.0 | 24.5 |
+| carbon, q8 KV + MTP | 116.1 | | 53.6 / 83.8 | 40.2 / 56.2 |
 
-With MTP carbon is now ahead of LM Studio on the mean (+5%), on code (+21%) and math (+16%),
-and behind on story (-2%) and JSON (-9%). Without MTP it is 10% behind. The depth table below
-predates the last round of decode work (carbon rows not re-measured), and time to first token
-on long prompts is still 2-3x longer than LM Studio's.
+Time to first token, cold (seconds):
+
+| engine | 32k | 129k | 253k |
+|---|---|---|---|
+| LM Studio | 11.3 | 72 | 148 |
+| carbon | 24 | 293 | 1041 |
+
+With MTP carbon is ahead of LM Studio on the mean at short context (+12%; story +4%, code
++28%, math +27%, JSON -4% with 5 drafts, level with 7), at 32k (+11%), and about 2x at 129k
+and 253k, where LM Studio has to turn MTP off. Without MTP carbon is 9% behind. Decode still
+slows with depth (140 -> 116 -> 69 -> 48), and cold prefill is the weak point: 2x slower at 32k
+and 7x slower at 253k. A second request sharing a long prefix resumes from the last prefill
+chunk boundary inside it (32k: 3.8 s instead of 24 s).
 
 ### Phase 3: decode speed (in progress)
 
@@ -174,7 +184,30 @@ on long prompts is still 2-3x longer than LM Studio's.
   slots, row gathers in `per_substep`, attention reading K/V once per token row), and the
   phase 3 launch fusion, which every verify step also pays.
 
-### Phase 5: context depth (started)
+### Phase 5 update: int8 KV, full window, chunk snapshots
+
+- `--kv-dtype q8`: each K / V vector is 256 int8 values plus an inline f32 scale (260 bytes).
+  `kv_q8_write` quantizes on write; the decode and prefill tensor-core kernels convert rows to
+  the activation dtype while staging them in shared memory, so the MMA code is shared with the
+  bf16 pools. Other readers (generic and non-tensor-core paths) refuse int8 pools.
+- Same decode speed as bf16 KV at short context. Text differs from the bf16-KV run after about
+  180 characters on one prompt (lossy cache); no quality evaluation yet. `--mtp` output is
+  still identical to plain decoding with the same kernels.
+- Full window: 270,854 KV tokens fit with the MTP head when the recurrent-state pools are
+  sized for a single user (`--max-running-requests 2 --state-snapshots 4`; the defaults of 16
+  + 16 slots take about 6 GB at 151 MB each and leave 150k tokens).
+- The chunked decode kernel's partials live in one scratch buffer per device and size. Per-call
+  buffers made every captured CUDA graph pin one per layer and batch shape.
+- Recurrent state is snapshotted at every prefill chunk boundary of a long prompt; when the
+  slots run out the request recycles a snapshot on its own path (keeps the shallowest).
+- Greedy pick kernel (`logit_pick`): argmax and its probability in one pass, replacing three
+  generic reductions of about 0.1 ms each per draft.
+- Why prefill is slow at depth: attention time grows with n^2 (293 s at 129k, about 225 s of
+  it attention). The prefill kernel runs one block per (64 queries, head, half of the output
+  dims), each staging the same K / V rows itself: 12 blocks per KV head re-read and convert
+  the prefix, and the scores are computed twice for head dim 256.
+
+### Phase 5: context depth (first round)
 
 - `paged_decode_tc` (`kernels/attention_tc.cu`) replaces the per-head decode kernel on sm_80+:
   256-position chunks, one block each (4 warps of 64 positions, merged in the block), the 6
@@ -204,10 +237,11 @@ on long prompts is still 2-3x longer than LM Studio's.
 
 ## Next steps, in order
 
-1. Remaining decode gaps: plain decode (65 vs 73: norm + prep and SiLU * up epilogues, small
-   launches), draft cost (about 1.2 ms each, 0.7 ms reading the LM head), story and JSON with MTP.
-   Re-measure depth.
-2. Int8 KV pool with int8 decode and prefill attention kernels (full 262,144 context), and a
-   KV auto-size that leaves room for prefill.
-3. Prefill: attention throughput, fewer dequant passes, periodic recurrent-state snapshots.
+1. Prefill at depth: a prefill attention kernel that stages K / V once per KV head for its six
+   query heads and scores once; then dequant passes, GDN recurrence and element-wise ops.
+2. Decode at depth: multi-token steps read K / V once per token row; int8 MMA instead of
+   converting to half precision.
+3. Int8 KV quality check against bf16 KV (logit-level), and `--kv-dtype auto`.
+4. KV / state auto-sizing: room for prefill temporaries, single-user defaults for long windows.
+5. Plain decode (66 vs 73): fuse norm + prep and SiLU * up into kernel epilogues.
 4. Phase 6 sweep and README; phase 7 image input.

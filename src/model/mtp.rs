@@ -427,7 +427,7 @@ impl MtpHead {
     pub fn kv_bytes_per_token(&self) -> usize {
         match self {
             Self::Flash(f) => f.kv_bytes_per_token(),
-            Self::Dense(d) => 2 * d.kv_width * d.dtype.size_in_bytes(),
+            Self::Dense(d) => crate::kvcache::kv_layer_bytes(d.kv_width / d.head_dim, d.head_dim, d.dtype, &d.device),
         }
     }
 

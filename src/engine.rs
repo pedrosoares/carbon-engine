@@ -55,6 +55,8 @@ pub struct EngineConfig {
     /// With more than two drafts per step: the head keeps drafting while its last draft's
     /// probability is at least this (`--mtp-min-prob`).
     pub mtp_min_prob: f32,
+    /// KV pools on CUDA as int8 with a scale per vector (`--kv-dtype q8`).
+    pub kv_q8: bool,
     /// Skip the checkpoint's vision tower (no image input, its VRAM left to the caches).
     pub text_only: bool,
 }
@@ -82,6 +84,7 @@ impl EngineConfig {
             mtp_speculate: false,
             mtp_drafts: 1,
             mtp_min_prob: 0.6,
+            kv_q8: false,
             text_only: false,
         }
     }
@@ -185,6 +188,7 @@ impl Engine {
             && ec.tp_size == 1
             && ec.rpc_workers.is_empty()
             && ec.devices[0].starts_with("cuda");
+        crate::kvcache::set_kv_q8(ec.kv_q8);
         // verify steps carry several tokens: the K-quant kernels pick their multi-token GEMM
         #[cfg(feature = "cuda")]
         crate::kernels::cuda::kquant_expect_multi_token(ec.mtp_speculate && speculation_supported);

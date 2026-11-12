@@ -809,6 +809,12 @@ impl Scheduler {
                     self.cache_prompt(i, true);
                 } else if samplers.contains(&i) {
                     self.cache_prompt(i, false);
+                } else if self.hybrid && r.in_prefill() {
+                    // a long prompt, between chunks: keep a reuse point here too, so a later
+                    // prompt that shares the beginning and ends differently resumes from the
+                    // last chunk boundary inside the shared part instead of from the start
+                    // (the oldest snapshots make room when the slots run out)
+                    self.cache_prompt(i, true);
                 }
             }
             self.reap();
@@ -1450,6 +1456,7 @@ impl Scheduler {
             .free_snaps
             .pop()
             .or_else(|| self.radix.evict_snapshot())
+            .or_else(|| self.radix.take_ancestor_snapshot(node))
         else {
             return;
         };

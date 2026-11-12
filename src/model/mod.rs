@@ -175,8 +175,8 @@ impl LayerStack {
         // the KV floor and the recurrent-state pools allocated after loading
         let kv_reserve_bytes = moe_opts.kv_reserve_tokens.unwrap_or(max_seq_len)
             * n_attn_stage
-            * (2 * kv_width + index_dim)
-            * p.dtype.size_in_bytes()
+            * (crate::kvcache::kv_layer_bytes(kv_width / cfg.head_dim.max(1), cfg.head_dim, p.dtype, &p.device)
+                + index_dim * p.dtype.size_in_bytes())
             + moe_opts.state_slots * state_bytes;
         // per-expert bytes as stored (quantized experts stay quantized unless dequant_fp8)
         let (expert_bytes, local_experts, format) = match (has_moe, cfg.moe.as_ref()) {
@@ -394,7 +394,11 @@ impl LayerStack {
     }
 
     pub fn kv_bytes_per_token(&self) -> usize {
-        self.n_attn * (2 * self.kv_width + self.index_dim) * self.placement.dtype.size_in_bytes()
+        let p = &self.placement;
+        let kvh = self.kv_width / self.cfg.head_dim.max(1);
+        self.n_attn
+            * (crate::kvcache::kv_layer_bytes(kvh, self.cfg.head_dim, p.dtype, &p.device)
+                + self.index_dim * p.dtype.size_in_bytes())
     }
 
     /// How many KV tokens fit in `memory_ratio` of the device's free memory (None when the
