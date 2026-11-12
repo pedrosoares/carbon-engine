@@ -2639,6 +2639,50 @@ pub fn sample_on_gpu(logits: &Tensor, rows: &[RowSampling]) -> CResult<Vec<(u32,
     Ok(out.into_iter().map(|r| (r[0], r[1] != 0)).collect())
 }
 
+struct LogitPick;
+
+impl candle_core::CustomOp1 for LogitPick {
+    fn name(&self) -> &'static str {
+        "carbon-logit-pick"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, x: &CudaStorage, xl: &Layout) -> CResult<(CudaStorage, Shape)> {
+        const PARTS: usize = 32; // LP_PARTS in quant.cu
+        let (r, v) = xl.shape().dims2()?;
+        let dev = x.device().clone();
+        let f_part = kernel!(dev, "logit_pick_part".to_string());
+        let f_merge = kernel!(dev, "logit_pick_merge".to_string());
+        let xv = view::<f32>(x, xl)?;
+        let part = unsafe { dev.alloc::<f32>(r * PARTS * 3)? };
+        let out = unsafe { dev.alloc::<f32>(r * 2)? };
+        let (r32, v32) = (r as i32, v as i32);
+        let mut b = f_part.builder();
+        b.arg(&xv);
+        b.arg(&part);
+        b.arg(&r32);
+        b.arg(&v32);
+        let cfg = LaunchConfig { grid_dim: ((r * PARTS) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(cfg) }.w()?;
+        let mut b = f_merge.builder();
+        b.arg(&part);
+        b.arg(&out);
+        b.arg(&r32);
+        let cfg = LaunchConfig { grid_dim: (r as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(cfg) }.w()?;
+        Ok((CudaStorage::wrap_cuda_slice(out, dev), Shape::from((r, 2))))
+    }
+}
+
+/// Greedy pick per row of f32 `logits` `[R, V]` on CUDA: the argmax (lowest index on ties) and
+/// its softmax probability, in one pass (the generic argmax / max / sum reductions take about
+/// 0.1 ms each over a 250k vocabulary).
+pub fn logit_pick(logits: &Tensor) -> CResult<Vec<(u32, f32)>> {
+    let out = logits.to_dtype(DType::F32)?.contiguous()?.apply_op1_no_bwd(&LogitPick)?.to_vec2::<f32>()?;
+    Ok(out.into_iter().map(|r| (r[0].to_bits(), r[1])).collect())
+}
+
 // ---- QSA decode selection (qsa.cu) ----
 
 fn qsa_ptx() -> CResult<&'static str> {

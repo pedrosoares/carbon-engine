@@ -429,6 +429,92 @@ __device__ void kq_gemv_i8_multi(const u8* d0, const u8* d1, const u8* d2, const
     }
 }
 
+// ---- greedy pick over logits [R, V] f32: argmax (lowest index on ties) and its probability ----
+//
+// logit_pick_part: grid R * LP_PARTS blocks; block (r, p) reduces its slice of row r to
+//   (max, argmax, sum exp(x - max)) in part [R, LP_PARTS, 3] (f32, the index as its bits).
+// logit_pick_merge: one warp per row merges the parts: out [R, 2] = (index bits, probability).
+#define LP_PARTS 32
+
+extern "C" __global__ void logit_pick_part(const float* logits, float* part, int R, int V) {
+    __shared__ float sm[32];
+    __shared__ int si[32];
+    int r = blockIdx.x / LP_PARTS, p = blockIdx.x % LP_PARTS;
+    long lo = (long)V * p / LP_PARTS, hi = (long)V * (p + 1) / LP_PARTS;
+    const float* x = logits + (long)r * V;
+    float m = -3.0e38f;
+    int mi = 0x7fffffff;
+    for (long i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        float v = x[i];
+        if (v > m) {
+            m = v;
+            mi = (int)i;
+        }
+    }
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nw = blockDim.x / 32;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float om = __shfl_xor_sync(0xffffffff, m, off);
+        int oi = __shfl_xor_sync(0xffffffff, mi, off);
+        if (om > m || (om == m && oi < mi)) {
+            m = om;
+            mi = oi;
+        }
+    }
+    if (lane == 0) {
+        sm[warp] = m;
+        si[warp] = mi;
+    }
+    __syncthreads();
+    float bm = sm[0];
+    int bi = si[0];
+    for (int w = 1; w < nw; ++w) {
+        if (sm[w] > bm || (sm[w] == bm && si[w] < bi)) {
+            bm = sm[w];
+            bi = si[w];
+        }
+    }
+    __syncthreads();
+    float sum = 0.0f;
+    for (long i = lo + threadIdx.x; i < hi; i += blockDim.x) sum += __expf(x[i] - bm);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, off);
+    if (lane == 0) sm[warp] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tot = 0.0f;
+        for (int w = 0; w < nw; ++w) tot += sm[w];
+        float* o = part + ((long)r * LP_PARTS + p) * 3;
+        o[0] = bm;
+        o[1] = __int_as_float(bi);
+        o[2] = tot;
+    }
+}
+
+extern "C" __global__ void logit_pick_merge(const float* part, float* out, int R) {
+    int r = blockIdx.x, lane = threadIdx.x;
+    if (r >= R || lane >= LP_PARTS) return;
+    const float* p = part + ((long)r * LP_PARTS + lane) * 3;
+    float m = p[0], pm = p[0], ps = p[2];
+    int mi = __float_as_int(p[1]);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float om = __shfl_xor_sync(0xffffffff, m, off);
+        int oi = __shfl_xor_sync(0xffffffff, mi, off);
+        if (om > m || (om == m && oi < mi)) {
+            m = om;
+            mi = oi;
+        }
+    }
+    float sum = ps * __expf(pm - m);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, off);
+    if (lane == 0) {
+        out[2 * r] = __int_as_float(mi);
+        out[2 * r + 1] = 1.0f / sum;
+    }
+}
+
 #define DEFINE_KERNELS(SUFFIX, D)                                                                            \
     extern "C" __global__ void nvfp4_dequant_##SUFFIX(const u8* p, const u8* s, float g, D::T* o, int n,     \
                                                       int k) { nvfp4_dequant<D>(p, s, g, o, n, k); }          \

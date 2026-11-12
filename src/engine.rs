@@ -468,6 +468,13 @@ impl Engine {
             return Ok((vec![], vec![], multi));
         }
         let logits = self.head.project(&mixed)?;
+        #[cfg(feature = "cuda")]
+        if logits.device().is_cuda() {
+            if let Ok(picks) = crate::kernels::cuda::logit_pick(&logits) {
+                let (ids, probs) = picks.into_iter().unzip();
+                return Ok((ids, probs, multi));
+            }
+        }
         let ids = logits.argmax(1)?.to_vec1::<u32>()?;
         let probs = if scored {
             // p(argmax) = 1 / sum(exp(logit - max))

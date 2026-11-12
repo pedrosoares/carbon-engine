@@ -1248,6 +1248,12 @@ impl Scheduler {
             let p = &self.running[i].params;
             p.is_greedy() && !host_only(p)
         }) {
+            #[cfg(feature = "cuda")]
+            if logits.device().is_cuda() {
+                if let Ok(picks) = crate::kernels::cuda::logit_pick(logits) {
+                    return Ok(picks.into_iter().map(|(id, _)| id).collect());
+                }
+            }
             return Ok(logits.argmax(1)?.to_vec1::<u32>()?);
         }
         #[cfg(feature = "cuda")]

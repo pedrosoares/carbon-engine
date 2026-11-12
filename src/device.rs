@@ -354,6 +354,7 @@ pub fn kernel_selftest(device: &Device, dtype: DType) -> Vec<(&'static str, Resu
                 "carbon fp8 kernels (gemv + dequant vs cpu)",
                 Box::new(move || check_quant_kernels(d, dtype, false)),
             ));
+            ops.push(("carbon greedy pick (argmax + probability vs cpu)", Box::new(move || check_logit_pick(d))));
             ops.push((
                 "carbon q4_k kernels (gemv + dequant vs cpu)",
                 Box::new(move || check_kquant_kernels(d, dtype, crate::gguf::KKind::Q4K)),
@@ -449,6 +450,31 @@ fn check_quant_kernels(d: &Device, dtype: DType, nvfp4: bool) -> candle_core::Re
     let (ew, ey) = (rel(&w_gpu, &w_ref)?, rel(&y_gpu, &y_ref)?);
     if ew > tol || ey > tol {
         candle_core::bail!("mismatch vs cpu: dequant rel err {ew:.2e}, gemv rel err {ey:.2e}");
+    }
+    Ok(())
+}
+
+/// Compare the one-pass greedy pick with a CPU argmax / softmax (a vocabulary that does not
+/// divide into the kernel's parts, a tie resolved to the lower index).
+#[cfg(feature = "cuda")]
+fn check_logit_pick(d: &Device) -> candle_core::Result<()> {
+    let (r, v) = (3usize, 100_003usize);
+    let mut x = Tensor::randn(0f32, 3.0, (r, v), &Device::Cpu)?.to_vec2::<f32>()?;
+    x[1][777] = 50.0;
+    x[1][90_001] = 50.0;
+    let flat: Vec<f32> = x.iter().flatten().copied().collect();
+    let got = crate::kernels::cuda::logit_pick(&Tensor::from_vec(flat, (r, v), d)?)?;
+    for (row, (id, p)) in x.iter().zip(got) {
+        let (mut best, mut m) = (0usize, f32::NEG_INFINITY);
+        for (i, &val) in row.iter().enumerate() {
+            if val > m {
+                (best, m) = (i, val);
+            }
+        }
+        let want = 1.0 / row.iter().map(|&val| ((val - m) as f64).exp()).sum::<f64>();
+        if id as usize != best || (p as f64 - want).abs() > 1e-4 * want.max(1e-3) {
+            candle_core::bail!("pick ({id}, {p}) differs from the cpu's ({best}, {want})");
+        }
     }
     Ok(())
 }
