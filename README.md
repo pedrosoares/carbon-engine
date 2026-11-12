@@ -218,7 +218,7 @@ carbon serve --model ~/models/Qwen3.8-27B-Q4_K_M.gguf --devices cuda:0 --cuda-gr
 
 # the full 262,144-token window on a 32 GB card: int8 KV, recurrent-state pools for one user
 carbon serve --model ~/models/Qwen3.8-27B-Q4_K_M.gguf --devices cuda:0 --cuda-graphs \
-  --mtp --mtp-drafts 5 --mtp-min-prob 0.75 --kv-dtype q8 \
+  --mtp --mtp-drafts 5 --mtp-min-prob 0.75 --kv-dtype q8 --max-seq-len 262144 \
   --max-running-requests 2 --state-snapshots 4
 ```
 
@@ -232,7 +232,8 @@ layers' value heads in a tiled order). The `mmproj` image tower is not loaded ye
   per 32 values and multiplies it with the 4- / 6-bit codes in integer arithmetic: a dp4a kernel
   for single tokens, an integer tensor-core GEMM for the multi-token steps of speculative
   decoding, where 8 tokens cost about 1.2x one. Projections that share an input run in one
-  launch. Prefill dequantizes a layer's weights per chunk and uses cuBLAS.
+  launch. Prefill dequantizes a layer's weights per chunk and uses cuBLAS; the Gated DeltaNet
+  layers and attention run in carbon's own prefill kernels.
 - **MTP** (`--mtp`): the head (`blk.64` + `nextn.*`) drafts up to `--mtp-drafts` tokens, going
   on while its last draft has probability `--mtp-min-prob`; the next step verifies them all.
   With `--mtp` every K-quant weight uses the tensor-core kernel for every step, so the output is
@@ -262,9 +263,13 @@ greedy answers with thinking off (`scripts/bench_openai.py`; `PLAN.md` has the f
 | LM Studio (MTP on to about 100k; it cannot load more with MTP) | 78 / 154 | 37 / 37 (no MTP) | 25 / 25 (no MTP) |
 | carbon, full-window configuration above | 76 / 147 | 59 / 109 | 44 / 80 |
 
-Cold prefill is slower than LM Studio's: 21 s for 32k tokens (LM Studio 11 s) and about 200 s
-for 128k (72 s). A later prompt that shares the beginning starts in 3 s at 32k, 7 s at 128k and
-14 s at 250k.
+| time to first token, cold prompt (s) | 32k | 128k | 250k |
+|---|---|---|---|
+| LM Studio | 11.3 | 72 | 148 |
+| carbon, full-window configuration above | 12.2 | 73 | 204 |
+
+A later prompt that shares the beginning starts in 1.7 s at 32k, 2.2 s at 128k and 4.3 s at
+250k. Without `--max-seq-len` the context is capped at 32,768 tokens.
 
 ## Architecture
 

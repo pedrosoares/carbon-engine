@@ -125,7 +125,8 @@ Time to first token (seconds):
 |---|---|---|---|---|
 | LM Studio | 11.3 | 72 | 148 | 0.9 - 3.4 |
 | carbon, first int8 KV build | 24 | 293 | 1041 | (re-prefilled) |
-| carbon, now | 21 | 183 - 201 | not measured cold (481 s on top of a cached 128k prefix) | 3.1 (32k), 7.0 (128k), 14.4 (250k) |
+| carbon, row-shared attention build | 21 | 183 - 201 | not measured cold (481 s on top of a cached 128k prefix) | 3.1 (32k), 7.0 (128k), 14.4 (250k) |
+| carbon, now (prefill round) | 12.2 | 73 | 204 | 1.7 (32k), 2.2 (128k), 4.3 (250k) |
 
 With MTP carbon is ahead of LM Studio at short context (+12% on the mean; story +4%, code +28%,
 math +27%, JSON -4% with 5 drafts, level with 7), at 32k (+10%), and 2.3x / 2.5x at 128k / 250k,
@@ -133,8 +134,8 @@ where LM Studio has to turn MTP off. Without MTP carbon is 9% behind. Decode sti
 depth (132 -> 116 -> 84 -> 62 on the means): at 128k a verify step is 34 ms against 18 ms at
 short context, the difference being attention (the kernel is bound by its own arithmetic, about
 1 ms per 13k tokens of context per step) and about 2 ms of host work per step that grows with
-the context (slot tables rebuilt and uploaded every step). Cold prefill is 2-3x slower than
-LM Studio's.
+the context (slot tables rebuilt and uploaded every step). Cold prefill is level with LM
+Studio's to 128k (12.2 s vs 11.3 s at 32k, 73 s vs 72 s at 128k) and 1.4x slower at 250k.
 
 ### Phase 3: decode speed (in progress)
 
@@ -211,6 +212,40 @@ LM Studio's.
   dims), each staging the same K / V rows itself: 12 blocks per KV head re-read and convert
   the prefix, and the scores are computed twice for head dim 256.
 
+### Phase 5 update 3: prefill speed
+
+Profile of a cold 16k prefill before this round (9.6 s): cuBLAS GEMMs 43% (about 250 TFLOPS,
+at the hardware's rate), K-quant dequant 15%, attention 13%, GDN recurrence 11%, generic
+element-wise ops 17%. After it (5.9 s): GEMMs 66%, recurrence 12%, attention 8%, dequant 3%.
+
+- `kq_dequant`: one warp per 64 weights with lanes on consecutive weights, so every load and
+  store covers one contiguous run (a thread per 32-weight group scattered each 2-byte store over
+  32 cache lines): 1173 -> 184 ms per 16k tokens.
+- Prefill attention (`flash_prefill_tc`), 1060 -> about 330 ms per 16k and 61 -> 109 TFLOPS at a
+  127k prefix (`examples/attnbench`):
+  - all 256 output dims in one block, so the scores are computed once (the split was a guess
+    about registers that did not hold: two heads per block still launch);
+  - int8 K / V are staged as their codes, exact in bf16 / f16, and the per-vector scales go
+    into the scores and the probabilities (no rounding of scaled values, a third of the work);
+  - V is staged transposed, so P V loads its fragments as two words like Q K^T;
+  - a thread issues all its staging loads before converting any. The load-convert-store loop
+    waited a cache round trip per item and was half the kernel.
+  What did not help: skipping the accumulator rescale when the max is unchanged, 64-key tiles,
+  and loading the next tile during the MMAs (the extra live registers spill). In this kernel
+  the MMAs themselves are about a third of the time; staging is 40% and is bound by the
+  registers a block needs (128 (query, head) rows per block, one block per SM).
+- Gated DeltaNet prefill on carbon kernels (`gdn_pre`, `gdn_gates`, `gdn_seq2`, `gdn_post`,
+  `gdn_conv_tail`): conv + SiLU + l2 norm, gates, recurrence and gated norm, with the state
+  read from and left in the sequence's slot. The generic path spent about 1.2 s per 16k tokens
+  in casts, copies and broadcast multiplies around the recurrence. `gdn_seq2` holds 32 state
+  rows per thread (8 columns per warp, 2 shuffles per reduction instead of 5): 5.3 -> 4.2 ms
+  per 4096 tokens (`examples/gdnbench`). 16 or 8 rows per thread, whole-head blocks, vector
+  loads and staging the tokens in shared memory all measured the same or worse; the kernel
+  runs at about 0.3 instructions per cycle per SM and I have not found what bounds it.
+- The 250k cold prefill is 204 s: about half attention (n^2), half the linear part.
+- `scripts/cuda_kernels_host_test.cpp` no longer compiles (it lacks shims for what `quant.cu`
+  gained on this branch: shared memory, shuffles); the GDN and attention host tests run.
+
 ### Phase 5 update 2: row-shared decode attention, shared slot tables, prefix cache
 
 - `paged_decode_tc_rows`: on pools of 131,072 slots or more, a block takes all token rows of a
@@ -258,9 +293,9 @@ LM Studio's.
 
 ## Next steps, in order
 
-1. Prefill: the linear part alone (16 s per 32k) is slower than LM Studio's whole prefill
-   (dequant passes, GDN recurrence, element-wise ops next to cuBLAS), and prefill attention
-   still scores twice at head dim 256 and stages per two heads.
+1. Prefill beyond 128k: attention is n^2 and at 107 TFLOPS (more (query, head) rows per staged
+   tile needs fewer registers per thread, e.g. Q in shared memory); the GDN recurrence is 12%
+   of the linear part and far from the hardware's rate.
 2. Decode at depth: int8 MMA in the attention kernels instead of converting to half precision;
    device-side slot tables kept across steps (append-only) instead of rebuilt per step.
 3. Int8 KV quality check against bf16 KV (logit-level), and `--kv-dtype auto`.
