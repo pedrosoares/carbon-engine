@@ -173,26 +173,32 @@ __device__ __forceinline__ float q6k_weight(const u8* b, int j, int l, float d) 
     return d * (float)sc * (float)((nib | (hb << 4)) - 32);
 }
 
-// out [n, k]; one thread per 32-weight group
+// out [n, k]; one warp per 64-weight unit (Q4_K: a sub-block pair sharing 32 code bytes; Q6_K:
+// two 32-weight groups), lane l taking weights l and 32 + l, so every load and store of the warp
+// covers one contiguous run (a thread per group scattered each store over 32 cache lines).
 template <class D>
 __device__ void kq_dequant(const u8* data, typename D::T* out, int n, int k, int kind) {
-    long groups = (long)n * (k / 32);
+    long units = (long)n * (k / 64);
     long row_bytes = (long)(k / 256) * (kind ? Q6K_BLOCK : Q4K_BLOCK);
-    for (long g = (long)blockIdx.x * blockDim.x + threadIdx.x; g < groups; g += (long)gridDim.x * blockDim.x) {
-        long row = g / (k / 32);
-        int s = (int)(g % (k / 32)), blk = s >> 3, j = s & 7;
-        long o = row * k + (long)s * 32;
+    long warps = (long)gridDim.x * (blockDim.x / 32);
+    int lane = threadIdx.x % 32;
+    for (long u = (long)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32; u < units; u += warps) {
+        long row = u / (k / 64);
+        int s = (int)(u % (k / 64)), blk = s >> 2, pair = s & 3;
+        long o = row * k + (long)s * 64 + lane;
         if (kind == 0) {
             const u8* b = data + row * row_bytes + (long)blk * Q4K_BLOCK;
-            float sc, mn;
-            q4k_scale_min(j, b + 4, kq_half(b), kq_half(b + 2), &sc, &mn);
-            const u8* q = b + 16 + 32 * (j >> 1);
-            int shift = (j & 1) * 4;
-            for (int l = 0; l < 32; ++l) D::store(out, o + l, sc * (float)((q[l] >> shift) & 15) - mn);
+            float d = kq_half(b), dmin = kq_half(b + 2), s1, m1, s2, m2;
+            q4k_scale_min(2 * pair, b + 4, d, dmin, &s1, &m1);
+            q4k_scale_min(2 * pair + 1, b + 4, d, dmin, &s2, &m2);
+            u8 c = b[16 + 32 * pair + lane];
+            D::store(out, o, s1 * (float)(c & 15) - m1);
+            D::store(out, o + 32, s2 * (float)(c >> 4) - m2);
         } else {
             const u8* b = data + row * row_bytes + (long)blk * Q6K_BLOCK;
             float d = kq_half(b + 208);
-            for (int l = 0; l < 32; ++l) D::store(out, o + l, q6k_weight(b, j, l, d));
+            D::store(out, o, q6k_weight(b, 2 * pair, lane, d));
+            D::store(out, o + 32, q6k_weight(b, 2 * pair + 1, lane, d));
         }
     }
 }

@@ -641,13 +641,50 @@ fn check_moe_kernels(d: &Device, dtype: DType, fmt: u8) -> candle_core::Result<(
 /// ragged tiles, two sequences in one launch).
 #[cfg(feature = "cuda")]
 fn check_flash_prefill(d: &Device, dtype: DType) -> candle_core::Result<()> {
+    check_flash_prefill_geometry(d, dtype, 128, false)?;
+    let tc = matches!(d, Device::Cuda(c) if crate::kernels::cuda::prefill_on_tensor_cores(c, dtype, 256));
+    if dtype != DType::F32 && tc {
+        // head dim 256 and the int8 KV pool (tensor-core kernels only)
+        check_flash_prefill_geometry(d, dtype, 256, false)?;
+        check_flash_prefill_geometry(d, dtype, 256, true)?;
+        check_flash_prefill_geometry(d, dtype, 128, true)?;
+    }
+    Ok(())
+}
+
+/// An int8 KV pool holding `x [rows, kvh * hd]` (codes and an inline f32 scale per vector), and
+/// the values it decodes to.
+#[cfg(feature = "cuda")]
+fn q8_pool(x: &Tensor, kvh: usize, hd: usize) -> candle_core::Result<(Tensor, Tensor)> {
+    let rows = x.dim(0)?;
+    let vals = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let (mut bytes, mut deq) = (Vec::with_capacity(rows * kvh * (hd + 4)), Vec::with_capacity(vals.len()));
+    for vec in vals.chunks(hd) {
+        let scale = vec.iter().fold(0f32, |m, v| m.max(v.abs())) / 127.0;
+        for v in vec {
+            let c = if scale > 0.0 { (v / scale).round().clamp(-127.0, 127.0) } else { 0.0 };
+            bytes.push(c as i8 as u8);
+            deq.push(c * scale);
+        }
+        bytes.extend_from_slice(&scale.to_le_bytes());
+    }
+    Ok((
+        Tensor::from_vec(bytes, (rows, kvh * (hd + 4)), x.device())?,
+        Tensor::from_vec(deq, (rows, kvh * hd), x.device())?,
+    ))
+}
+
+#[cfg(feature = "cuda")]
+fn check_flash_prefill_geometry(d: &Device, dtype: DType, hd: usize, q8: bool) -> candle_core::Result<()> {
     let cpu = Device::Cpu;
-    let (h, kvh, hd, pool) = (8usize, 2usize, 128usize, 200usize);
+    let (h, kvh, pool) = (8usize, 2usize, 200usize);
     let seqs = [(5usize, 37usize), (0, 20)]; // (cached prefix, new queries)
     let t: usize = seqs.iter().map(|s| s.1).sum();
     let q = Tensor::randn(0f32, 1.0, (t, h, hd), &cpu)?.to_dtype(dtype)?;
     let k = Tensor::randn(0f32, 1.0, (pool, kvh * hd), &cpu)?.to_dtype(dtype)?;
     let v = Tensor::randn(0f32, 1.0, (pool, kvh * hd), &cpu)?.to_dtype(dtype)?;
+    // (what the kernel reads, what it stands for)
+    let ((k_dev, k), (v_dev, v)) = if q8 { (q8_pool(&k, kvh, hd)?, q8_pool(&v, kvh, hd)?) } else { ((k.clone(), k), (v.clone(), v)) };
     let (mut slots, mut seqinfo, mut tiles) = (Vec::new(), Vec::new(), Vec::new());
     let mut q_start = 0u32;
     for (i, &(pre, n)) in seqs.iter().enumerate() {
@@ -662,8 +699,8 @@ fn check_flash_prefill(d: &Device, dtype: DType) -> candle_core::Result<()> {
     let scale = 1.0 / (hd as f32).sqrt();
     let got = crate::kernels::cuda::flash_prefill(
         &q.to_device(d)?,
-        &k.to_device(d)?,
-        &v.to_device(d)?,
+        &k_dev.to_device(d)?,
+        &v_dev.to_device(d)?,
         &Tensor::new(&slots[..], d)?,
         &Tensor::new(&seqinfo[..], d)?,
         &Tensor::new(&tiles[..], d)?,
@@ -706,7 +743,7 @@ fn check_flash_prefill(d: &Device, dtype: DType) -> candle_core::Result<()> {
     }
     let tol = if dtype == DType::F32 { 1e-4 } else { 3e-2 };
     if worst > tol {
-        candle_core::bail!("mismatch vs cpu: max abs err {worst:.2e}");
+        candle_core::bail!("mismatch vs cpu (head dim {hd}, int8 kv {q8}): max abs err {worst:.2e}");
     }
     Ok(())
 }

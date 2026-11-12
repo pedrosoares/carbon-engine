@@ -2428,7 +2428,7 @@ fn attn_tc_ptx() -> CResult<&'static str> {
 
 /// Whether prefill attention on `dev` runs on tensor cores for this dtype / head dim:
 /// bf16 or f16, head dim 64 / 128 / 256, compute capability 8.0+, `CARBON_ATTN_TC` not `0`.
-fn prefill_on_tensor_cores(dev: &candle_core::CudaDevice, dtype: DType, d: usize) -> bool {
+pub(crate) fn prefill_on_tensor_cores(dev: &candle_core::CudaDevice, dtype: DType, d: usize) -> bool {
     static ENV: OnceLock<bool> = OnceLock::new();
     let on = *ENV.get_or_init(|| std::env::var("CARBON_ATTN_TC").map_or(true, |v| v != "0"));
     on && matches!(dtype, DType::BF16 | DType::F16)
@@ -2503,7 +2503,7 @@ impl CustomOp3 for FlashPrefill<'_> {
                 attn_tc_ptx()?,
             )?;
             // one block per (tile, head, slice of up to 128 output dims); see `group` below
-            (f, n_tiles * h * d.div_ceil(128))
+            (f, n_tiles * h)
         } else {
             let f = dev.get_or_load_custom_func(
                 &format!("flash_prefill_{}", suffix(dtype)?),
