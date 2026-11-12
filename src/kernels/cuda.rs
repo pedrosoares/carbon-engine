@@ -877,6 +877,38 @@ struct PagedDecode {
     scale: f32,
     /// The chunked kernel's partials (`attn_scratch`), when that kernel runs.
     scratch: Option<Tensor>,
+    /// Multi-token steps: the rows' chain links (`DeviceBatch::chain`).
+    links: Option<Tensor>,
+    /// Most rows one sequence has in this step (1 without links).
+    max_rows: usize,
+}
+
+/// Multi-token steps give every row of a sequence the same slot table (an (offset, end) pair per
+/// row) instead of a copy each: copies make the tables rows x context long, which stops fitting
+/// captured CUDA graphs and costs the host a pass over them every step. Needs the tensor-core
+/// decode kernels (`CARBON_ATTN_SHARED_TABLES=0`: a copy per row).
+pub fn paged_shared_tables() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    SHARED_TABLES.load(std::sync::atomic::Ordering::Relaxed)
+        && *ON.get_or_init(|| {
+            !std::env::var("CARBON_ATTN_SHARED_TABLES").is_ok_and(|v| v == "0") && attn_tc_ptx().is_ok()
+        })
+}
+
+static SHARED_TABLES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The engine allows shared slot tables for models whose attention only goes through the
+/// paged decode kernels (QSA's selection kernel reads cumulative per-row tables).
+pub fn allow_paged_shared_tables(on: bool) {
+    SHARED_TABLES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Pool size (slots) from which a multi-token step's rows share one pass over K and V
+/// (`paged_decode_tc_rows`). Its blocks walk 16 tiles in a row, 4x the per-row kernel's latency,
+/// which only pays once reading K and V dominates. `CARBON_ATTN_ROWS_MIN` overrides.
+fn attn_rows_min() -> usize {
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("CARBON_ATTN_ROWS_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(65536))
 }
 
 /// f32 scratch of at least `len` elements on `dev`, shared by every decode-attention call that
@@ -966,19 +998,52 @@ impl CustomOp3 for PagedDecode {
         let (ta, tb) = u32_range(&self.starts)?;
         let slots = cuda_of(&sg)?.as_cuda_slice::<u32>()?.slice(sa..sb);
         let starts = cuda_of(&tg)?.as_cuda_slice::<u32>()?.slice(ta..tb);
-        if tb - ta != b + 1 {
+        // B + 1 cumulative offsets, or an (offset, end) pair per row (multi-token steps whose rows
+        // share their sequence's table; tensor-core kernels only)
+        let pairs = b >= 2 && tb - ta == 2 * b;
+        if tb - ta != b + 1 && !pairs {
             candle_core::bail!(
                 "paged decode: starts has {} entries for {b} sequences",
                 tb - ta
             );
         }
         let (h32, kvh32, d32) = (h as i32, kvh as i32, d as i32);
+        let pairs32 = i32::from(pairs);
+        if pairs && !paged_decode_tc_supported(h, kvh, d, dtype) {
+            candle_core::bail!("paged decode: shared slot tables need the tensor-core kernel");
+        }
         if paged_decode_tc_supported(h, kvh, d, dtype) {
             // chunked tensor-core path: launch shapes depend on the pool size alone (graph safe)
             let pool_slots = kl.shape().dims2()?.0;
+            let g_heads = h / kvh;
             let ncw = pool_slots.div_ceil(PD_WP).max(1);
+            // large pools: the row-shared kernel for every step, single-row ones included (each
+            // row its own group), so a verify step reproduces single-token steps bit for bit
+            let rows_kernel = pool_slots >= attn_rows_min() && g_heads * MAX_GEMV_ROWS <= 48;
+            let own_links;
+            let links = if !rows_kernel {
+                None
+            } else {
+                Some(match &self.links {
+                    Some(l) => Side::new(l, "links")?,
+                    None => {
+                        own_links = Tensor::zeros(b, DType::U32, &candle_core::Device::Cuda(dev.clone()))?;
+                        Side::new(&own_links, "links")?
+                    }
+                })
+            };
+            if let Some(l) = &links {
+                if l.len() != b {
+                    candle_core::bail!("paged decode: {} links for {b} rows", l.len());
+                }
+            }
             let f_tc = dev.get_or_load_custom_func(
-                &format!("paged_decode_tc_{}{}", if q8 { "q8_" } else { "" }, suffix(dtype)?),
+                &format!(
+                    "paged_decode_tc_{}{}{}",
+                    if links.is_some() { "rows_" } else { "" },
+                    if q8 { "q8_" } else { "" },
+                    suffix(dtype)?
+                ),
                 "carbon_attn_tc",
                 attn_tc_ptx()?,
             )?;
@@ -1012,15 +1077,30 @@ impl CustomOp3 for PagedDecode {
                     }
                     bld.arg(&slots);
                     bld.arg(&starts);
+                    let lv;
+                    if let Some(l) = &links {
+                        lv = l.view::<u32>()?;
+                        bld.arg(&lv);
+                    }
                     bld.arg(&part);
                     bld.arg(&h32);
                     bld.arg(&kvh32);
                     bld.arg(&d32);
                     bld.arg(&self.scale);
                     bld.arg(&ncw32);
+                    bld.arg(&pairs32);
                     let cfg = LaunchConfig {
                         grid_dim: ((b * kvh * ncw) as u32, 1, 1),
-                        block_dim: (128, 1, 1),
+                        // the row-shared kernel: one warp per 8 (row, head) columns
+                        block_dim: (
+                            if links.is_some() {
+                                32 * (self.max_rows.clamp(1, MAX_GEMV_ROWS) * g_heads).div_ceil(8) as u32
+                            } else {
+                                128
+                            },
+                            1,
+                            1,
+                        ),
                         shared_mem_bytes: 0,
                     };
                     unsafe { bld.launch(cfg) }.w()?;
@@ -1032,6 +1112,7 @@ impl CustomOp3 for PagedDecode {
                     bld.arg(&kvh32);
                     bld.arg(&d32);
                     bld.arg(&ncw32);
+                    bld.arg(&pairs32);
                     let cfg = LaunchConfig {
                         grid_dim: ((b * h) as u32, 1, 1),
                         block_dim: (d as u32, 1, 1),
@@ -1113,6 +1194,7 @@ pub fn paged_decode_supported(heads: usize, kv_heads: usize, head_dim: usize) ->
 
 /// One decode step of attention for `B` sequences: `q [B, H, D]`, pools `[S, KVH*D]`,
 /// `slots`/`starts` u32 on the same device. Returns `[B, H, D]` in q's dtype.
+#[allow(clippy::too_many_arguments)]
 pub fn paged_decode(
     q: &Tensor,
     k_pool: &Tensor,
@@ -1121,6 +1203,8 @@ pub fn paged_decode(
     starts: &Tensor,
     kv_heads: usize,
     scale: f32,
+    links: Option<&Tensor>,
+    max_rows: usize,
 ) -> CResult<Tensor> {
     let (b, h, d) = q.dims3()?;
     let scratch = if paged_decode_tc_supported(h, kv_heads, d, q.dtype()) {
@@ -1139,6 +1223,8 @@ pub fn paged_decode(
             kv_heads,
             scale,
             scratch,
+            links: links.map(|l| l.contiguous()).transpose()?,
+            max_rows: if links.is_some() { max_rows } else { 1 },
         },
     )
 }

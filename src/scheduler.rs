@@ -301,6 +301,10 @@ struct Req {
     /// Radix node locked by this request and the number of leading slots owned by the tree.
     node: NodeId,
     tree_owned: usize,
+    /// Slots below `tree_owned` that are still this request's: it computed their KV itself
+    /// while the tree already held those tokens in other slots (`cache_prompt`). Its slot
+    /// table keeps using them, and they are freed when it ends.
+    dup_slots: Vec<u32>,
     cache_hit: usize,
     max_new: usize,
     params: SamplingParams,
@@ -668,6 +672,7 @@ impl Scheduler {
             tokens: sub.prompt,
             prompt_len,
             tree_owned: matched.len(),
+            dup_slots: vec![],
             cache_hit: matched.len(),
             slots: matched,
             node,
@@ -945,6 +950,7 @@ impl Scheduler {
                     let r = self.running.swap_remove(i);
                     let _ = r.tx.send(Event::Error(msg.clone()));
                     self.alloc.free(&r.slots[r.tree_owned..]);
+                    self.alloc.free(&r.dup_slots);
                     self.radix.unlock(r.node);
                     if self.hybrid {
                         self.free_states.push(r.state_slot);
@@ -1408,6 +1414,7 @@ impl Scheduler {
                     let _ = r.tx.send(Event::Error(msg.clone()));
                     // KV contents of a failed forward are not trusted: free without caching
                     self.alloc.free(&r.slots[r.tree_owned..]);
+                    self.alloc.free(&r.dup_slots);
                     if let Some(s) = r.mtp_next_slot {
                         self.alloc.free(&[s]);
                     }
@@ -1431,13 +1438,19 @@ impl Scheduler {
         let r = &self.running[i];
         let key = &r.tokens[..r.slots.len()];
         let (_, existing) = self.radix.match_prefix(key);
-        if existing.len() != r.tree_owned {
+        if existing.len() < r.tree_owned {
             return;
         }
+        // The tree may hold more of these tokens than the request reused: a hybrid model resumes
+        // only at a snapshot, so a prompt that shares a few leading tokens (the chat template's
+        // header) with an earlier one recomputed them. The tree keeps its slots for that part and
+        // takes the request's from there on; the request keeps reading its own copies.
+        let dup = r.slots[r.tree_owned..existing.len().min(r.slots.len())].to_vec();
         self.radix.insert(key, &r.slots);
         let (node, _) = self.radix.match_prefix(key);
         self.radix.lock(node);
         let r = &mut self.running[i];
+        r.dup_slots.extend(dup);
         let old = std::mem::replace(&mut r.node, node);
         r.tree_owned = r.slots.len();
         let live = r.state_slot;
@@ -1504,6 +1517,7 @@ impl Scheduler {
         if let Some(s) = r.mtp_next_slot {
             self.alloc.free(&[s]);
         }
+        self.alloc.free(&r.dup_slots);
         if self.prefix_cache {
             let n = r.slots.len();
             let cached = self.radix.insert(&r.tokens[..n], &r.slots);

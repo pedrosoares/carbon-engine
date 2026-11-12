@@ -786,6 +786,8 @@ fn check_paged_decode_with(
         &Tensor::new(&starts[..], d)?,
         kvh,
         scale,
+        None,
+        1,
     )?
     .to_device(&cpu)?
     .to_dtype(DType::F32)?;

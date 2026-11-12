@@ -189,6 +189,16 @@ impl Engine {
             && ec.rpc_workers.is_empty()
             && ec.devices[0].starts_with("cuda");
         crate::kvcache::set_kv_q8(ec.kv_q8);
+        #[cfg(feature = "cuda")]
+        crate::kernels::cuda::allow_paged_shared_tables(
+            // only the tensor-core decode kernels read shared tables (and QSA's selection kernel
+            // reads per-row ones): head dims they take, at most 8 query heads per KV head
+            cfg.qwen38.is_none()
+                && cfg.head_dim.is_multiple_of(64)
+                && cfg.head_dim <= 256
+                && cfg.num_kv_heads > 0
+                && cfg.num_heads / cfg.num_kv_heads <= 8,
+        );
         // verify steps carry several tokens: the K-quant kernels pick their multi-token GEMM
         #[cfg(feature = "cuda")]
         crate::kernels::cuda::kquant_expect_multi_token(ec.mtp_speculate && speculation_supported);

@@ -108,29 +108,33 @@ code / math / json). RTX 5090, LM Studio runtime llama.cpp 2.71.
 | carbon, `--mtp --mtp-drafts 5 --mtp-min-prob 0.75` | 91.4 | 145.5 | 149.4 | 174.2 | 140.1 |
 | carbon, `--mtp --mtp-drafts 7 --mtp-min-prob 0.5` | 92.5 | 147.1 | 148.8 | 179.8 | 142.0 |
 
-At depth (decode tok/s; carbon with `--kv-dtype q8 --mtp --mtp-drafts 5 --mtp-min-prob 0.75
---max-running-requests 2 --state-snapshots 4`, which holds the full 262,144-token window in
-28 GiB; story / json where only two prompts were run):
+At depth (decode tok/s, story / json; carbon with `--kv-dtype q8 --mtp --mtp-drafts 5
+--mtp-min-prob 0.75 --max-running-requests 2 --state-snapshots 4`, which holds the full
+262,144-token window in 28-29.5 GiB):
 
-| engine | 32k (4 prompts) | 91k | 129k | 253k |
+| engine | short (4 prompts, mean) | 32k (mean) | 128k | 250k |
 |---|---|---|---|---|
-| LM Studio, MTP | 104.7 | 86.7 | does not fit | does not fit |
-| LM Studio, no MTP | | | 37.0 | 24.5 |
-| carbon, q8 KV + MTP | 116.1 | | 53.6 / 83.8 | 40.2 / 56.2 |
+| LM Studio, MTP | 124.9 | 104.7 | does not fit | does not fit |
+| LM Studio, no MTP | 72.8 | | 37.0 / 37.0 | 24.6 / 24.5 |
+| carbon, first int8 KV build | 139.0 | 116.1 | 53.6 / 83.8 | 40.2 / 56.2 |
+| carbon, row-shared attention + shared slot tables | 132.4 | 115.6 | 58.5 / 109.2 | 44.0 / 80.1 |
 
-Time to first token, cold (seconds):
+Time to first token (seconds):
 
-| engine | 32k | 129k | 253k |
-|---|---|---|---|
-| LM Studio | 11.3 | 72 | 148 |
-| carbon | 24 | 293 | 1041 |
+| engine | 32k cold | 128k cold | 250k cold | same prefix again |
+|---|---|---|---|---|
+| LM Studio | 11.3 | 72 | 148 | 0.9 - 3.4 |
+| carbon, first int8 KV build | 24 | 293 | 1041 | (re-prefilled) |
+| carbon, now | 21 | 183 - 201 | not measured cold (481 s on top of a cached 128k prefix) | 3.1 (32k), 7.0 (128k), 14.4 (250k) |
 
-With MTP carbon is ahead of LM Studio on the mean at short context (+12%; story +4%, code
-+28%, math +27%, JSON -4% with 5 drafts, level with 7), at 32k (+11%), and about 2x at 129k
-and 253k, where LM Studio has to turn MTP off. Without MTP carbon is 9% behind. Decode still
-slows with depth (140 -> 116 -> 69 -> 48), and cold prefill is the weak point: 2x slower at 32k
-and 7x slower at 253k. A second request sharing a long prefix resumes from the last prefill
-chunk boundary inside it (32k: 3.8 s instead of 24 s).
+With MTP carbon is ahead of LM Studio at short context (+12% on the mean; story +4%, code +28%,
+math +27%, JSON -4% with 5 drafts, level with 7), at 32k (+10%), and 2.3x / 2.5x at 128k / 250k,
+where LM Studio has to turn MTP off. Without MTP carbon is 9% behind. Decode still slows with
+depth (132 -> 116 -> 84 -> 62 on the means): at 128k a verify step is 34 ms against 18 ms at
+short context, the difference being attention (the kernel is bound by its own arithmetic, about
+1 ms per 13k tokens of context per step) and about 2 ms of host work per step that grows with
+the context (slot tables rebuilt and uploaded every step). Cold prefill is 2-3x slower than
+LM Studio's.
 
 ### Phase 3: decode speed (in progress)
 
@@ -207,6 +211,23 @@ chunk boundary inside it (32k: 3.8 s instead of 24 s).
   dims), each staging the same K / V rows itself: 12 blocks per KV head re-read and convert
   the prefix, and the scores are computed twice for head dim 256.
 
+### Phase 5 update 2: row-shared decode attention, shared slot tables, prefix cache
+
+- `paged_decode_tc_rows`: on pools of 65,536 slots or more, a block takes all token rows of a
+  sequence and a 256-position chunk, stages each K / V tile once and scores 8 (row, head)
+  columns per warp (blocks are sized to the step's rows). Used for single-row steps too, so
+  verify steps stay bit-identical to single-token steps.
+- Multi-token steps give the rows of a sequence one slot table with an (offset, end) pair per
+  row. A copy per row made the tables rows x context long: they stopped fitting captured CUDA
+  graphs beyond about 45k tokens (verify steps ran eagerly) and cost the host a pass each step.
+  Off for Qwen3.8-Flash-Next, whose QSA selection kernel reads the old layout.
+- Prefill attention: two heads that share a KV head go in one block and share its staged tiles
+  (32k cold: 24 s -> 20.5 s; three per block exceeds the register budget at head dim 256).
+- Prefix cache: a prompt whose first tokens were already in the tree without a snapshot (every
+  chat shares the template header) was never cached while running, only when it finished, so
+  neither the prompt-end snapshot nor the chunk snapshots existed. `cache_prompt` now lets the
+  tree keep its slots for that head and tracks the request's duplicates until it ends.
+
 ### Phase 5: context depth (first round)
 
 - `paged_decode_tc` (`kernels/attention_tc.cu`) replaces the per-head decode kernel on sm_80+:
@@ -237,10 +258,11 @@ chunk boundary inside it (32k: 3.8 s instead of 24 s).
 
 ## Next steps, in order
 
-1. Prefill at depth: a prefill attention kernel that stages K / V once per KV head for its six
-   query heads and scores once; then dequant passes, GDN recurrence and element-wise ops.
-2. Decode at depth: multi-token steps read K / V once per token row; int8 MMA instead of
-   converting to half precision.
+1. Prefill: the linear part alone (16 s per 32k) is slower than LM Studio's whole prefill
+   (dequant passes, GDN recurrence, element-wise ops next to cuBLAS), and prefill attention
+   still scores twice at head dim 256 and stages per two heads.
+2. Decode at depth: int8 MMA in the attention kernels instead of converting to half precision;
+   device-side slot tables kept across steps (append-only) instead of rebuilt per step.
 3. Int8 KV quality check against bf16 KV (logit-level), and `--kv-dtype auto`.
 4. KV / state auto-sizing: room for prefill temporaries, single-user defaults for long windows.
 5. Plain decode (66 vs 73): fuse norm + prep and SiLU * up into kernel epilogues.

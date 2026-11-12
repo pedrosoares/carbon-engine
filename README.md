@@ -39,7 +39,7 @@ few runtime choices.
 | MoE placement | resident, offload (global LRU expert cache), CPU, hybrid CPU-GPU split, picked from a bandwidth benchmark | the same four strategies, picked from `carbon bench bw` |
 | Offloaded experts | expert cache on the GPU fed from pinned host memory, CUDA-graph compatible | a device slot cache fed from pinned host memory by a GPU kernel at PCIe speed, routing and caching on the GPU, CUDA-graph compatible |
 | Elastic memory | VRAM moved between KV and experts at runtime | `POST /v1/cache/rebuild`, `carbon ctl cache --kv N --moe N` |
-| Quantized weights | FP8, NVFP4, MXFP4, GGUF Q4_0, BF16 | FP8 (block and per-tensor), NVFP4 (ModelOpt and compressed-tensors), BF16/F16/F32 |
+| Quantized weights | FP8, NVFP4, MXFP4, GGUF Q4_0, BF16 | FP8 (block and per-tensor), NVFP4 (ModelOpt and compressed-tensors), GGUF Q4_K / Q6_K (dense Qwen3.5-family), BF16/F16/F32 |
 | Hybrid attention models | Gated DeltaNet (Qwen3.5/3.6/3.8) | Gated DeltaNet (Qwen3.5/3.6/3.8), fused decode and prefill kernels |
 | CUDA graphs | decode steps | decode steps, including offloaded experts and multi-token (MTP verify) steps |
 | CLI | `ft serve / ctl / bench` | `carbon serve / generate / ctl / bench bw / devices / worker / launch / shell` |
@@ -59,8 +59,9 @@ few runtime choices.
 | Distribution | Python package, desktop app | one Rust binary |
 | Implementation | Python, Triton and CUDA on PyTorch | Rust on [candle](https://github.com/huggingface/candle), with its own CUDA kernels |
 
-Not supported yet (see [Roadmap](#roadmap)): MXFP4 and GGUF weights, sliding-window and MLA
-attention (DeepSeek, GLM, gpt-oss, Gemma), video input.
+Not supported yet (see [Roadmap](#roadmap)): MXFP4 weights, GGUF files of other architectures
+or quantizations than the ones below, sliding-window and MLA attention (DeepSeek, GLM, gpt-oss,
+Gemma), video input.
 
 ## Running Qwen3.6-35B-A3B-FP8
 
@@ -207,6 +208,63 @@ sampling):
 
 `ctl bench --prompt-tokens 64 --max-tokens 256` (output tok/s, plain / `--mtp`): one request
 47.4 / 55.3, two 59.5 / 74.9, four 81.3 / 74.1.
+
+## Running Qwen3.8-27B from a GGUF file (Q4_K_M)
+
+```bash
+# speculative decoding with the file's MTP head
+carbon serve --model ~/models/Qwen3.8-27B-Q4_K_M.gguf --devices cuda:0 --cuda-graphs \
+  --mtp --mtp-drafts 5 --mtp-min-prob 0.75
+
+# the full 262,144-token window on a 32 GB card: int8 KV, recurrent-state pools for one user
+carbon serve --model ~/models/Qwen3.8-27B-Q4_K_M.gguf --devices cuda:0 --cuda-graphs \
+  --mtp --mtp-drafts 5 --mtp-min-prob 0.75 --kv-dtype q8 \
+  --max-running-requests 2 --state-snapshots 4
+```
+
+`--model` takes a `.gguf` file (or a directory holding one): the config, the tokenizer and the
+chat template come from its metadata (`src/gguf.rs`). Supported: architecture `qwen35` (dense
+Qwen3.5 / 3.6 / 3.8: 48 Gated DeltaNet + 16 full-attention layers at 27B), tensors stored F32 /
+F16 / BF16 / Q4_K / Q6_K, on one local GPU (no tensor parallelism: the file stores the linear
+layers' value heads in a tiled order). The `mmproj` image tower is not loaded yet.
+
+- **Weights stay packed** (15.6 GiB). A decode step quantizes each projection's input to 8 bits
+  per 32 values and multiplies it with the 4- / 6-bit codes in integer arithmetic: a dp4a kernel
+  for single tokens, an integer tensor-core GEMM for the multi-token steps of speculative
+  decoding, where 8 tokens cost about 1.2x one. Projections that share an input run in one
+  launch. Prefill dequantizes a layer's weights per chunk and uses cuBLAS.
+- **MTP** (`--mtp`): the head (`blk.64` + `nextn.*`) drafts up to `--mtp-drafts` tokens, going
+  on while its last draft has probability `--mtp-min-prob`; the next step verifies them all.
+  With `--mtp` every K-quant weight uses the tensor-core kernel for every step, so the output is
+  the same as without drafts on those kernels (checked token for token on 400-token greedy
+  runs). Without `--mtp` the dp4a kernel is used (about 10% faster for single tokens), and its
+  rounding differs in the last bits.
+- **Decode attention** is chunked (256 positions per block) and reads K and V once per KV head
+  for its six query heads; on pools of 65,536 slots or more a verify step's rows also share one
+  pass (`CARBON_ATTN_ROWS_MIN`).
+- **`--kv-dtype q8`** keeps each key / value vector as 256 int8 values and an f32 scale: half
+  the memory and attention traffic of bf16. It is lossy (the text of a greedy run drifts from
+  the bf16 run after a few sentences) and has not been evaluated for quality beyond that.
+- **Prefix reuse**: recurrent state is snapshotted at every prefill chunk boundary, so a prompt
+  that shares a long beginning with an earlier one resumes from the last boundary inside it.
+
+Measured on an RTX 5090 against LM Studio (llama.cpp runtime 2.71) on the same file, 400-token
+greedy answers with thinking off (`scripts/bench_openai.py`; `PLAN.md` has the full tables):
+
+| decode tok/s | story | code | math | json |
+|---|---|---|---|---|
+| LM Studio, MTP on, short context | 87.5 | 113.6 | 117.8 | 180.6 |
+| carbon `--mtp --mtp-drafts 5 --mtp-min-prob 0.75`, short context | 91.4 | 145.5 | 149.4 | 174.2 |
+| LM Studio without MTP / carbon without `--mtp` | 73 / 66 | | | |
+
+| decode tok/s at depth (story / json) | 32k | 128k | 250k |
+|---|---|---|---|
+| LM Studio (MTP on to about 100k; it cannot load more with MTP) | 78 / 154 | 37 / 37 (no MTP) | 25 / 25 (no MTP) |
+| carbon, full-window configuration above | 76 / 147 | 59 / 109 | 44 / 80 |
+
+Cold prefill is slower than LM Studio's: 21 s for 32k tokens (LM Studio 11 s) and about 200 s
+for 128k (72 s). A later prompt that shares the beginning starts in 3 s at 32k, 7 s at 128k and
+14 s at 250k.
 
 ## Architecture
 
@@ -522,7 +580,7 @@ hardware yet, so treat it as unvalidated until you run the suite on your GPUs.
 ## Roadmap
 
 - Image input for Qwen3-VL; video input
-- MXFP4 and GGUF Q4 weights
+- MXFP4 weights; GGUF for more architectures and K-quants, and its `mmproj` image tower
 - Prefill: fuse Qwen3.8's hyper-connection elementwise ops (~0.6 s of a 4096-token chunk)
 - MTP speculative decoding across several local GPUs
 - Micro-batched pipeline execution (overlap stages for different sequences)

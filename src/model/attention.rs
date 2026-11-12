@@ -365,18 +365,38 @@ impl DeviceBatch {
             && fused_decode_enabled()
             && meta.seqs.iter().all(|s| s.q_len <= MULTI_DECODE_MAX);
         let paged = if device.is_cuda() && fused_decode_enabled() && (all_decode || multi) {
-            let mut slots = Vec::with_capacity(meta.seqs.iter().map(|s| s.kv_len * s.q_len).sum());
-            let mut starts = Vec::with_capacity(t + 1);
-            starts.push(0u32);
-            for s in &meta.seqs {
-                for j in 0..s.q_len {
-                    slots.extend_from_slice(&s.slots[..s.kv_len - s.q_len + j + 1]);
-                    starts.push(slots.len() as u32);
+            #[cfg(feature = "cuda")]
+            let shared = multi
+                && crate::kernels::cuda::paged_shared_tables()
+                // half-precision activations: the tensor-core kernels' dtypes
+                && matches!(rotary.tables().0.dtype(), DType::BF16 | DType::F16);
+            #[cfg(not(feature = "cuda"))]
+            let shared = false;
+            let mut slots = Vec::new();
+            let mut starts = Vec::with_capacity(2 * t);
+            if shared {
+                // one table per sequence; row j sees its first kv_len - q_len + j + 1 slots
+                for s in &meta.seqs {
+                    let off = slots.len() as u32;
+                    slots.extend_from_slice(&s.slots[..s.kv_len]);
+                    for j in 0..s.q_len {
+                        starts.push(off);
+                        starts.push(off + (s.kv_len - s.q_len + j + 1) as u32);
+                    }
+                }
+            } else {
+                starts.push(0u32);
+                for s in &meta.seqs {
+                    for j in 0..s.q_len {
+                        slots.extend_from_slice(&s.slots[..s.kv_len - s.q_len + j + 1]);
+                        starts.push(slots.len() as u32);
+                    }
                 }
             }
+            let n_starts = starts.len();
             Some(PagedCtx {
                 slots: Tensor::from_vec(slots.clone(), slots.len(), device)?,
-                starts: Tensor::from_vec(starts, t + 1, device)?,
+                starts: Tensor::from_vec(starts, n_starts, device)?,
             })
         } else {
             None
@@ -901,7 +921,7 @@ impl Attention {
             return None;
         }
         match ix.select_device(qi, b, pool)? {
-            Ok(pc) => self.decode_fused(q, &pc, kv),
+            Ok(pc) => self.decode_fused(q, &pc, kv, None),
             Err(e) => {
                 disable_fused_decode(&e);
                 None
@@ -917,7 +937,12 @@ impl Attention {
     /// Every query over its whole causal history.
     fn attend_all(&self, q: &Tensor, b: &DeviceBatch, kv: &LayerKv) -> Result<Tensor> {
         let fused = match (&b.paged, &b.prefill) {
-            (Some(pc), _) => self.decode_fused(q, pc, kv),
+            (Some(pc), _) => self.decode_fused(
+                q,
+                pc,
+                kv,
+                b.chain.as_ref().map(|c| (&c.1, b.seqs.iter().map(|s| s.q_len).max().unwrap_or(1))),
+            ),
             (None, Some(pf)) => self.prefill_fused(q, pf, kv),
             (None, None) => None,
         };
@@ -957,7 +982,7 @@ impl Attention {
                 slots: Tensor::from_vec(slots, n, device)?,
                 starts: Tensor::from_vec(starts, b.seqs.len() + 1, device)?,
             };
-            if let Some(o) = self.decode_fused(q, &pc, kv) {
+            if let Some(o) = self.decode_fused(q, &pc, kv, None) {
                 return Ok(o);
             }
         }
@@ -1052,7 +1077,7 @@ impl Attention {
 
     /// carbon's fused paged-attention kernel; `None` when unavailable (the caller falls back).
     #[cfg(feature = "cuda")]
-    fn decode_fused(&self, q: &Tensor, pc: &PagedCtx, kv: &LayerKv) -> Option<Tensor> {
+    fn decode_fused(&self, q: &Tensor, pc: &PagedCtx, kv: &LayerKv, links: Option<(&Tensor, usize)>) -> Option<Tensor> {
         use crate::kernels::cuda;
         let (h, kvh, d) = (self.heads, self.kv_heads, self.head_dim);
         if !cuda::paged_decode_supported(h, kvh, d) {
@@ -1069,6 +1094,8 @@ impl Attention {
                 &pc.starts,
                 kvh,
                 self.scale as f32,
+                links.map(|l| l.0),
+                links.map_or(1, |l| l.1),
             )?;
             Ok(o.reshape((b, h * d))?)
         };
@@ -1119,7 +1146,7 @@ impl Attention {
     }
 
     #[cfg(not(feature = "cuda"))]
-    fn decode_fused(&self, _: &Tensor, _: &PagedCtx, _: &LayerKv) -> Option<Tensor> {
+    fn decode_fused(&self, _: &Tensor, _: &PagedCtx, _: &LayerKv, _: Option<(&Tensor, usize)>) -> Option<Tensor> {
         None
     }
 

@@ -822,6 +822,77 @@ mod tests {
         assert!(err < 1.5e-3, "max error {err}");
     }
 
+    /// A minimal GGUF v3 file: string / u32 / array metadata and two tensors.
+    fn write_gguf(path: &std::path::Path, q4k: &[u8], norm: &[f32]) {
+        fn s(out: &mut Vec<u8>, x: &str) {
+            out.extend((x.len() as u64).to_le_bytes());
+            out.extend(x.as_bytes());
+        }
+        let mut h = Vec::new();
+        h.extend(b"GGUF");
+        h.extend(3u32.to_le_bytes());
+        h.extend(2u64.to_le_bytes()); // tensors
+        h.extend(3u64.to_le_bytes()); // metadata entries
+        s(&mut h, "general.architecture");
+        h.extend(8u32.to_le_bytes());
+        s(&mut h, "qwen35");
+        s(&mut h, "qwen35.block_count");
+        h.extend(4u32.to_le_bytes());
+        h.extend(1u32.to_le_bytes());
+        s(&mut h, "tokenizer.ggml.tokens");
+        h.extend(9u32.to_le_bytes());
+        h.extend(8u32.to_le_bytes());
+        h.extend(2u64.to_le_bytes());
+        s(&mut h, "a");
+        s(&mut h, "b");
+        // dims are stored reversed: [2 rows, 256 cols] and [4]
+        s(&mut h, "blk.0.ffn_gate.weight");
+        h.extend(2u32.to_le_bytes());
+        h.extend(256u64.to_le_bytes());
+        h.extend(2u64.to_le_bytes());
+        h.extend(12u32.to_le_bytes());
+        h.extend(0u64.to_le_bytes());
+        s(&mut h, "blk.0.attn_norm.weight");
+        h.extend(1u32.to_le_bytes());
+        h.extend(4u64.to_le_bytes());
+        h.extend(0u32.to_le_bytes());
+        h.extend(288u64.to_le_bytes()); // after the 2 * 144 bytes above (already 32-aligned)
+        h.resize(h.len().div_ceil(32) * 32, 0);
+        h.extend(q4k);
+        h.resize(h.len().div_ceil(32) * 32, 0);
+        for x in norm {
+            h.extend(x.to_le_bytes());
+        }
+        std::fs::write(path, h).unwrap();
+    }
+
+    #[test]
+    fn reads_a_gguf_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.gguf");
+        let w = weights(2 * QK_K);
+        let q = quantize_q4k(&w);
+        write_gguf(&path, &q, &[1.5, 0.5, 1.0, 2.0]);
+        assert_eq!(find(dir.path()).as_deref(), Some(path.as_path()));
+
+        let src = GgufSource::open(&path).unwrap();
+        let name = "model.layers.0.mlp.gate_proj.weight";
+        assert!(src.contains(name) && src.is_kquant(name));
+        // packed blocks as stored, and the same values decoded
+        let packed = src.load_kquant(name).unwrap().unwrap();
+        assert_eq!((packed.rows, packed.cols, packed.kind), (2, 256, KKind::Q4K));
+        assert_eq!(packed.data.flatten_all().unwrap().to_vec1::<u8>().unwrap(), q);
+        let mut want = vec![0f32; w.len()];
+        dequant_q4k(&q, &mut want);
+        let got = src.load_raw(name).unwrap();
+        assert_eq!(got.dims(), &[2, 256]);
+        assert_eq!(got.flatten_all().unwrap().to_vec1::<f32>().unwrap(), want);
+        // norm weights come back as offsets from 1
+        let norm = src.load_raw("model.layers.0.input_layernorm.weight").unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(norm, vec![0.5, -0.5, 0.0, 1.0]);
+        assert!(src.load_kquant("model.layers.0.input_layernorm.weight").unwrap().is_none());
+    }
+
     #[test]
     fn maps_names() {
         assert_eq!(hf_name("blk.3.attn_q.weight", 64).unwrap(), "model.layers.3.self_attn.q_proj.weight");
