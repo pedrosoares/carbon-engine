@@ -264,10 +264,21 @@ Done, `--kv-dtype rotor4 | planar4 | iso4` (RotorQuant; `KvFormat::{Rotor4, Plan
   one scale per vector assumes coordinates of equal variance, which a dense rotation produces
   and a 2-4 dim block rotation does not. `turbo4` stays the recommended 4-bit format.
 
+Why the block rotations lose (`CARBON_KV_ROT_BLOCK` overrides the block side; same 250
+prefixes): no rotation at all 80.0%, the same as `rotor4`; blocks of 8 / 16 / 32 / 64 / 128:
+83.6 / 83.2 / 86.8 / 88.8 / 87.2%; dense 91.6%. Agreement follows how many coordinates a
+rotation mixes, and 2-4 dim blocks are within noise of not rotating. A per-block scale would
+need 85 scales per vector, so it is not a storage option.
+
+Where `turbo4` loses (`CARBON_KV_TQ_SIM=k|v|kv` puts keys and / or values through the
+TurboQuant round trip before a `q8` pool stores them): both 91.6% (equal to the real `turbo4`
+pool), keys only 94.0%, values only 93.2%, neither (`q8`) 97.2%. The loss is split about evenly,
+so neither a key-only fix (the QJL stage) nor 8-bit values alone gets back to `q8`: K at 4 bits
+with V at 8 would be 196 bytes per vector for about 94%.
+
 Planned, in order:
 
-1. Why the block rotations lose: agreement with no rotation at all (the floor) and with a
-   per-block scale, to see whether RotorQuant can be brought to `turbo4`'s level here.
+1. (done, see below)
 2. The paper's second stage (1-bit QJL of the residual, unbiased inner products for K).
 3. 3-bit variants (`turbo3` / `rotor3`), mixed formats per pool (e.g. K at 4 bits, V at 8).
 4. The two rotations per attention layer and step as part of existing launches.

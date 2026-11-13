@@ -228,6 +228,8 @@ pub fn block_rotation(d: usize, block: usize, seed: u64) -> Vec<f64> {
 /// vectors, `y.matmul(back)` rotates them back. One matrix per format and head dim for the
 /// whole engine.
 fn pool_rotation(block: usize, d: usize, dtype: DType, device: &Device) -> Result<(Tensor, Tensor)> {
+    // experiments: CARBON_KV_ROT_BLOCK overrides the block side (1 = no rotation, 0 = dense)
+    let block = std::env::var("CARBON_KV_ROT_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(block);
     let m = match block {
         0 => random_rotation(d, 0x7475_7262_6f34),
         b => block_rotation(d, b, 0x726f_746f_7234 + b as u64),
@@ -236,6 +238,26 @@ fn pool_rotation(block: usize, d: usize, dtype: DType, device: &Device) -> Resul
     let back = Tensor::from_vec(m, (d, d), &Device::Cpu)?; // rows are the rotation's rows
     let to = back.t()?.contiguous()?;
     Ok((to.to_dtype(dtype)?.to_device(device)?, back.to_dtype(dtype)?.to_device(device)?))
+}
+
+/// `x` `[T, kv_heads * d]` after TurboQuant's rotate / quantize / reconstruct / rotate back, in
+/// tensor ops (experiments only: what a `turbo4` pool would hand attention for these vectors).
+fn tq4_roundtrip(x: &Tensor, kv_heads: usize, to: &Tensor, back: &Tensor) -> Result<Tensor> {
+    let (t, width) = x.dims2()?;
+    let d = width / kv_heads;
+    let y = x.to_dtype(DType::F32)?.reshape((t * kv_heads, d))?.matmul(to)?;
+    let scale = y.sqr()?.mean_keepdim(1)?.sqrt()?;
+    let u = y.broadcast_div(&(&scale + 1e-30)?)?;
+    let a = u.abs()?;
+    let mut m = Tensor::zeros(a.shape(), DType::F32, a.device())?;
+    for b in TQ4_BOUNDS {
+        m = (m + a.gt(b)?.to_dtype(DType::F32)?)?;
+    }
+    let table = Tensor::new(&TQ4_CENTROIDS, a.device())?;
+    let c = table.index_select(&m.to_dtype(DType::U32)?.flatten_all()?, 0)?.reshape(a.shape())?;
+    let sign = (u.ge(0f32)?.to_dtype(DType::F32)? * 2.0)? - 1.0;
+    let r = (c * sign?)?.broadcast_mul(&(scale * TQ4_UNBIAS as f64)?)?;
+    Ok(r.matmul(back)?.reshape((t, width))?)
 }
 
 /// KV tensors for one layer on one device: `[num_slots, kv_heads * head_dim]` each in the
@@ -250,6 +272,9 @@ pub struct LayerKv {
     /// TurboQuant / RotorQuant: the rotation stored vectors went through, as (`to`, `back`) `[d, d]`
     /// matrices in the activation dtype. Queries take `to`, attention outputs `back`.
     pub rot: Option<(Tensor, Tensor)>,
+    /// Experiments (`CARBON_KV_TQ_SIM=k|v|kv` on a `q8` pool): the dense rotation in f32, for
+    /// putting keys and / or values through the TurboQuant quantizer before they are stored.
+    sim: Option<(Tensor, Tensor, bool, bool)>,
     /// Per-token indexer keys `[slots, index_dim]` (QSA sparse attention layers only).
     pub idx: Option<Tensor>,
 }
@@ -271,7 +296,15 @@ impl LayerKv {
             Some(block) => Some(pool_rotation(block, head_dim, dtype, device)?),
             None => None,
         };
+        let sim = match std::env::var("CARBON_KV_TQ_SIM") {
+            Ok(w) if fmt == KvFormat::Q8 => {
+                let (to, back) = pool_rotation(0, head_dim, DType::F32, device)?;
+                Some((to, back, w.contains('k'), w.contains('v')))
+            }
+            _ => None,
+        };
         Ok(Self {
+            sim,
             k: Tensor::zeros(shape, pool_dtype, device)?,
             v: Tensor::zeros(shape, pool_dtype, device)?,
             dtype,
@@ -315,8 +348,13 @@ impl LayerKv {
             #[cfg(feature = "cuda")]
             {
                 use crate::kernels::cuda::kv_packed_write;
-                for (x, pool) in [(k, &self.k), (v, &self.v)] {
+                for (x, pool, is_k) in [(k, &self.k, true), (v, &self.v, false)] {
                     let mut x = x.to_dtype(self.dtype)?;
+                    if let Some((to, back, sk, sv)) = &self.sim {
+                        if if is_k { *sk } else { *sv } {
+                            x = tq4_roundtrip(&x, kv_heads, to, back)?.to_dtype(self.dtype)?;
+                        }
+                    }
                     if let Some((to, _)) = &self.rot {
                         let (t, width) = x.dims2()?;
                         let d = width / kv_heads;
