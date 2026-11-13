@@ -717,7 +717,7 @@ fn packed_pool(x: &Tensor, kvh: usize, hd: usize, fmt: crate::kvcache::KvFormat)
     match fmt {
         crate::kvcache::KvFormat::Model => Ok((x.clone(), x.clone())),
         crate::kvcache::KvFormat::Q8 => q8_pool(x, kvh, hd),
-        crate::kvcache::KvFormat::Turbo4 => tq4_pool(x, kvh, hd),
+        _ => tq4_pool(x, kvh, hd),
     }
 }
 

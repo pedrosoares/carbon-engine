@@ -256,6 +256,12 @@ layers' value heads in a tiled order). The `mmproj` image tower is not loaded ye
   The full window then takes 23.5 GiB instead of 28. It is lossier than `q8`: the greedy next
   token agrees with the bf16 cache on 229 of 250 prefixes (91.6%; `q8` 97.2%), and decode is
   about 4% slower at short context (two small rotations per attention layer and step).
+- **`--kv-dtype rotor4`** is RotorQuant (scrya-com/rotorquant): the storage of `turbo4`, the
+  rotation made of independent random 3D rotations on consecutive coordinate triples
+  (`planar4` and `iso4` use 2D and 4D blocks). Same memory as `turbo4` and no faster here,
+  since this engine never applies the rotation per key. It is the lossiest option: next-token
+  agreement with the bf16 cache is 80.0% (`planar4` 82.8%, `iso4` 82.0%) against 91.6% for
+  `turbo4`. Prefer `turbo4` unless you are comparing the methods.
 - **Prefix reuse**: recurrent state is snapshotted at every prefill chunk boundary, so a prompt
   that shares a long beginning with an earlier one resumes from the last boundary inside it.
 

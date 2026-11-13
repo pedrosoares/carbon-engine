@@ -24,6 +24,13 @@ pub enum KvFormat {
     /// index into the 16-level Lloyd-Max codebook of a Gaussian, an f32 scale per vector. A
     /// quarter of bf16.
     Turbo4,
+    /// RotorQuant at 4 bits: the storage of `Turbo4`, the rotation made of independent random
+    /// 3D rotations (Clifford rotors) on consecutive coordinate triples.
+    Rotor4,
+    /// RotorQuant's planar variant: 2D (Givens) blocks.
+    Planar4,
+    /// RotorQuant's isoclinic variant: 4D (quaternion pair) blocks.
+    Iso4,
 }
 
 impl KvFormat {
@@ -32,6 +39,9 @@ impl KvFormat {
             "model" | "auto" => Self::Model,
             "q8" | "int8" => Self::Q8,
             "turbo4" | "turboquant" | "tq4" => Self::Turbo4,
+            "rotor4" | "rotorquant" | "rq4" => Self::Rotor4,
+            "planar4" | "planarquant" => Self::Planar4,
+            "iso4" | "isoquant" => Self::Iso4,
             _ => return None,
         })
     }
@@ -41,7 +51,26 @@ impl KvFormat {
         match self {
             Self::Model => head_dim * dtype.size_in_bytes(),
             Self::Q8 => head_dim + Q8_PAD,
-            Self::Turbo4 => head_dim / 2 + TQ_PAD,
+            Self::Turbo4 | Self::Rotor4 | Self::Planar4 | Self::Iso4 => head_dim / 2 + TQ_PAD,
+        }
+    }
+
+    /// What the kernels see: the rotated formats share the storage of `Turbo4`.
+    pub fn storage(self) -> Self {
+        match self {
+            Self::Rotor4 | Self::Planar4 | Self::Iso4 => Self::Turbo4,
+            f => f,
+        }
+    }
+
+    /// Side of the rotation's diagonal blocks: `None` without a rotation, 0 for a dense one.
+    pub fn rotation_block(self) -> Option<usize> {
+        match self {
+            Self::Model | Self::Q8 => None,
+            Self::Turbo4 => Some(0),
+            Self::Planar4 => Some(2),
+            Self::Rotor4 => Some(3),
+            Self::Iso4 => Some(4),
         }
     }
 }
@@ -62,6 +91,9 @@ pub fn kv_format() -> KvFormat {
     match KV_FORMAT.load(std::sync::atomic::Ordering::Relaxed) {
         1 => KvFormat::Q8,
         2 => KvFormat::Turbo4,
+        3 => KvFormat::Rotor4,
+        4 => KvFormat::Planar4,
+        5 => KvFormat::Iso4,
         _ => KvFormat::Model,
     }
 }
@@ -144,10 +176,63 @@ pub fn random_rotation(d: usize, seed: u64) -> Vec<f64> {
     m
 }
 
-/// The rotation of a TurboQuant pool as two `[d, d]` tensors: `x.matmul(to)` rotates row
-/// vectors, `y.matmul(back)` rotates them back. One matrix per head dim for the whole engine.
-fn turbo_rotation(d: usize, dtype: DType, device: &Device) -> Result<(Tensor, Tensor)> {
-    let m: Vec<f32> = random_rotation(d, 0x7475_7262_6f34).into_iter().map(|x| x as f32).collect();
+/// Determinant of a row-major `n x n` matrix (elimination with partial pivoting).
+fn determinant(m: &[f64], n: usize) -> f64 {
+    let mut a = m.to_vec();
+    let mut det = 1.0;
+    for c in 0..n {
+        let p = (c..n).max_by(|x, y| a[x * n + c].abs().total_cmp(&a[y * n + c].abs())).unwrap();
+        if a[p * n + c] == 0.0 {
+            return 0.0;
+        }
+        if p != c {
+            for j in 0..n {
+                a.swap(p * n + j, c * n + j);
+            }
+            det = -det;
+        }
+        det *= a[c * n + c];
+        for r in c + 1..n {
+            let f = a[r * n + c] / a[c * n + c];
+            for j in c..n {
+                a[r * n + j] -= f * a[c * n + j];
+            }
+        }
+    }
+    det
+}
+
+/// RotorQuant's rotation as a `d x d` matrix: independent random rotations (determinant +1,
+/// what a rotor sandwich `R x R~` or a quaternion pair gives) on consecutive groups of `block`
+/// coordinates; the `d % block` coordinates left at the end are not rotated.
+pub fn block_rotation(d: usize, block: usize, seed: u64) -> Vec<f64> {
+    let mut m = vec![0f64; d * d];
+    for g in 0..d / block {
+        let mut r = random_rotation(block, seed.wrapping_add(g as u64).wrapping_mul(0x2545_f491_4f6c_dd1d));
+        if determinant(&r, block) < 0.0 {
+            r[..block].iter_mut().for_each(|x| *x = -*x);
+        }
+        for i in 0..block {
+            for j in 0..block {
+                m[(g * block + i) * d + g * block + j] = r[i * block + j];
+            }
+        }
+    }
+    for i in d - d % block..d {
+        m[i * d + i] = 1.0;
+    }
+    m
+}
+
+/// The rotation of a rotated pool as two `[d, d]` tensors: `x.matmul(to)` rotates row
+/// vectors, `y.matmul(back)` rotates them back. One matrix per format and head dim for the
+/// whole engine.
+fn pool_rotation(block: usize, d: usize, dtype: DType, device: &Device) -> Result<(Tensor, Tensor)> {
+    let m = match block {
+        0 => random_rotation(d, 0x7475_7262_6f34),
+        b => block_rotation(d, b, 0x726f_746f_7234 + b as u64),
+    };
+    let m: Vec<f32> = m.into_iter().map(|x| x as f32).collect();
     let back = Tensor::from_vec(m, (d, d), &Device::Cpu)?; // rows are the rotation's rows
     let to = back.t()?.contiguous()?;
     Ok((to.to_dtype(dtype)?.to_device(device)?, back.to_dtype(dtype)?.to_device(device)?))
@@ -162,7 +247,7 @@ pub struct LayerKv {
     pub dtype: DType,
     /// How the pools store vectors; anything but `Model` is read by the CUDA kernels only.
     pub fmt: KvFormat,
-    /// TurboQuant: the rotation stored vectors went through, as (`to`, `back`) `[d, d]`
+    /// TurboQuant / RotorQuant: the rotation stored vectors went through, as (`to`, `back`) `[d, d]`
     /// matrices in the activation dtype. Queries take `to`, attention outputs `back`.
     pub rot: Option<(Tensor, Tensor)>,
     /// Per-token indexer keys `[slots, index_dim]` (QSA sparse attention layers only).
@@ -182,9 +267,9 @@ impl LayerKv {
             KvFormat::Model => ((num_slots, kv_heads * head_dim), dtype),
             _ => ((num_slots, kv_heads * fmt.vector_bytes(head_dim, dtype)), DType::U8),
         };
-        let rot = match fmt {
-            KvFormat::Turbo4 => Some(turbo_rotation(head_dim, dtype, device)?),
-            _ => None,
+        let rot = match fmt.rotation_block() {
+            Some(block) => Some(pool_rotation(block, head_dim, dtype, device)?),
+            None => None,
         };
         Ok(Self {
             k: Tensor::zeros(shape, pool_dtype, device)?,
@@ -237,7 +322,7 @@ impl LayerKv {
                         let d = width / kv_heads;
                         x = x.reshape((t * kv_heads, d))?.matmul(to)?.reshape((t, width))?;
                     }
-                    kv_packed_write(&x, pool, scatter_idx, kv_heads, self.fmt)?;
+                    kv_packed_write(&x, pool, scatter_idx, kv_heads, self.fmt.storage())?;
                 }
                 return Ok(());
             }
@@ -272,6 +357,42 @@ mod tests {
                 let dot: f64 = (0..d).map(|c| m[i * d + c] * m[j * d + c]).sum();
                 assert!((dot - if i == j { 1.0 } else { 0.0 }).abs() < 1e-12, "rows {i}, {j}: {dot}");
             }
+        }
+    }
+
+    /// Block rotations are orthogonal, touch only their own coordinates, have determinant +1
+    /// per block, and leave the coordinates past the last whole block alone.
+    #[test]
+    fn block_rotation_is_block_diagonal() {
+        for (d, b) in [(256, 3), (256, 2), (256, 4), (64, 3), (128, 3)] {
+            let m = block_rotation(d, b, 11);
+            assert_eq!(m, block_rotation(d, b, 11));
+            for i in 0..d {
+                for j in 0..d {
+                    let dot: f64 = (0..d).map(|c| m[i * d + c] * m[j * d + c]).sum();
+                    assert!((dot - if i == j { 1.0 } else { 0.0 }).abs() < 1e-12);
+                    let whole = i < d - d % b && j < d - d % b;
+                    if !(whole && i / b == j / b) && i != j {
+                        assert_eq!(m[i * d + j], 0.0, "d {d} block {b}: ({i}, {j})");
+                    }
+                }
+            }
+            for g in 0..d / b {
+                let blk: Vec<f64> = (0..b * b).map(|x| m[(g * b + x / b) * d + g * b + x % b]).collect();
+                assert!((determinant(&blk, b) - 1.0).abs() < 1e-12);
+                // a rotation, not a permutation of the axes
+                assert!(blk.iter().all(|x| x.abs() < 1.0));
+            }
+            for i in d - d % b..d {
+                assert_eq!(m[i * d + i], 1.0);
+            }
+            // blocks differ from one another
+            assert_ne!(m[0], m[b * d + b]);
+        }
+        for s in ["rotor4", "planar4", "iso4"] {
+            let f = KvFormat::parse(s).unwrap();
+            assert_eq!(f.storage(), KvFormat::Turbo4);
+            assert_eq!(f.vector_bytes(256, DType::BF16), 132);
         }
     }
 

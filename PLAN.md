@@ -213,7 +213,7 @@ Studio's to 128k (12.2 s vs 11.3 s at 32k, 73 s vs 72 s at 128k) and 1.4x slower
   dims), each staging the same K / V rows itself: 12 blocks per KV head re-read and convert
   the prefix, and the scores are computed twice for head dim 256.
 
-### Phase 8: KV cache quantizers behind `--kv-dtype` (TurboQuant done, RotorQuant planned)
+### Phase 8: KV cache quantizers behind `--kv-dtype` (TurboQuant and RotorQuant done)
 
 Both methods are the same pipeline: normalise a vector, rotate it so its coordinates look like
 independent Gaussians, store a few bits per coordinate from a Lloyd-Max codebook plus the norm.
@@ -248,13 +248,26 @@ Done, `--kv-dtype turbo4` (`KvFormat::Turbo4`):
   gets a refusal instead of the array. The scale's `1 / (1 - MSE)` factor (unbiased inner
   products) did not change the agreement.
 
+Done, `--kv-dtype rotor4 | planar4 | iso4` (RotorQuant; `KvFormat::{Rotor4, Planar4, Iso4}`):
+
+- The storage and kernels of `turbo4` (`KvFormat::storage`); only the matrix differs:
+  `kvcache::block_rotation` puts an independent random rotation (determinant +1, what a rotor
+  sandwich or a quaternion pair gives) on each group of 3 / 2 / 4 consecutive coordinates. At
+  head dim 256 that is 85 rotors and one coordinate left as is for `rotor4`.
+- Measured (27B, same 250 prefixes, next token equal to the bf16 cache): `turbo4` 91.6%
+  (re-collected, identical to the earlier run on all 250), `planar4` 82.8%, `iso4` 82.0%,
+  `rotor4` 80.0%. `q8` is 97.2%.
+- `rotor4` in the full-window configuration: memory as `turbo4`; decode 127.0 tok/s short
+  (turbo4 134.1, q8 140.2), 65.9 at 128k story; the planted fact is recalled at 6k and 120k.
+- So the expectation held: no speed gain here (the rotation is two `[D, D]` GEMMs per layer
+  and step whatever its structure) and clearly lower agreement. Likely reason, not verified:
+  one scale per vector assumes coordinates of equal variance, which a dense rotation produces
+  and a 2-4 dim block rotation does not. `turbo4` stays the recommended 4-bit format.
+
 Planned, in order:
 
-1. `--kv-dtype rotor4`: the same storage and kernels with RotorQuant's rotation, built as a
-   block-diagonal `[D, D]` matrix (85 random 3D rotors and one coordinate left as is at head dim
-   256; `planar4` / `iso4` the same way with 2D / 4D blocks). Compare with `turbo4` on the
-   agreement script. Expectation to check, not a result: RotorQuant's selling point is a
-   cheaper rotation, which this engine does not pay per key, and block rotations mix less.
+1. Why the block rotations lose: agreement with no rotation at all (the floor) and with a
+   per-block scale, to see whether RotorQuant can be brought to `turbo4`'s level here.
 2. The paper's second stage (1-bit QJL of the residual, unbiased inner products for K).
 3. 3-bit variants (`turbo3` / `rotor3`), mixed formats per pool (e.g. K at 4 bits, V at 8).
 4. The two rotations per attention layer and step as part of existing launches.

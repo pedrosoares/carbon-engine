@@ -1287,7 +1287,7 @@ fn pool_tag(fmt: KvFormat) -> &'static str {
     match fmt {
         KvFormat::Model => "",
         KvFormat::Q8 => "q8_",
-        KvFormat::Turbo4 => "tq4_",
+        _ => "tq4_", // pools are detected by storage: the rotated formats all read as Turbo4
     }
 }
 
