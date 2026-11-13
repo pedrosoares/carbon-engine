@@ -195,6 +195,20 @@ with graphs on; LM Studio is at 13.7.
     slower.
   - The per-row attention kernel for single-token steps at short context: no difference
     (66.3 vs 66.0 at 0 context, equal at 32k).
+- Second pass on the weight read (`examples/l2bench`: a Q4_K weight of a given size read with
+  other weights in between, and read again right away):
+  - A launch costs about 5 us on top of size / 1.49 TB/s (4 MB: 6.7 us, 48 MB: 37.4, 256 MB:
+    177), and 2.4 us on top of size / 1.68 TB/s when the weight is still in L2 (up to about
+    96 MB). So a cached read is only 13% faster: pre-loading the next weight during the small
+    launches between two GEMVs cannot pay, and I did not build it.
+  - A row on several warps, one unit per thread, partial sums through shared memory
+    (`kq_gemv_i8w`, removed again): the fixed cost drops 0.8 us but the steady rate falls from
+    1446 to 1340 GB/s, slower from 16 MB up (48 MB: 37.4 -> 39.1 us).
+  - What the 5 us is, I do not know: it is 2.6 us larger for a weight that was not just read
+    (address translation or cache ramp-up would fit, not verified).
+- The GDN step (9.6 us x 48 launches) is one 1024-thread block per value head, so it is bound
+  by one SM like the norm kernel was; splitting a head over blocks needs the same cross-block
+  rendezvous that did not pay there. Not attempted: at most 0.2 ms per token.
 - Measuring: decode speed drifts down about 2% over consecutive runs on a warm card, so
   compare builds alternately; and stop servers by their real process name (two A/B rounds
   here measured a stale server before I noticed).
@@ -472,9 +486,11 @@ element-wise ops 17%. After it (5.9 s): GEMMs 66%, recurrence 12%, attention 8%,
 2. Decode at depth: 16 layers x 0.75 ms of attention per step at 250k next to about 15 ms of
    GEMMs. Left: int8 MMA for Q K^T (no conversion, but Q becomes 8-bit), and the fixed cost
    per launch (the grid covers the whole pool; the merge kernel walks every chunk).
+   The int8 tensor-core multiply (`mma.sync m16n8k32 s8 x s8 -> s32`) assembles and is exact
+   on this card (a one-warp probe); V needs the probabilities as two 8-bit planes.
 3. Int8 KV: `--kv-dtype auto` (the logit-level comparison is done, see phase 8).
 4. KV / state auto-sizing: single-user defaults for long windows (the prefill reserve and the
    pool-smaller-than-context warning are done, see phase 5 update 5).
-5. Plain decode (65 vs 73, see phase 3 update 2): the per-launch cost of the GEMVs (1.2 ms)
-   and the GDN step (0.46 ms in 48 launches) are what is left to try.
+5. Plain decode (65 vs 73, see phase 3 update 2): no approach left that I expect to work; the
+   weight read has been through six variants.
 4. Phase 6 sweep and README; phase 7 image input.
