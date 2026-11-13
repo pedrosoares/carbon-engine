@@ -672,8 +672,9 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
     __shared__ u32 sk[16][PDR_KW];
     __shared__ u16 sv[PD_MAXD * PDR_VS];
     __shared__ float ksc[16], vsc[16];
-    __shared__ u32 lut[256];
+    __shared__ u32 lut[F == 2 ? 256 : 1];
     __shared__ float sp[PDR_WARPS][16][PD_G];
+    __shared__ unsigned ssl[PDR_POS];  // the chunk's slots
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane >> 2, tg = lane & 3;
     const int G = H / KVH, KS = D / 16;
     const int c = blockIdx.x % NCW;
@@ -714,10 +715,10 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
     constexpr int W = F ? 1 : 2;
     const int KI = 16 * (D / 4), VI = 8 * (D / 4);  // staging items: (row, 4 dims), (row pair, 4 dims)
 
-    if (F == 2) {
-        tq4_lut_init<A>(lut);
-        __syncthreads();
-    }
+    if (F == 2) tq4_lut_init<A>(lut);
+    // the chunk's slots once: a tile's K and V loads then do not wait for its slot loads
+    for (unsigned i = threadIdx.x; i < PDR_POS; i += blockDim.x) ssl[i] = p0 + i < s1 ? slots[p0 + i] : 0u;
+    __syncthreads();
     for (unsigned t0 = p0; t0 < p1; t0 += 16) {
         const int nk = (int)min(s1 - t0, 16u);
         for (int base = threadIdx.x; base < KI; base += PDR_SB * blockDim.x) {
@@ -725,7 +726,7 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
 #pragma unroll
             for (int it = 0; it < PDR_SB; ++it) {
                 int i = base + it * blockDim.x, row = i / (D / 4);
-                sl[it] = (i < KI && row < nk) ? slots[t0 + row] : 0xffffffffu;
+                sl[it] = (i < KI && row < nk) ? ssl[t0 - p0 + row] : 0xffffffffu;
             }
 #pragma unroll
             for (int it = 0; it < PDR_SB; ++it) {
@@ -750,7 +751,7 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
 #pragma unroll
             for (int it = 0; it < PDR_SB; ++it) {
                 int i = base + (it / 2) * blockDim.x, row = 2 * (i % 8) + (it & 1);
-                sl[it] = (i < VI && row < nk) ? slots[t0 + row] : 0xffffffffu;
+                sl[it] = (i < VI && row < nk) ? ssl[t0 - p0 + row] : 0xffffffffu;
             }
 #pragma unroll
             for (int it = 0; it < PDR_SB; ++it) {
@@ -773,7 +774,7 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
         }
         if (F && threadIdx.x < 16) {
             const bool in = (int)threadIdx.x < nk;
-            const long vec = in ? (long)slots[t0 + threadIdx.x] * KVH + kvh : 0;
+            const long vec = in ? (long)ssl[t0 - p0 + threadIdx.x] * KVH + kvh : 0;
             ksc[threadIdx.x] = in ? tc_pool_scale<F>(kc, vec, D) : 0.0f;
             vsc[threadIdx.x] = in ? tc_pool_scale<F>(vc, vec, D) : 0.0f;
         }

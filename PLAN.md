@@ -352,6 +352,36 @@ Planned, in order:
 3. 3-bit variants (`turbo3` / `rotor3`), mixed formats per pool (e.g. K at 4 bits, V at 8).
 4. The two rotations per attention layer and step as part of existing launches.
 
+### Phase 5 update 6: decode attention at depth, int8 tensor-core round
+
+The plan was integer scores (`mma.sync m16n8k32 s8 x s8 -> s32`, K as stored, queries at 8
+bits). The instruction works and is exact, but the premise was wrong: converting K is not what
+the row-shared kernel waits for. `examples/attnbench decode`, q8 pool, ms per layer:
+
+| variant | 129k, 1 row | 129k, 6 rows | 250k, 3 rows |
+|---|---|---|---|
+| before | 0.349 | 0.531 | 0.750 |
+| integer scores, K staged unconverted | 0.349 | 0.516 | 0.740 |
+| the same, a tile's multiplies spread over 2 - 4 warps per column set | 0.356 | 0.80 | 0.93 |
+| one memory round trip per tile (K, V and scale loads issued together) | 0.379 | 0.729 | 0.788 |
+| a chunk's slots loaded once into shared memory (kept) | 0.331 | 0.507 | 0.706 |
+| + query fragments read per tile instead of 32 registers | 0.341 | 0.512 | 0.756 |
+
+- Kept: the slot pre-load. Same bits (a second q8 agreement run matches the earlier one on all
+  250 prefixes, KL 0). 27B, full-window MTP configuration: 250k 49.6 / 95.3 -> 52.3 / 98.3
+  tok/s (story / json); 128k 63.6 / 127.0 (65.6 / 126.5 before, within noise).
+- Not kept: everything else in the table. Integer scores bring 8-bit queries for no speed, so
+  the int8 kernel is not in the tree.
+- What I learned about the bound, from removing parts (timings only, results wrong): no K
+  loads 0.247, no V loads 0.302, V conversion replaced by masks 0.348. With the multiplies
+  removed it is 0.190, but then the compiler also drops the staging, so that number is the
+  floor of loop, softmax and barriers, not the cost of the multiplies.
+- Occupancy matters for 4-warp blocks: 8 KB more shared memory costs 27% (one block fewer per
+  SM); taking 1 KB out (the TurboQuant table, now only in the TQ4 kernel) gains nothing, so
+  something else caps it at the current count, probably registers per thread. 6-warp blocks
+  do not react to shared memory at all.
+- More registers held across a tile's staging made it slower every time (again).
+
 ### Phase 5 update 5: activation reserve follows the prefill chunk
 
 - `device::workspace_reserve` is now the larger of the fixed part (1.5 GiB + 5% of the card)
@@ -486,8 +516,8 @@ element-wise ops 17%. After it (5.9 s): GEMMs 66%, recurrence 12%, attention 8%,
 2. Decode at depth: 16 layers x 0.75 ms of attention per step at 250k next to about 15 ms of
    GEMMs. Left: int8 MMA for Q K^T (no conversion, but Q becomes 8-bit), and the fixed cost
    per launch (the grid covers the whole pool; the merge kernel walks every chunk).
-   The int8 tensor-core multiply (`mma.sync m16n8k32 s8 x s8 -> s32`) assembles and is exact
-   on this card (a one-warp probe); V needs the probabilities as two 8-bit planes.
+   Integer scores were tried and gave nothing (phase 5 update 6). What is left: fewer registers
+   per thread (the 64 accumulators) to fit more blocks per SM.
 3. Int8 KV: `--kv-dtype auto` (the logit-level comparison is done, see phase 8).
 4. KV / state auto-sizing: single-user defaults for long windows (the prefill reserve and the
    pool-smaller-than-context warning are done, see phase 5 update 5).
