@@ -537,6 +537,15 @@ fn check_kquant_kernels(d: &Device, dtype: DType, kind: crate::gguf::KKind) -> c
         if ei > 3e-2 {
             candle_core::bail!("mismatch vs cpu: 8-bit gemv ({t} rows) rel err {ei:.2e}");
         }
+        // SiLU * up with its activation prep in one launch against the separate kernels
+        let f32c = |a: &Tensor| a.to_device(&cpu)?.to_dtype(DType::F32);
+        let r = Tensor::rand(-1f32, 1.0, (t, kk), &cpu)?.to_dtype(dtype)?.to_device(d)?;
+        let sp = k::kquant_silu_mul_prep(&xd, &r)?;
+        let sp_ref = k::kquant_prep(&(candle_nn::ops::silu(&xd)? * &r)?)?;
+        let es = rel(&k::kquant_gemv_prepared(&sp, &q, DType::F32)?, &f32c(&k::kquant_gemv_prepared(&sp_ref, &q, DType::F32)?)?)?;
+        if es > tol {
+            candle_core::bail!("fused silu * up prep ({t} rows): rel err {es:.2e}");
+        }
         if k::kquant_tc_enabled() {
             let prep = k::kquant_prep(&xd)?;
             let a = k::kquant_gemv_prepared(&prep, &q, DType::F32)?.to_device(&cpu)?;

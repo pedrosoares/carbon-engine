@@ -625,6 +625,24 @@ impl Mlp {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let mut gu = QLinear::forward_many(&[&self.gate, &self.up], x)?;
         let u = gu.pop().expect("up");
+        #[cfg(feature = "cuda")]
+        if let (QLinear::KQuant(down), true, true) = (
+            &self.down,
+            matches!(self.act.as_str(), "silu" | "swish"),
+            u.device().is_cuda()
+                && crate::kernels::cuda::kquant_step_fusion()
+                && !crate::kernels::cuda::kquant_exact()
+                && u.dims2().is_ok_and(|(t, k)| t <= crate::kernels::cuda::MAX_GEMV_ROWS && k % 256 == 0),
+        ) {
+            // SiLU, the product and the down projection's activation prep in one launch
+            use crate::kernels::cuda as k;
+            let g = &gu[0];
+            if let Some(y) =
+                cuda_quant(x, "kquant silu", || k::kquant_gemv_with(&k::kquant_silu_mul_prep(g, &u)?, down, x.dtype()))
+            {
+                return Ok(y);
+            }
+        }
         let g = activation(&self.act, &gu.pop().expect("gate"))?;
         self.down.forward(&(g * u)?)
     }

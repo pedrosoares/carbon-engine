@@ -51,13 +51,16 @@ __device__ __forceinline__ u16 f32_to_f16(float f) { _Float16 x = (_Float16)f; u
 // element loaders / storers per activation dtype
 struct F32 { typedef float T;
     __device__ static float load(const float* p, long i) { return p[i]; }
-    __device__ static void store(float* p, long i, float v) { p[i] = v; } };
+    __device__ static void store(float* p, long i, float v) { p[i] = v; }
+    __device__ static float round(float v) { return v; } };
 struct BF16 { typedef u16 T;
     __device__ static float load(const u16* p, long i) { return bf16_to_f32(p[i]); }
-    __device__ static void store(u16* p, long i, float v) { p[i] = f32_to_bf16(v); } };
+    __device__ static void store(u16* p, long i, float v) { p[i] = f32_to_bf16(v); }
+    __device__ static float round(float v) { return bf16_to_f32(f32_to_bf16(v)); } };
 struct F16 { typedef u16 T;
     __device__ static float load(const u16* p, long i) { return f16_to_f32(p[i]); }
-    __device__ static void store(u16* p, long i, float v) { p[i] = f32_to_f16(v); } };
+    __device__ static void store(u16* p, long i, float v) { p[i] = f32_to_f16(v); }
+    __device__ static float round(float v) { return f16_to_f32(f32_to_f16(v)); } };
 
 // ---- NVFP4: codes [n, k/2] (low nibble first), e4m3 scales [n, k/16], global multiplier ----
 
@@ -287,36 +290,46 @@ __device__ __forceinline__ float kq_term_q6k(float f, float xs, float xsum, int 
     return (f * xs) * (float)isum - f * (32.0f * xsum);
 }
 
+// One group of 32 inputs by one warp whose lanes hold the values (coalesced loads, the
+// reductions through shuffles).
+__device__ __forceinline__ void kq_prep_warp(float v, float* base, int k, int s) {
+    const int lane = threadIdx.x % 32;
+    float mx = fabsf(v);
+    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
+    float inv = mx > 0.0f ? 127.0f / mx : 0.0f, xs = mx / 127.0f;
+    int q = __float2int_rn(v * inv);
+    unsigned word = ((unsigned)q & 0xff) << (8 * (lane & 3));
+    word |= __shfl_xor_sync(0xffffffff, word, 1);
+    word |= __shfl_xor_sync(0xffffffff, word, 2);
+    int sum = q;
+    for (int off = 1; off < 16; off <<= 1) sum += __shfl_xor_sync(0xffffffff, sum, off);
+    if ((lane & 3) == 0) ((unsigned*)base)[s * 8 + (lane >> 2)] = word;
+    if (lane == 0) base[k / 4 + s] = xs;
+    if ((lane & 15) == 0) base[k / 4 + k / 32 + 2 * s + (lane >> 4)] = xs * (float)sum;
+}
+
 template <class D>
 __device__ void kq_prep(const typename D::T* x, float* out, int k, int t) {
-    long groups = (long)t * (k / 32);
-    for (long g = (long)blockIdx.x * blockDim.x + threadIdx.x; g < groups; g += (long)gridDim.x * blockDim.x) {
+    const long groups = (long)t * (k / 32), warps = (long)gridDim.x * (blockDim.x / 32);
+    const int lane = threadIdx.x % 32;
+    for (long g = (long)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32; g < groups; g += warps) {
         int ti = (int)(g / (k / 32)), s = (int)(g % (k / 32));
-        const long xo = (long)ti * k + (long)s * 32;
-        float v[32], mx = 0.0f;
-#pragma unroll
-        for (int l = 0; l < 32; ++l) {
-            v[l] = D::load(x, xo + l);
-            mx = fmaxf(mx, fabsf(v[l]));
-        }
-        float* base = out + (long)ti * KQ_PREP_STRIDE(k);
-        float inv = mx > 0.0f ? 127.0f / mx : 0.0f, xs = mx / 127.0f;
-        unsigned* xq = (unsigned*)base + s * 8;
-        int sum[2] = {0, 0};
-#pragma unroll
-        for (int w = 0; w < 8; ++w) {
-            unsigned word = 0;
-#pragma unroll
-            for (int b = 0; b < 4; ++b) {
-                int q = __float2int_rn(v[4 * w + b] * inv);
-                sum[w >> 2] += q;
-                word |= ((unsigned)q & 0xff) << (8 * b);
-            }
-            xq[w] = word;
-        }
-        base[k / 4 + s] = xs;
-        base[k / 4 + k / 32 + 2 * s] = xs * (float)sum[0];
-        base[k / 4 + k / 32 + 2 * s + 1] = xs * (float)sum[1];
+        kq_prep_warp(D::load(x, (long)ti * k + (long)s * 32 + lane), out + (long)ti * KQ_PREP_STRIDE(k), k, s);
+    }
+}
+
+// SiLU(g) * u and its activation prep in one launch (the MLP's input to the down projection;
+// the product itself is not kept). Both steps rounded to the activation type.
+template <class D>
+__device__ void kq_silu_mul_prep(const typename D::T* gt, const typename D::T* up, float* out, int k, int t) {
+    const long groups = (long)t * (k / 32), warps = (long)gridDim.x * (blockDim.x / 32);
+    const int lane = threadIdx.x % 32;
+    for (long g = (long)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32; g < groups; g += warps) {
+        int ti = (int)(g / (k / 32)), s = (int)(g % (k / 32));
+        const long i = (long)ti * k + (long)s * 32 + lane;
+        float a = D::load(gt, i);
+        a = D::round(a / (1.0f + expf(-a)));
+        kq_prep_warp(D::round(a * D::load(up, i)), out + (long)ti * KQ_PREP_STRIDE(k), k, s);
     }
 }
 
@@ -543,6 +556,10 @@ extern "C" __global__ void logit_pick_merge(const float* part, float* out, int R
     }                                                                                                         \
     extern "C" __global__ void kq_prep_##SUFFIX(const D::T* x, float* o, int k, int t) {                     \
         kq_prep<D>(x, o, k, t);                                                                               \
+    }                                                                                                         \
+    extern "C" __global__ void kq_silu_mul_prep_##SUFFIX(const D::T* g, const D::T* u, float* o, int k,      \
+                                                         int t) {                                             \
+        kq_silu_mul_prep<D>(g, u, o, k, t);                                                                   \
     }                                                                                                         \
     extern "C" __global__ void kq_gemv_i8_##SUFFIX(const u8* w, const float* p, D::T* y, int n, int k,       \
                                                    int t, int kind) {                                         \

@@ -564,7 +564,7 @@ impl candle_core::CustomOp1 for KqPrep {
                 b.arg(&out);
                 b.arg(&k32);
                 b.arg(&t32);
-                unsafe { b.launch(grid_stride(t * k / 32)) }.w()?;
+                unsafe { b.launch(warp_per_group(t * k / 32)) }.w()?;
             }};
         }
         match dtype {
@@ -729,6 +729,69 @@ pub fn kquant_use_tc(_kind: crate::gguf::KKind, n: usize, _t: usize) -> bool {
 /// Projections that read the same input share one.
 pub fn kquant_prep(x: &Tensor) -> CResult<Tensor> {
     x.contiguous()?.apply_op1_no_bwd(&KqPrep)
+}
+
+/// `CARBON_KQ_FUSE=0`: a decode step's SiLU, gate * up product and activation prep stay
+/// separate launches (for comparisons).
+pub fn kquant_step_fusion() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CARBON_KQ_FUSE").map_or(true, |v| v != "0"))
+}
+
+/// A warp per 32 inputs (`kq_prep_warp`).
+fn warp_per_group(groups: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (groups.div_ceil(8).max(1) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+struct KqSiluMulPrep;
+
+impl CustomOp2 for KqSiluMulPrep {
+    fn name(&self) -> &'static str {
+        "carbon-kquant-silu-mul-prep"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, g: &CudaStorage, gl: &Layout, u: &CudaStorage, ul: &Layout) -> CResult<(CudaStorage, Shape)> {
+        let (t, k) = gl.shape().dims2()?;
+        if k % 256 != 0 || gl.shape() != ul.shape() || g.dtype() != u.dtype() {
+            candle_core::bail!("kquant silu mul prep: bad shapes {:?} / {:?}", gl.shape(), ul.shape());
+        }
+        let dev = g.device().clone();
+        let dtype = g.dtype();
+        let f = kernel!(dev, format!("kq_silu_mul_prep_{}", suffix(dtype)?));
+        let stride = kq_prep_stride(k);
+        let out = unsafe { dev.alloc::<f32>(t * stride)? };
+        let (k32, t32) = (k as i32, t as i32);
+        macro_rules! go {
+            ($ty:ty) => {{
+                let (gv, uv) = (view::<$ty>(g, gl)?, view::<$ty>(u, ul)?);
+                let mut b = f.builder();
+                b.arg(&gv);
+                b.arg(&uv);
+                b.arg(&out);
+                b.arg(&k32);
+                b.arg(&t32);
+                unsafe { b.launch(warp_per_group(t * k / 32)) }.w()?;
+            }};
+        }
+        match dtype {
+            DType::F32 => go!(f32),
+            DType::BF16 => go!(bf16),
+            DType::F16 => go!(f16),
+            d => candle_core::bail!("kquant silu mul prep: unsupported dtype {d:?}"),
+        }
+        Ok((CudaStorage::wrap_cuda_slice(out, dev), Shape::from((t, stride))))
+    }
+}
+
+/// Prepared activations of `silu(g) * u` (`[T <= 8, k]` each) for [`kquant_gemv_with`].
+pub fn kquant_silu_mul_prep(g: &Tensor, u: &Tensor) -> CResult<Tensor> {
+    g.contiguous()?.apply_op2_no_bwd(&u.contiguous()?, &KqSiluMulPrep)
 }
 
 /// A packed K-quant weight times prepared activations -> `[T, rows]` of `dtype`.

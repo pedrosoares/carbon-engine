@@ -167,6 +167,41 @@ Studio's to 128k (12.2 s vs 11.3 s at 32k, 73 s vs 72 s at 128k) and 1.4x slower
   model). `CARBON_KQ_TC_MIN=a,b` moves the thresholds, `CARBON_KQ_EXACT=1` selects the float
   reference kernel.
 
+### Phase 3 update 2: plain decode round (small kernels; the weight read is the bound)
+
+Profile of a plain decode step (graphs off, per token): K-quant GEMVs 12.45 ms in 255
+launches, attention 0.93 ms, activation prep 0.60 (256 launches), RMS norm 0.59 (160), GDN
+step + conv 0.63, about 0.5 ms of one-microsecond element-wise launches. 15.4 ms per token
+with graphs on; LM Studio is at 13.7.
+
+- Kept: `kq_prep` with a warp per 32 inputs (coalesced loads, max / packing / sums through
+  shuffles, same bits): 2.4 -> 1.1 us per launch. `kq_silu_mul_prep`: SiLU, gate * up and the
+  down projection's activation prep in one launch, 4.4 -> 1.5 us (`CARBON_KQ_FUSE=0` restores
+  the three launches). Plain decode in an alternating A/B over three server starts each:
+  64.5 / 64.0 / 63.9 -> 65.5 / 65.2 / 65.1 tok/s (+1.8%); graphs off 61.3 -> 62.9. The
+  full-window MTP configuration: 138.0 -> 140.0 (one pair).
+- `--mtp` output is still identical to single-token decoding on the same kernels
+  (`CARBON_KQ_TC_ROWS=1`) on three 400-token prompts. A plain server (dp4a kernel) and an
+  `--mtp` server (tensor-core kernel) differ after some tokens, as before this change.
+- Tried and dropped:
+  - GEMV: all of a lane's loads issued before computing (1477 -> 1288 GB/s: the extra
+    registers cost occupancy); persistent blocks looping over rows instead of a block per 4
+    rows (no better at any shape). Sixty 50 MB weights in sequence still read at 1.30 TB/s
+    against 1.48 for one large weight: about 4.6 us per launch that I have not found a way to
+    remove, 1.2 ms per token.
+  - Residual add + RMS norm + activation prep in one launch: 7.4 us against 7.1 for the three
+    launches (one 1024-thread block is bound by a single SM). Eight blocks per row, each summing
+    the whole row or exchanging partial sums through a rendezvous buffer, were the same or
+    slower.
+  - The per-row attention kernel for single-token steps at short context: no difference
+    (66.3 vs 66.0 at 0 context, equal at 32k).
+- Measuring: decode speed drifts down about 2% over consecutive runs on a warm card, so
+  compare builds alternately; and stop servers by their real process name (two A/B rounds
+  here measured a stale server before I noticed).
+- Where this leaves plain decode: 65 against LM Studio's 73. The GEMVs are 81% of the step and
+  read at 1.27 TB/s in the model; LM Studio's 13.7 ms means it reads at 1.3 TB/s or better with
+  about 1 ms of everything else, against 3 ms here.
+
 ### Phase 3/4 update: launch fusion, one-launch GDN chains, exact verify steps
 
 - Projections that share an input (gate + up, q/k/v, qkv/z/a/b) run in one launch
@@ -428,5 +463,6 @@ element-wise ops 17%. After it (5.9 s): GEMMs 66%, recurrence 12%, attention 8%,
    is 98.0% over 250 prefixes), and `--kv-dtype auto`.
 4. KV / state auto-sizing: single-user defaults for long windows (the prefill reserve and the
    pool-smaller-than-context warning are done, see phase 5 update 5).
-5. Plain decode (66 vs 73): fuse norm + prep and SiLU * up into kernel epilogues.
+5. Plain decode (65 vs 73, see phase 3 update 2): the per-launch cost of the GEMVs (1.2 ms)
+   and the GDN step (0.46 ms in 48 launches) are what is left to try.
 4. Phase 6 sweep and README; phase 7 image input.
