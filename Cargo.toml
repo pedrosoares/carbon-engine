@@ -16,6 +16,10 @@ name = "kqbench"
 required-features = ["cuda"]
 
 [[example]]
+name = "l2bench"
+required-features = ["cuda"]
+
+[[example]]
 name = "gdnbench"
 required-features = ["cuda"]
 
