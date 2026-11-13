@@ -451,6 +451,8 @@ impl AppState {
             repetition_penalty: f("repetition_penalty")
                 .or(d.repetition_penalty)
                 .unwrap_or(1.0),
+            // the endpoints that report them set it
+            logprobs: 0,
         }
     }
 
@@ -508,6 +510,7 @@ pub struct Generation {
     first_token: Option<Instant>,
     prompt_len: usize,
     generated: usize,
+    logprobs: Vec<crate::sampling::TokenLogprobs>,
 }
 
 impl Generation {
@@ -547,6 +550,7 @@ impl Generation {
             first_token: None,
             prompt_len,
             generated: 0,
+            logprobs: vec![],
         }
     }
 
@@ -576,6 +580,11 @@ impl Generation {
         });
     }
 
+    /// Log-probabilities of the tokens received so far (requests that asked for them).
+    pub fn logprobs(&self) -> &[crate::sampling::TokenLogprobs] {
+        &self.logprobs
+    }
+
     pub fn output_ids(&self) -> &[u32] {
         self.detok.ids()
     }
@@ -594,6 +603,7 @@ impl Generation {
                     self.record(500, None, Some("engine stopped".into()));
                     return Some(Chunk::Error("engine stopped".into()));
                 }
+                Some(Event::Logprobs(lp)) => self.logprobs.push(lp),
                 Some(Event::Token(t)) => {
                     self.first_token.get_or_insert_with(Instant::now);
                     self.generated += 1;

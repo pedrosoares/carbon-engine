@@ -80,6 +80,7 @@ fn run_with_stats(
             let mut toks = vec![];
             loop {
                 match rx.recv().await.expect("engine dropped the request") {
+                    Event::Logprobs(_) => {}
                     Event::Token(t) => toks.push(t),
                     Event::Done { usage, .. } => {
                         out.push((toks, usage));
@@ -295,6 +296,7 @@ fn prefix_cache_reuses_kv() {
             let mut toks = vec![];
             loop {
                 match rx.recv().await.unwrap() {
+                    Event::Logprobs(_) => {}
                     Event::Token(t) => toks.push(t),
                     Event::Done { usage, .. } => return (toks, usage),
                     Event::Error(e) => panic!("{e}"),
@@ -324,6 +326,55 @@ fn prefix_cache_reuses_kv() {
         stats.kv_capacity,
         "KV slots leaked"
     );
+}
+
+/// `SamplingParams::logprobs`: every token is preceded by its log-probabilities, the greedy
+/// token leads the list, and asking for them does not change the tokens.
+#[test]
+fn logprobs_precede_tokens() {
+    let (_dir, model) = tiny("llama");
+    let engine = Engine::load(&config(&model, &["cpu"], 1)).unwrap();
+    let handle = scheduler::spawn(
+        engine,
+        SchedulerConfig {
+            max_running: 4,
+            max_prefill_tokens: 4096,
+            eos_token_ids: vec![],
+            anchor_token: None,
+        },
+    )
+    .unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let prompt: Vec<u32> = (0..24).map(|i| (i * 7 + 3) % 250).collect();
+    let go = |logprobs: usize| {
+        let (h, p) = (handle.clone(), prompt.clone());
+        rt.block_on(async move {
+            let (_, mut rx) = h.submit(p, SamplingParams { max_tokens: 5, ignore_eos: true, logprobs, ..Default::default() });
+            let (mut toks, mut lps) = (vec![], vec![]);
+            loop {
+                match rx.recv().await.unwrap() {
+                    Event::Logprobs(l) => {
+                        assert_eq!(lps.len(), toks.len(), "one per token, before it");
+                        lps.push(l);
+                    }
+                    Event::Token(t) => toks.push(t),
+                    Event::Done { .. } => return (toks, lps),
+                    Event::Error(e) => panic!("{e}"),
+                }
+            }
+        })
+    };
+    let (plain, none) = go(0);
+    assert!(none.is_empty());
+    let (toks, lps) = go(3);
+    assert_eq!(toks, plain);
+    assert_eq!(lps.len(), toks.len());
+    for (t, l) in toks.iter().zip(&lps) {
+        assert_eq!(l.token, *t);
+        assert_eq!(l.top.len(), 3);
+        assert_eq!(l.top[0], (*t, l.logprob));
+        assert!(l.logprob <= 0.0 && l.top[0].1 >= l.top[1].1 && l.top[1].1 >= l.top[2].1);
+    }
 }
 
 #[test]
@@ -419,6 +470,7 @@ fn live_cache_rebuild() {
             let mut toks = vec![];
             loop {
                 match rx.recv().await.unwrap() {
+                    Event::Logprobs(_) => {}
                     Event::Token(t) => toks.push(t),
                     Event::Done { .. } => return toks,
                     Event::Error(e) => panic!("{e}"),
@@ -661,6 +713,7 @@ fn run_sequential_anchored(
                 let mut toks = vec![];
                 loop {
                     match rx.recv().await.unwrap() {
+                        Event::Logprobs(_) => {}
                         Event::Token(t) => toks.push(t),
                         Event::Done { usage, .. } => return (toks, usage),
                         Event::Error(e) => panic!("{e}"),
@@ -1023,6 +1076,7 @@ fn run_mtp_with(
             let mut toks = vec![];
             loop {
                 match rx.recv().await.expect("engine dropped the request") {
+                    Event::Logprobs(_) => {}
                     Event::Token(t) => toks.push(t),
                     Event::Done { usage, .. } => {
                         out.push((toks, usage));

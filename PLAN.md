@@ -318,6 +318,19 @@ pool), keys only 94.0%, values only 93.2%, neither (`q8`) 97.2%. The loss is spl
 so neither a key-only fix (the QJL stage) nor 8-bit values alone gets back to `q8`: K at 4 bits
 with V at 8 would be 196 bytes per vector for about 94%.
 
+Distribution-level comparison (`/v1/completions` now takes `logprobs: N`; the agreement
+script records the top 20 per prefix and reports KL over the bf16 run's top tokens, which hold
+86% of its probability on this text; a second bf16 run reproduces the first exactly):
+
+| pool | same top token | KL(bf16 \|\| pool), mean / 90th pct (nats) | change of bf16's top logprob, mean | changed tokens that were near-ties (margin < 0.5 nats) |
+|---|---|---|---|---|
+| `q8` | 244 / 250 | 0.0022 / 0.0088 | 0.033 | 6 of 6 |
+| `turbo4` | 228 / 250 | 0.0165 / 0.0405 | 0.094 | 20 of 22 |
+
+(One prefix fewer or more than the earlier counts: the decode kernels changed in between.)
+So the tokens that change are almost all coin flips for the bf16 model too; `turbo4` moves
+the distribution about 7x as much as `q8`.
+
 Planned, in order:
 
 1. (done, see below)
@@ -459,8 +472,7 @@ element-wise ops 17%. After it (5.9 s): GEMMs 66%, recurrence 12%, attention 8%,
 2. Decode at depth: 16 layers x 0.75 ms of attention per step at 250k next to about 15 ms of
    GEMMs. Left: int8 MMA for Q K^T (no conversion, but Q becomes 8-bit), and the fixed cost
    per launch (the grid covers the whole pool; the merge kernel walks every chunk).
-3. Int8 KV: a logit-level comparison with bf16 KV (needs logprobs output; next-token agreement
-   is 98.0% over 250 prefixes), and `--kv-dtype auto`.
+3. Int8 KV: `--kv-dtype auto` (the logit-level comparison is done, see phase 8).
 4. KV / state auto-sizing: single-user defaults for long windows (the prefill reserve and the
    pool-smaller-than-context warning are done, see phase 5 update 5).
 5. Plain decode (65 vs 73, see phase 3 update 2): the per-launch cost of the GEMVs (1.2 ms)

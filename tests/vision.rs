@@ -153,6 +153,7 @@ fn image_generation_matches_hf() {
                 let mut toks = vec![];
                 loop {
                     match rx.recv().await.unwrap() {
+                        Event::Logprobs(_) => {}
                         Event::Token(t) => toks.push(t),
                         Event::Done { .. } => return toks,
                         Event::Error(e) => panic!("{e}"),

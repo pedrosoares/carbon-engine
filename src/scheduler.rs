@@ -45,6 +45,9 @@ pub struct Usage {
 
 #[derive(Debug)]
 pub enum Event {
+    /// Log-probabilities of the token the next `Token` event carries (requests with
+    /// `SamplingParams::logprobs`).
+    Logprobs(crate::sampling::TokenLogprobs),
     Token(u32),
     Done { reason: FinishReason, usage: Usage },
     Error(String),
@@ -314,6 +317,9 @@ struct Req {
     state_slot: u32,
     /// Length of `tokens` just after a sampled anchor token, until that state is cached.
     anchor_len: Option<usize>,
+    /// Log-probabilities of the rows sampled for this request in the current step, in row
+    /// order (`params.logprobs`).
+    logprob_rows: std::collections::VecDeque<crate::sampling::TokenLogprobs>,
 }
 
 impl Req {
@@ -663,6 +669,7 @@ impl Scheduler {
             state_slot,
             anchor_len: None,
             mtp_drafts: vec![],
+            logprob_rows: Default::default(),
             mtp_next_slot: None,
             mrope: crate::images::MropePositions::new(&sub.images),
             images: sub.images.iter().map(|span| ReqImage { span: span.clone(), features: None }).collect(),
@@ -988,6 +995,9 @@ impl Scheduler {
                 let t = row(j);
                 let r = &mut self.running[i];
                 r.tokens.push(t);
+                if let Some(lp) = r.logprob_rows.pop_front() {
+                    let _ = r.tx.send(Event::Logprobs(lp));
+                }
                 let _ = r.tx.send(Event::Token(t));
                 e += 1;
                 let stop = !r.params.ignore_eos
@@ -1252,6 +1262,22 @@ impl Scheduler {
     }
 
     fn sample_rows(&mut self, logits: &Tensor, samplers: &[usize]) -> Result<Vec<u32>> {
+        let toks = self.pick_rows(logits, samplers)?;
+        // rows of an earlier step that were not emitted (rejected drafts) are stale
+        for &i in samplers {
+            self.running[i].logprob_rows.clear();
+        }
+        for (row, (&i, &tok)) in samplers.iter().zip(&toks).enumerate() {
+            let n = self.running[i].params.logprobs;
+            if n > 0 {
+                let l = logits.get(row)?.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
+                self.running[i].logprob_rows.push_back(crate::sampling::top_logprobs(&l, tok, n));
+            }
+        }
+        Ok(toks)
+    }
+
+    fn pick_rows(&mut self, logits: &Tensor, samplers: &[usize]) -> Result<Vec<u32>> {
         if samplers.is_empty() {
             return Ok(vec![]);
         }
@@ -1394,6 +1420,9 @@ impl Scheduler {
                         r.anchor_len = Some(r.tokens.len());
                     }
                     self.stats.total_generated_tokens += 1;
+                    if let Some(lp) = r.logprob_rows.pop_front() {
+                        let _ = r.tx.send(Event::Logprobs(lp));
+                    }
                     let _ = r.tx.send(Event::Token(tok));
                 }
                 true

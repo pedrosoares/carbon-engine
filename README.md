@@ -246,7 +246,9 @@ layers' value heads in a tiled order). The `mmproj` image tower is not loaded ye
 - **`--kv-dtype q8`** keeps each key / value vector as 256 int8 values and an f32 scale: half
   the memory and attention traffic of bf16. It is lossy: the text of a greedy run drifts from
   the bf16 run after a few sentences, and the greedy next token agrees with the bf16 cache on
-  245 of 250 prefixes of a 44k-token text (`scripts/next_token_agreement.py`). No benchmark-level
+  244 of 250 prefixes of a 44k-token text (`scripts/next_token_agreement.py`); all six changed
+  tokens were near-ties, and the KL divergence from the bf16 distribution averages 0.002 nats
+  (`turbo4`: 0.017). No benchmark-level
   quality evaluation has been done.
 - **`--kv-dtype turbo4`** is TurboQuant (Zandieh et al., arXiv 2504.19874) at 4 bits: keys and
   values are rotated by a fixed random orthogonal matrix and each coordinate is stored as an
@@ -494,7 +496,7 @@ each rank's cache holds only its experts. `GET /v1/cache/status` shows per-stage
 | Endpoint | |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI chat, streaming, tools (`tool_choice` none / auto / named), `reasoning_content`, `reasoning_effort`, `thinking`, `stream_options.include_usage`, `chat_template_kwargs` |
-| `POST /v1/completions` | text or token-id prompts |
+| `POST /v1/completions` | text or token-id prompts; `logprobs: N` (1-20, non-streaming) adds each output token's log-probability and the N most likely tokens, with their ids in `token_ids` / `top_token_ids` |
 | `POST /v1/responses` | OpenAI Responses (what codex speaks): `instructions`, input items incl. reasoning / function_call / function_call_output, function tools, `reasoning.effort`, typed streaming events. Stateless: `GET /v1/responses/{id}` and `/cancel` answer 404, `previous_response_id` is refused |
 | `GET /v1/models` | incl. `context_length`, `supported_reasoning_efforts`, `default_reasoning_effort` |
 | `POST /v1/messages` | Anthropic Messages: system, tool_use / tool_result, thinking, `output_config.effort`, streaming events with `ping` keep-alives; late system messages are kept in place or folded into the next user turn (`--anthropic-inline-system`, probed from the template) |

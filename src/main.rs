@@ -1021,6 +1021,7 @@ fn generate(mut a: GenerateArgs) -> Result<()> {
         let mut out = std::io::stdout();
         while let Some(ev) = rx.recv().await {
             match ev {
+                Event::Logprobs(_) => {}
                 Event::Token(t) => {
                     first.get_or_insert_with(|| t0.elapsed());
                     if let Some(d) = detok.step(&tok, t) {

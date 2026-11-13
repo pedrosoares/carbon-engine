@@ -360,7 +360,11 @@ pub async fn completions(
         }
     };
     let max = body.get("max_tokens").and_then(|x| x.as_u64()).or(Some(16));
-    let params = s.sampling(&body, max);
+    let mut params = s.sampling(&body, max);
+    // `logprobs: N` (the legacy completions field): each output token's log-probability and
+    // the N most likely tokens at its position; non-streaming responses only
+    params.logprobs = body.get("logprobs").and_then(|x| x.as_u64()).map_or(0, |n| n.clamp(1, 20) as usize);
+    let want_logprobs = params.logprobs > 0;
     let stops = stop_strings(body.get("stop"));
     s.log_request("/v1/completions", &body);
     let stream = body
@@ -416,6 +420,37 @@ pub async fn completions(
         return Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response());
+    }
+    if want_logprobs {
+        let mut gen = gen;
+        let mut text = String::new();
+        let (reason, usage) = loop {
+            match gen.next().await {
+                Some(Chunk::Text(t)) => text.push_str(&t),
+                Some(Chunk::Done { reason, usage, .. }) => break (reason, usage),
+                Some(Chunk::Error(e)) => return Err(ApiError::internal(e)),
+                None => return Err(ApiError::internal("generation ended unexpectedly")),
+            }
+        };
+        let piece = |t: u32| s.tok.decode(&[t], false);
+        let lps = gen.logprobs();
+        // token strings as OpenAI's format has them, plus ids (two tokens can share a string)
+        let logprobs = json!({
+            "tokens": lps.iter().map(|l| piece(l.token)).collect::<Vec<_>>(),
+            "token_ids": lps.iter().map(|l| l.token).collect::<Vec<_>>(),
+            "token_logprobs": lps.iter().map(|l| l.logprob).collect::<Vec<_>>(),
+            "top_logprobs": lps.iter().map(|l| l.top.iter().map(|(t, p)| (piece(*t), json!(p))).collect::<serde_json::Map<_, _>>()).collect::<Vec<_>>(),
+            "top_token_ids": lps.iter().map(|l| l.top.iter().map(|(t, p)| json!([t, p])).collect::<Vec<_>>()).collect::<Vec<_>>(),
+        });
+        return Ok(Json(json!({
+            "id": id,
+            "object": "text_completion",
+            "created": now_secs(),
+            "model": s.model_name,
+            "choices": [{"index": 0, "text": text, "finish_reason": finish_str(reason, false), "logprobs": logprobs}],
+            "usage": usage_json(&s, &usage),
+        }))
+        .into_response());
     }
     let (text, reason, usage, _) = gen.collect().await.map_err(ApiError::internal)?;
     Ok(Json(json!({
