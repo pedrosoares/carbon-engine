@@ -226,7 +226,11 @@ carbon serve --model ~/models/Qwen3.8-27B-Q4_K_M.gguf --devices cuda:0 --cuda-gr
 chat template come from its metadata (`src/gguf.rs`). Supported: architecture `qwen35` (dense
 Qwen3.5 / 3.6 / 3.8: 48 Gated DeltaNet + 16 full-attention layers at 27B), tensors stored F32 /
 F16 / BF16 / Q4_K / Q6_K, on one local GPU (no tensor parallelism: the file stores the linear
-layers' value heads in a tiled order). The `mmproj` image tower is not loaded yet.
+layers' value heads in a tiled order). Image input: a projector file
+(`mmproj-*.gguf`, type `qwen3vl_merger`) next to the model is loaded as the vision tower
+(`--mmproj FILE` names another one, `--mmproj none` or `--text-only` loads none); see
+[Images](#images). The tower takes about 0.6 GiB, which leaves the int8 KV cache at 246k tokens
+on a 32 GiB card: for the full 262,144 window use `--text-only` or `--kv-dtype turbo4`.
 
 - **Weights stay packed** (15.6 GiB). A decode step quantizes each projection's input to 8 bits
   per 32 values and multiplies it with the 4- / 6-bit codes in integer arithmetic: a dp4a kernel
@@ -529,6 +533,13 @@ cache keys image tokens by the image's content, so a conversation that resends a
 its KV. `/v1/stats` lists `image` in `input_modalities`; a model without a vision tower answers
 400. `--text-only` skips the tower (~0.9 GB in bf16 for Qwen3.8).
 
+GGUF models take images at 256 x 256 pixels' worth or more and at most 4096 tokens each
+(llama.cpp's cap; there is no preprocessor config to read). On Qwen3.8-27B Q4_K_M (RTX 5090) a
+640x480 image is 300 tokens and is encoded in 27 ms; the largest, 4032 tokens, takes 3.6 s. A
+snapshot is kept at the end of every image, so another question about the same image starts
+in 0.3 s. On three test images (shapes with a caption, eight lines of small text, a colour
+grid) the answers and prompt token counts equal llama.cpp's.
+
 On Qwen3.8-Flash-Next (RTX 5090, offloaded experts), a 640x480 image is 300 tokens and the first
 token comes after 2.1 s.
 
@@ -608,7 +619,7 @@ hardware yet, so treat it as unvalidated until you run the suite on your GPUs.
 ## Roadmap
 
 - Image input for Qwen3-VL; video input
-- MXFP4 weights; GGUF for more architectures and K-quants, and its `mmproj` image tower
+- MXFP4 weights; GGUF for more architectures and K-quants, other `mmproj` projector types
 - Prefill: fuse Qwen3.8's hyper-connection elementwise ops (~0.6 s of a 4096-token chunk)
 - MTP speculative decoding across several local GPUs
 - Micro-batched pipeline execution (overlap stages for different sequences)

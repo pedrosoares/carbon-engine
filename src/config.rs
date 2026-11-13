@@ -415,7 +415,7 @@ impl ModelConfig {
     /// `from_dir` with `--hf-overrides` applied to `config.json` first.
     pub fn from_dir_with(dir: &Path, overrides: Option<&Value>) -> Result<Self> {
         if let Some(file) = crate::gguf::find(dir) {
-            let mut v = crate::gguf::Gguf::open(&file)?.hf_config()?;
+            let mut v = crate::gguf::model_config(&file)?;
             if let Some(o) = overrides {
                 apply_overrides(&mut v, o)?;
             }

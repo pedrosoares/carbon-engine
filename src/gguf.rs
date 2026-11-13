@@ -233,7 +233,124 @@ pub fn find(model: &Path) -> Option<PathBuf> {
     (files.len() == 1).then(|| files.remove(0))
 }
 
+/// The projector file (`mmproj*.gguf`: the vision tower and its merger) that goes with model
+/// file `model`: the one named by `CARBON_MMPROJ` (`--mmproj`; `none` for no image input), or
+/// the only `mmproj*.gguf` next to the model.
+pub fn find_mmproj(model: &Path) -> Option<PathBuf> {
+    match std::env::var("CARBON_MMPROJ") {
+        Ok(p) if p == "none" => return None,
+        Ok(p) if !p.is_empty() => return Some(PathBuf::from(p)),
+        _ => {}
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(model.parent()?)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")))
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("mmproj")))
+        .collect();
+    files.sort();
+    (files.len() == 1).then(|| files.remove(0))
+}
+
+/// The HF `config.json` of model file `file`, with the `vision_config` of its projector file
+/// when there is one.
+pub fn model_config(file: &Path) -> Result<Value> {
+    let main = Gguf::open(file)?;
+    let mut v = main.hf_config()?;
+    if let Some(mm) = find_mmproj(file) {
+        let proj = Gguf::open(&mm)?;
+        let vision = proj.vision_config().with_context(|| format!("projector {}", mm.display()))?;
+        let hidden = v["hidden_size"].as_u64();
+        if vision["out_hidden_size"].as_u64() != hidden {
+            bail!("projector {} outputs {} values per token, the model takes {:?}", mm.display(), vision["out_hidden_size"], hidden);
+        }
+        let ids = ["<|image_pad|>", "<|vision_start|>", "<|vision_end|>"].map(|t| main.token_id(t));
+        if let [Some(image), Some(start), Some(end)] = ids {
+            v["vision_config"] = vision;
+            v["image_token_id"] = json!(image);
+            v["vision_start_token_id"] = json!(start);
+            v["vision_end_token_id"] = json!(end);
+        } else {
+            tracing::warn!("{} has no image tokens in its vocabulary: projector {} ignored", file.display(), mm.display());
+        }
+    }
+    Ok(v)
+}
+
+/// The HF vision-tower name of projector tensor `name` (`qwen3vl_merger` files). The two
+/// temporal slices of the patch embedding are joined by [`GgufSource`].
+fn hf_vision_name(name: &str) -> Option<String> {
+    const V: &str = "model.visual";
+    Some(match name {
+        "v.patch_embd.weight" => format!("{V}.patch_embed.proj.weight"),
+        "v.patch_embd.weight.1" => return None,
+        "v.patch_embd.bias" => format!("{V}.patch_embed.proj.bias"),
+        "v.position_embd.weight" => format!("{V}.pos_embed.weight"),
+        "v.post_ln.weight" => format!("{V}.merger.norm.weight"),
+        "v.post_ln.bias" => format!("{V}.merger.norm.bias"),
+        "mm.0.weight" => format!("{V}.merger.linear_fc1.weight"),
+        "mm.0.bias" => format!("{V}.merger.linear_fc1.bias"),
+        "mm.2.weight" => format!("{V}.merger.linear_fc2.weight"),
+        "mm.2.bias" => format!("{V}.merger.linear_fc2.bias"),
+        _ => {
+            let (idx, tail) = name.strip_prefix("v.blk.")?.split_once('.')?;
+            let idx: usize = idx.parse().ok()?;
+            let (part, kind) = tail.rsplit_once('.')?;
+            let sub = match part {
+                "ln1" => "norm1",
+                "ln2" => "norm2",
+                "attn_qkv" => "attn.qkv",
+                "attn_out" => "attn.proj",
+                "ffn_up" => "mlp.linear_fc1",
+                "ffn_down" => "mlp.linear_fc2",
+                _ => return None,
+            };
+            if !matches!(kind, "weight" | "bias") {
+                return None;
+            }
+            format!("{V}.blocks.{idx}.{sub}.{kind}")
+        }
+    })
+}
+
 impl Gguf {
+    /// A projector file's tower as an HF `vision_config` (`clip.*` metadata).
+    pub fn vision_config(&self) -> Result<Value> {
+        let proj = self.meta.get("clip.projector_type").and_then(Meta::as_str).unwrap_or("");
+        if self.arch() != "clip" || proj != "qwen3vl_merger" {
+            bail!("projector type '{proj}' (architecture '{}') is not supported (supported: qwen3vl_merger)", self.arch());
+        }
+        if self.meta.get("clip.vision.is_deepstack_layers").and_then(Meta::as_array).is_some_and(|a| a.iter().any(|x| matches!(x, Meta::B(true)))) {
+            bail!("projectors with deepstack layers are not supported");
+        }
+        let n = |k: &str| self.usize_key(&format!("vision.{k}"));
+        let table = self.tensors.get("v.position_embd.weight").context("no v.position_embd.weight")?;
+        Ok(json!({
+            "depth": n("block_count")?,
+            "hidden_size": n("embedding_length")?,
+            "num_heads": n("attention.head_count")?,
+            "intermediate_size": n("feed_forward_length")?,
+            // ggml's GELU is the tanh form
+            "hidden_act": "gelu_pytorch_tanh",
+            "in_channels": 3,
+            "patch_size": n("patch_size")?,
+            "temporal_patch_size": if self.tensors.contains_key("v.patch_embd.weight.1") { 2 } else { 1 },
+            "spatial_merge_size": n("spatial_merge_size").unwrap_or(2),
+            "num_position_embeddings": table.shape[0],
+            "out_hidden_size": n("projection_dim")?,
+            "image_mean": self.f32_list("clip.vision.image_mean"),
+            "image_std": self.f32_list("clip.vision.image_std"),
+        }))
+    }
+
+    fn f32_list(&self, key: &str) -> Vec<f64> {
+        self.meta
+            .get(key)
+            .and_then(Meta::as_array)
+            .map(|a| a.iter().filter_map(Meta::as_f64).map(|x| (x * 1e6).round() / 1e6).collect())
+            .unwrap_or_default()
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         // SAFETY: mapped read-only; the checkpoint is not modified while serving
@@ -603,6 +720,8 @@ pub struct GgufSource {
     gguf: Gguf,
     /// HF name -> GGUF name
     names: HashMap<String, String>,
+    /// The projector file and its HF name -> GGUF name map (`model.visual.*`).
+    vision: Option<(Gguf, HashMap<String, String>)>,
 }
 
 impl GgufSource {
@@ -621,7 +740,52 @@ impl GgufSource {
                 None => tracing::warn!("GGUF tensor '{name}' has no known role, ignored"),
             }
         }
-        Ok(Self { gguf, names })
+        let vision = match find_mmproj(path) {
+            Some(mm) => {
+                let proj = Gguf::open(&mm)?;
+                let mut map = HashMap::with_capacity(proj.tensors.len());
+                for name in proj.tensors.keys() {
+                    match hf_vision_name(name) {
+                        Some(hf) => {
+                            map.insert(hf, name.clone());
+                        }
+                        None if name == "v.patch_embd.weight.1" => {}
+                        None => tracing::warn!("projector tensor '{name}' has no known role, ignored"),
+                    }
+                }
+                Some((proj, map))
+            }
+            None => None,
+        };
+        Ok(Self { gguf, names, vision })
+    }
+
+    /// A projector tensor (`model.visual.*`) as stored; the patch embedding's temporal slices
+    /// `[hidden, C, P, P]` are joined into the Conv3d weight `[hidden, C, T, P, P]`.
+    fn load_vision(&self, name: &str) -> Result<Tensor> {
+        let (proj, map) = self.vision.as_ref().context("no projector file")?;
+        let g = map.get(name).ok_or_else(|| anyhow!("weight '{name}' is not in the projector file"))?;
+        let info = &proj.tensors[g];
+        let data = plain_f32(proj.bytes(info), info.ty).with_context(|| format!("projector tensor '{g}'"))?;
+        if g == "v.patch_embd.weight" {
+            if let Some(second) = proj.tensors.get("v.patch_embd.weight.1") {
+                let &[h, c, p, q] = info.shape.as_slice() else {
+                    bail!("projector patch embedding has shape {:?}", info.shape);
+                };
+                if second.shape != info.shape {
+                    bail!("projector patch embedding slices differ in shape");
+                }
+                let other = plain_f32(proj.bytes(second), second.ty)?;
+                let plane = p * q;
+                let mut joined = Vec::with_capacity(2 * data.len());
+                for (a, b) in data.chunks_exact(plane).zip(other.chunks_exact(plane)) {
+                    joined.extend_from_slice(a);
+                    joined.extend_from_slice(b);
+                }
+                return Ok(Tensor::from_vec(joined, (h, c, 2, p, q), &Device::Cpu)?);
+            }
+        }
+        Ok(Tensor::from_vec(data, info.shape.as_slice(), &Device::Cpu)?)
     }
 
     fn info(&self, name: &str) -> Result<&TensorInfo> {
@@ -630,8 +794,21 @@ impl GgufSource {
     }
 }
 
+/// The values of an unquantized tensor.
+fn plain_f32(bytes: &[u8], ty: GgmlType) -> Result<Vec<f32>> {
+    Ok(match ty {
+        GgmlType::F32 => bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+        GgmlType::F16 => bytes.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+        GgmlType::Bf16 => bytes.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+        GgmlType::Q4K | GgmlType::Q6K => bail!("quantized projector tensors are not supported"),
+    })
+}
+
 impl WeightSource for GgufSource {
     fn load_raw(&self, name: &str) -> Result<Tensor> {
+        if name.starts_with("model.visual.") {
+            return self.load_vision(name);
+        }
         let info = self.info(name)?;
         let bytes = self.gguf.bytes(info);
         let n = info.elems();
@@ -691,11 +868,11 @@ impl WeightSource for GgufSource {
     }
 
     fn contains(&self, name: &str) -> bool {
-        self.names.contains_key(name)
+        self.names.contains_key(name) || self.vision.as_ref().is_some_and(|(_, m)| m.contains_key(name))
     }
 
     fn names(&self) -> Vec<String> {
-        self.names.keys().cloned().collect()
+        self.names.keys().chain(self.vision.iter().flat_map(|(_, m)| m.keys())).cloned().collect()
     }
 }
 
@@ -900,5 +1077,17 @@ mod tests {
         assert_eq!(hf_name("blk.64.ffn_up.weight", 64).unwrap(), "mtp.layers.0.mlp.up_proj.weight");
         assert_eq!(hf_name("blk.64.nextn.eh_proj.weight", 64).unwrap(), "mtp.fc.weight");
         assert!(hf_name("blk.0.unknown", 64).is_none());
+    }
+
+    #[test]
+    fn maps_projector_names() {
+        let v = |n: &str| hf_vision_name(n);
+        assert_eq!(v("v.blk.12.attn_qkv.weight").unwrap(), "model.visual.blocks.12.attn.qkv.weight");
+        assert_eq!(v("v.blk.0.ln2.bias").unwrap(), "model.visual.blocks.0.norm2.bias");
+        assert_eq!(v("v.blk.3.ffn_up.bias").unwrap(), "model.visual.blocks.3.mlp.linear_fc1.bias");
+        assert_eq!(v("mm.2.weight").unwrap(), "model.visual.merger.linear_fc2.weight");
+        assert_eq!(v("v.post_ln.weight").unwrap(), "model.visual.merger.norm.weight");
+        assert!(v("v.patch_embd.weight.1").is_none());
+        assert!(v("v.blk.0.unknown.weight").is_none());
     }
 }

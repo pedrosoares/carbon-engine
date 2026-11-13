@@ -736,6 +736,12 @@ impl Scheduler {
                 let boundary = r.prompt_len - 1;
                 if self.hybrid && self.prefix_cache && r.slots.len() < boundary {
                     chunk = chunk.min(boundary - r.slots.len());
+                    // and at the end of an image: a later prompt with the same image and a
+                    // different question then resumes after it instead of encoding it again
+                    let done = r.slots.len();
+                    if let Some(end) = r.images.iter().map(|im| im.span.start + im.span.len).filter(|&e| e > done).min() {
+                        chunk = chunk.min(end - done);
+                    }
                 }
                 budget -= chunk;
                 chosen.push((i, chunk));

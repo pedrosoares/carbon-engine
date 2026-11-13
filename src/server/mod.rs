@@ -992,9 +992,11 @@ pub async fn with_images(
                     "image {i}: expected a data: or http(s) URL or base64 image data"
                 )));
             };
+            let t0 = Instant::now();
             let img = bytes
                 .and_then(|b| proc.prepare(&b))
                 .map_err(|e| ApiError::bad_request(format!("image {i}: {e:#}")))?;
+            tracing::debug!("image {i} prepared in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
             images.push(img);
         }
         crate::images::expand_image_tokens(&ids, image_id, images, proc.merge_size)

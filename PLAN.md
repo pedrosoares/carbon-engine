@@ -498,6 +498,31 @@ element-wise ops 17%. After it (5.9 s): GEMMs 66%, recurrence 12%, attention 8%,
   everything (26 s again at 32k; LM Studio 0.9 s): recurrent-state snapshots only exist at the
   end of earlier prompts. Periodic snapshots during prefill would fix it (151 MB each).
 
+### Phase 7: image input (done)
+
+- `gguf::find_mmproj`: the only `mmproj*.gguf` next to the model, or `--mmproj FILE | none`
+  (`CARBON_MMPROJ`). `Gguf::vision_config` turns its `clip.*` metadata into an HF
+  `vision_config` (projector type `qwen3vl_merger`, no deepstack layers); the image token ids
+  come from the model file's vocabulary. `GgufSource` serves the projector's tensors under the
+  HF tower names (`hf_vision_name`), joining the patch embedding's two temporal slices into the
+  Conv3d weight. Nothing else changed: the tower, preprocessing and mRoPE path already existed.
+- Image limits without a preprocessor config: at least 256 x 256 pixels' worth (the Qwen3
+  processor's minimum), at most 4096 tokens (llama.cpp's cap).
+- Against llama.cpp (`llama-server --mmproj`, same files, temperature 0), three generated
+  images: a caption with three shapes (both describe it correctly, in different words), eight
+  lines of text down to 16 px (identical transcription, all correct), a 3 x 4 colour grid
+  (identical, all correct). Prompt token counts equal on all three (291, 481, 352). I did not
+  compare the tower's output numerically.
+- Also correct with `--kv-dtype q8` and `turbo4`, MTP and CUDA graphs on, two images in one
+  prompt, and a 2688 x 1536 image (4032 tokens).
+- Vision attention: the score scale folded into q and candle's single-kernel softmax: a
+  4032-token image 7.0 -> 3.6 s, a 448-token one 111 -> 50 ms.
+- A prefill chunk now also ends at the end of an image, which leaves a state snapshot there:
+  another question about the same image resumes after it (8.6 s -> 0.3 s; with two images the
+  first is reused when the second differs).
+- Memory: the tower takes about 0.6 GiB; the auto-sized q8 pool is then 246,354 tokens (under
+  the 262,144 window; the startup warning names `--text-only`), turbo4 485,243.
+
 ### Tests
 
 - `cargo test --release`: 111 pass (72 unit, 25 parallel, 4 real_configs, 4 server, 6 vision).
@@ -523,4 +548,4 @@ element-wise ops 17%. After it (5.9 s): GEMMs 66%, recurrence 12%, attention 8%,
    pool-smaller-than-context warning are done, see phase 5 update 5).
 5. Plain decode (65 vs 73, see phase 3 update 2): no approach left that I expect to work; the
    weight read has been through six variants.
-4. Phase 6 sweep and README; phase 7 image input.
+4. Phase 6 sweep and README.

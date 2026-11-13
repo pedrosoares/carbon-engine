@@ -353,8 +353,8 @@ impl Engine {
             let hint = if ec.kv_tokens.is_some() {
                 "raise --kv-tokens or lower --max-seq-len"
             } else {
-                "lower --max-seq-len, or free device memory: --kv-dtype q8 / turbo4, a smaller \
-                 --max-prefill-tokens, fewer --state-snapshots"
+                "lower --max-seq-len, or free device memory: --kv-dtype q8 / turbo4, --text-only \
+                 (no vision tower), a smaller --max-prefill-tokens, fewer --state-snapshots"
             };
             tracing::warn!(
                 "the kv cache holds {num_slots} tokens, less than the max context {max_seq_len}: \
@@ -451,7 +451,13 @@ impl Engine {
         let tower = self.vision.as_ref().context("this server has no vision tower")?;
         let n = img.grid.0 * img.grid.1 * img.grid.2;
         let pixels = Tensor::from_slice(&img.pixels, (n, img.pixels.len() / n.max(1)), &tower.device)?;
-        Ok(tower.forward(&pixels, img.grid)?.to_device(&self.head.device)?.to_dtype(self.dtype)?)
+        let t0 = std::time::Instant::now();
+        let out = tower.forward(&pixels, img.grid)?.to_device(&self.head.device)?.to_dtype(self.dtype)?;
+        // (the copy back makes the timing include the tower's queued work)
+        let tokens = out.dim(0)?;
+        out.narrow(0, 0, 1)?.to_dtype(candle_core::DType::F32)?.to_vec2::<f32>()?;
+        tracing::info!("image encoded: {tokens} tokens ({:?} patches) in {:.0} ms", img.grid, t0.elapsed().as_secs_f64() * 1e3);
+        Ok(out)
     }
 
     /// Start reading the PLE table rows `tokens` (following `prev`, model token ids) will need, in

@@ -60,9 +60,17 @@ impl ImageProcessor {
                 .map(|a| std::array::from_fn(|i| a[i].as_f64().unwrap_or(0.5) as f32))
                 .unwrap_or([0.5; 3])
         };
+        // GGUF models come without a preprocessor config: the Qwen3 processor's smallest image
+        // (256 x 256 pixels' worth) and llama.cpp's cap of 4096 image tokens
+        let token_pixels = (vision.patch_size * vision.spatial_merge_size).pow(2);
+        let (min_default, max_default) = if crate::gguf::find(model_dir).is_some() {
+            (256 * 256, 4096 * token_pixels)
+        } else {
+            (56 * 56, 28 * 28 * 1280)
+        };
         Self {
-            min_pixels: edge("shortest_edge").or_else(|| get("min_pixels")).unwrap_or(56 * 56),
-            max_pixels: edge("longest_edge").or_else(|| get("max_pixels")).unwrap_or(28 * 28 * 1280),
+            min_pixels: edge("shortest_edge").or_else(|| get("min_pixels")).unwrap_or(min_default),
+            max_pixels: edge("longest_edge").or_else(|| get("max_pixels")).unwrap_or(max_default),
             patch_size: get("patch_size").unwrap_or(vision.patch_size),
             temporal_patch_size: get("temporal_patch_size").unwrap_or(vision.temporal_patch_size),
             merge_size: get("merge_size").unwrap_or(vision.spatial_merge_size),

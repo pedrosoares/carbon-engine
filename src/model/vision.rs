@@ -15,7 +15,7 @@ use super::layers::Placement;
 use crate::config::VisionConfig;
 use crate::weights::WeightSource;
 use anyhow::{bail, Result};
-use candle_core::{DType, Device, Module, Tensor, D};
+use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{LayerNorm, Linear};
 
 const PREFIX: &str = "model.visual";
@@ -207,18 +207,19 @@ impl VisionTower {
             let rot = Tensor::cat(&[t.narrow(2, d / 2, d / 2)?.neg()?, t.narrow(2, 0, d / 2)?], 2)?;
             Ok((t.broadcast_mul(&c)? + rot.broadcast_mul(&s)?)?)
         };
-        let q = rope(qkv.narrow(1, 0, 1)?.squeeze(1)?)?.transpose(0, 1)?.contiguous()?; // [nh, n, d]
+        let scale = (d as f64).powf(-0.5);
+        // the score scale goes into q: one pass less over every score tile
+        let q = (rope(qkv.narrow(1, 0, 1)?.squeeze(1)?)? * scale)?.transpose(0, 1)?.contiguous()?; // [nh, n, d]
         let k = rope(qkv.narrow(1, 1, 1)?.squeeze(1)?)?.transpose(0, 1)?.contiguous()?;
         let v = qkv.narrow(1, 2, 1)?.squeeze(1)?.to_dtype(DType::F32)?.transpose(0, 1)?.contiguous()?;
         let kt = k.t()?.contiguous()?;
-        let scale = (d as f64).powf(-0.5);
         let tile = (SCORE_BUDGET / (nh * n).max(1)).clamp(1, n);
         let mut outs = Vec::with_capacity(n.div_ceil(tile));
         let mut a = 0;
         while a < n {
             let len = tile.min(n - a);
-            let s = (q.narrow(1, a, len)?.matmul(&kt)? * scale)?;
-            let p = candle_nn::ops::softmax(&s, D::Minus1)?;
+            let s = q.narrow(1, a, len)?.matmul(&kt)?;
+            let p = candle_nn::ops::softmax_last_dim(&s)?;
             outs.push(p.matmul(&v)?); // [nh, len, d]
             a += len;
         }

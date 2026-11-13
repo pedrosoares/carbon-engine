@@ -210,6 +210,10 @@ struct EngineArgs {
     /// Qwen3.6 / 3.8) goes to the KV and expert caches.
     #[arg(long)]
     text_only: bool,
+    /// GGUF models: the projector file with the vision tower (`mmproj-*.gguf`). Default: the
+    /// only `mmproj*.gguf` next to the model file; `none` for no image input.
+    #[arg(long, env = "CARBON_MMPROJ")]
+    mmproj: Option<String>,
 }
 
 impl EngineArgs {
@@ -221,6 +225,10 @@ impl EngineArgs {
     }
 
     fn engine_config(&self) -> Result<EngineConfig> {
+        // the GGUF loader finds the projector through the environment
+        if let Some(m) = &self.mmproj {
+            std::env::set_var("CARBON_MMPROJ", m);
+        }
         let layer_split = if self.layer_split.trim().is_empty() {
             vec![]
         } else {
