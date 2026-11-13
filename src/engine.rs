@@ -55,8 +55,8 @@ pub struct EngineConfig {
     /// With more than two drafts per step: the head keeps drafting while its last draft's
     /// probability is at least this (`--mtp-min-prob`).
     pub mtp_min_prob: f32,
-    /// KV pools on CUDA as int8 with a scale per vector (`--kv-dtype q8`).
-    pub kv_q8: bool,
+    /// Format of the KV pools on CUDA devices (`--kv-dtype`).
+    pub kv_format: crate::kvcache::KvFormat,
     /// Skip the checkpoint's vision tower (no image input, its VRAM left to the caches).
     pub text_only: bool,
 }
@@ -84,7 +84,7 @@ impl EngineConfig {
             mtp_speculate: false,
             mtp_drafts: 1,
             mtp_min_prob: 0.6,
-            kv_q8: false,
+            kv_format: Default::default(),
             text_only: false,
         }
     }
@@ -188,7 +188,7 @@ impl Engine {
             && ec.tp_size == 1
             && ec.rpc_workers.is_empty()
             && ec.devices[0].starts_with("cuda");
-        crate::kvcache::set_kv_q8(ec.kv_q8);
+        crate::kvcache::set_kv_format(ec.kv_format);
         #[cfg(feature = "cuda")]
         crate::kernels::cuda::allow_paged_shared_tables(
             // only the tensor-core decode kernels read shared tables (and QSA's selection kernel

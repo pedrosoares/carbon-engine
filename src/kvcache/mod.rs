@@ -12,39 +12,159 @@ use candle_core::{DType, Device, Tensor};
 pub use allocator::SlotAllocator;
 pub use radix::RadixCache;
 
-static KV_Q8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How KV pools on CUDA devices store keys and values (`--kv-dtype`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvFormat {
+    /// The activation dtype.
+    #[default]
+    Model,
+    /// int8 with an f32 scale per vector: half the memory and attention traffic of bf16.
+    Q8,
+    /// TurboQuant at 4 bits: vectors rotated by a random orthogonal matrix, each coordinate an
+    /// index into the 16-level Lloyd-Max codebook of a Gaussian, an f32 scale per vector. A
+    /// quarter of bf16.
+    Turbo4,
+}
+
+impl KvFormat {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "model" | "auto" => Self::Model,
+            "q8" | "int8" => Self::Q8,
+            "turbo4" | "turboquant" | "tq4" => Self::Turbo4,
+            _ => return None,
+        })
+    }
+
+    /// Bytes of one stored vector of `head_dim` values whose activations are `dtype`.
+    pub fn vector_bytes(self, head_dim: usize, dtype: DType) -> usize {
+        match self {
+            Self::Model => head_dim * dtype.size_in_bytes(),
+            Self::Q8 => head_dim + Q8_PAD,
+            Self::Turbo4 => head_dim / 2 + TQ_PAD,
+        }
+    }
+}
+
+static KV_FORMAT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Bytes after each int8 KV vector: its f32 scale (`Q8_PAD` in attention_tc.cu).
 pub const Q8_PAD: usize = 4;
+/// Bytes after each TurboQuant vector: its f32 scale (`TQ_PAD` in attention_tc.cu).
+pub const TQ_PAD: usize = 4;
 
-/// Keep KV pools on CUDA devices as int8 with a scale per vector (`--kv-dtype q8`): half the
-/// memory and half the attention traffic of bf16. Set before the pools are allocated.
-pub fn set_kv_q8(on: bool) {
-    KV_Q8.store(on, std::sync::atomic::Ordering::Relaxed);
+/// The format of KV pools on CUDA devices. Set before the pools are allocated.
+pub fn set_kv_format(f: KvFormat) {
+    KV_FORMAT.store(f as u8, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub fn kv_q8() -> bool {
-    KV_Q8.load(std::sync::atomic::Ordering::Relaxed)
+pub fn kv_format() -> KvFormat {
+    match KV_FORMAT.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => KvFormat::Q8,
+        2 => KvFormat::Turbo4,
+        _ => KvFormat::Model,
+    }
+}
+
+/// The format a pool on `device` gets: the packed ones are read by the CUDA kernels only.
+fn format_on(device: &Device) -> KvFormat {
+    if device.is_cuda() {
+        kv_format()
+    } else {
+        KvFormat::Model
+    }
 }
 
 /// Bytes one token's K and V take in one layer's pool on `device`.
 pub fn kv_layer_bytes(kv_heads: usize, head_dim: usize, dtype: DType, device: &Device) -> usize {
-    if kv_q8() && device.is_cuda() {
-        2 * kv_heads * (head_dim + Q8_PAD)
+    2 * kv_heads * format_on(device).vector_bytes(head_dim, dtype)
+}
+
+/// The 16-level Lloyd-Max quantizer of N(0, 1) that TurboQuant pools use (`tq4_centroid` /
+/// `tq4_code` in attention_tc.cu): the positive centroids and the boundaries between them.
+pub const TQ4_CENTROIDS: [f32; 8] = [0.128395, 0.388048, 0.656759, 0.942340, 1.256231, 1.618046, 2.069017, 2.732590];
+pub const TQ4_BOUNDS: [f32; 7] = [0.258222, 0.522404, 0.799550, 1.099286, 1.437139, 1.843532, 2.400803];
+
+/// Factor on a stored vector's scale: a Lloyd-Max reconstruction has `1 - MSE` of the inner
+/// product with its original, so plain centroids would bias scores and outputs low.
+pub const TQ4_UNBIAS: f32 = 1.009592;
+
+/// Centroid of code `c` (0..16).
+pub fn tq4_centroid(c: u8) -> f32 {
+    if c >= 8 {
+        TQ4_CENTROIDS[c as usize - 8]
     } else {
-        2 * kv_heads * head_dim * dtype.size_in_bytes()
+        -TQ4_CENTROIDS[7 - c as usize]
     }
 }
 
-/// KV tensors for one layer on one device: `[num_slots, kv_heads * head_dim]` each, or with
-/// `q8` U8 `[num_slots, kv_heads * (head_dim + 4)]` (int8 values, then the vector's f32 scale).
+/// Code of a value in units of the vector's scale.
+pub fn tq4_code(u: f32) -> u8 {
+    let m = TQ4_BOUNDS.iter().filter(|b| u.abs() > **b).count() as u8;
+    if u >= 0.0 {
+        8 + m
+    } else {
+        7 - m
+    }
+}
+
+/// A `d x d` orthogonal matrix, the same for a given `d` and `seed` everywhere (snapshots and
+/// restarts must agree): Gaussian entries, orthonormalised row by row.
+pub fn random_rotation(d: usize, seed: u64) -> Vec<f64> {
+    let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+    let mut uniform = move || {
+        // splitmix64
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut m = vec![0f64; d * d];
+    for x in m.iter_mut() {
+        // Box-Muller
+        let (u1, u2) = (uniform().max(1e-300), uniform());
+        *x = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+    }
+    for i in 0..d {
+        // twice: the second pass removes what rounding left of the first
+        for _ in 0..2 {
+            for j in 0..i {
+                let dot: f64 = (0..d).map(|c| m[i * d + c] * m[j * d + c]).sum();
+                for c in 0..d {
+                    m[i * d + c] -= dot * m[j * d + c];
+                }
+            }
+        }
+        let norm = (0..d).map(|c| m[i * d + c] * m[i * d + c]).sum::<f64>().sqrt();
+        for c in 0..d {
+            m[i * d + c] /= norm;
+        }
+    }
+    m
+}
+
+/// The rotation of a TurboQuant pool as two `[d, d]` tensors: `x.matmul(to)` rotates row
+/// vectors, `y.matmul(back)` rotates them back. One matrix per head dim for the whole engine.
+fn turbo_rotation(d: usize, dtype: DType, device: &Device) -> Result<(Tensor, Tensor)> {
+    let m: Vec<f32> = random_rotation(d, 0x7475_7262_6f34).into_iter().map(|x| x as f32).collect();
+    let back = Tensor::from_vec(m, (d, d), &Device::Cpu)?; // rows are the rotation's rows
+    let to = back.t()?.contiguous()?;
+    Ok((to.to_dtype(dtype)?.to_device(device)?, back.to_dtype(dtype)?.to_device(device)?))
+}
+
+/// KV tensors for one layer on one device: `[num_slots, kv_heads * head_dim]` each in the
+/// activation dtype, or U8 `[num_slots, kv_heads * vector_bytes]` for the packed formats.
 pub struct LayerKv {
     pub k: Tensor,
     pub v: Tensor,
     /// The activations' dtype: what attention reads the pools as.
     pub dtype: DType,
-    /// The pools hold int8 vectors with scales (CUDA only, read by the tensor-core kernels).
-    pub q8: bool,
+    /// How the pools store vectors; anything but `Model` is read by the CUDA kernels only.
+    pub fmt: KvFormat,
+    /// TurboQuant: the rotation stored vectors went through, as (`to`, `back`) `[d, d]`
+    /// matrices in the activation dtype. Queries take `to`, attention outputs `back`.
+    pub rot: Option<(Tensor, Tensor)>,
     /// Per-token indexer keys `[slots, index_dim]` (QSA sparse attention layers only).
     pub idx: Option<Tensor>,
 }
@@ -57,33 +177,72 @@ impl LayerKv {
         dtype: DType,
         device: &Device,
     ) -> Result<Self> {
-        let q8 = kv_q8() && device.is_cuda();
-        let (shape, pool_dtype) = if q8 {
-            ((num_slots, kv_heads * (head_dim + Q8_PAD)), DType::U8)
-        } else {
-            ((num_slots, kv_heads * head_dim), dtype)
+        let fmt = format_on(device);
+        let (shape, pool_dtype) = match fmt {
+            KvFormat::Model => ((num_slots, kv_heads * head_dim), dtype),
+            _ => ((num_slots, kv_heads * fmt.vector_bytes(head_dim, dtype)), DType::U8),
+        };
+        let rot = match fmt {
+            KvFormat::Turbo4 => Some(turbo_rotation(head_dim, dtype, device)?),
+            _ => None,
         };
         Ok(Self {
             k: Tensor::zeros(shape, pool_dtype, device)?,
             v: Tensor::zeros(shape, pool_dtype, device)?,
             dtype,
-            q8,
+            fmt,
+            rot,
             idx: None,
         })
+    }
+
+    /// Whether the pools hold packed vectors (not readable as activations).
+    pub fn packed(&self) -> bool {
+        self.fmt != KvFormat::Model
+    }
+
+    /// Queries `[n, heads, head_dim]` in the space the pool's vectors are stored in.
+    pub fn rotate_queries(&self, q: &Tensor) -> Result<Tensor> {
+        match &self.rot {
+            Some((to, _)) => {
+                let (n, h, d) = q.dims3()?;
+                Ok(q.reshape((n * h, d))?.matmul(to)?.reshape((n, h, d))?)
+            }
+            None => Ok(q.clone()),
+        }
+    }
+
+    /// Attention outputs `[n, heads, head_dim]` (sums of stored values) back in model space.
+    pub fn unrotate_outputs(&self, o: &Tensor) -> Result<Tensor> {
+        match &self.rot {
+            Some((_, back)) => {
+                let (n, h, d) = o.dims3()?;
+                Ok(o.reshape((n * h, d))?.matmul(back)?.reshape((n, h, d))?)
+            }
+            None => Ok(o.clone()),
+        }
     }
 
     /// Store the new tokens' keys and values `[T, kv_heads * head_dim]` in the slots of
     /// `scatter_idx` (`[T, kv_heads * head_dim]` u32, every element of a row its slot).
     pub fn write(&self, scatter_idx: &Tensor, k: &Tensor, v: &Tensor, kv_heads: usize) -> Result<()> {
-        if self.q8 {
+        if self.packed() {
             #[cfg(feature = "cuda")]
             {
-                crate::kernels::cuda::kv_q8_write(&k.to_dtype(self.dtype)?, &self.k, scatter_idx, kv_heads)?;
-                crate::kernels::cuda::kv_q8_write(&v.to_dtype(self.dtype)?, &self.v, scatter_idx, kv_heads)?;
+                use crate::kernels::cuda::kv_packed_write;
+                for (x, pool) in [(k, &self.k), (v, &self.v)] {
+                    let mut x = x.to_dtype(self.dtype)?;
+                    if let Some((to, _)) = &self.rot {
+                        let (t, width) = x.dims2()?;
+                        let d = width / kv_heads;
+                        x = x.reshape((t * kv_heads, d))?.matmul(to)?.reshape((t, width))?;
+                    }
+                    kv_packed_write(&x, pool, scatter_idx, kv_heads, self.fmt)?;
+                }
                 return Ok(());
             }
             #[cfg(not(feature = "cuda"))]
-            anyhow::bail!("int8 KV pools need the cuda build");
+            anyhow::bail!("packed KV pools need the cuda build");
         }
         let _ = kv_heads;
         self.k.scatter_set(scatter_idx, &k.to_dtype(self.dtype)?.contiguous()?, 0)?;
@@ -96,5 +255,55 @@ impl LayerKv {
         let n = self.k.dim(0)?;
         self.idx = Some(Tensor::zeros((n, index_dim), self.dtype, self.k.device())?);
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotation_is_orthogonal_and_reproducible() {
+        let d = 64;
+        let m = random_rotation(d, 7);
+        assert_eq!(m, random_rotation(d, 7));
+        for i in 0..d {
+            for j in 0..d {
+                let dot: f64 = (0..d).map(|c| m[i * d + c] * m[j * d + c]).sum();
+                assert!((dot - if i == j { 1.0 } else { 0.0 }).abs() < 1e-12, "rows {i}, {j}: {dot}");
+            }
+        }
+    }
+
+    /// The codebook is a fixed point of Lloyd's iteration on N(0, 1) (each centroid is the mean
+    /// of its cell) and its distortion is the 0.0095 the TurboQuant paper gives for 4 bits.
+    #[test]
+    fn tq4_codebook_is_lloyd_max() {
+        let pdf = |x: f64| (-x * x / 2.0).exp() / (std::f64::consts::TAU).sqrt();
+        let mut edges = vec![0.0f64];
+        edges.extend(TQ4_BOUNDS.iter().map(|b| *b as f64));
+        edges.push(12.0);
+        let mut mse = 0.0;
+        for (i, c) in TQ4_CENTROIDS.iter().enumerate() {
+            let (a, b, n) = (edges[i], edges[i + 1], 200_000);
+            let h = (b - a) / n as f64;
+            let (mut mass, mut mean, mut err) = (0.0, 0.0, 0.0);
+            for k in 0..n {
+                let x = a + (k as f64 + 0.5) * h;
+                mass += pdf(x) * h;
+                mean += x * pdf(x) * h;
+                err += (x - *c as f64).powi(2) * pdf(x) * h;
+            }
+            assert!((mean / mass - *c as f64).abs() < 2e-5, "centroid {i}: {} vs {c}", mean / mass);
+            mse += 2.0 * err;
+        }
+        assert!((mse - 0.009501).abs() < 1e-5, "mse {mse}");
+        // codes and centroids agree, and boundaries sit halfway between centroids
+        for c in 0..16u8 {
+            assert_eq!(tq4_code(tq4_centroid(c)), c);
+        }
+        for (i, b) in TQ4_BOUNDS.iter().enumerate() {
+            assert!((b - (TQ4_CENTROIDS[i] + TQ4_CENTROIDS[i + 1]) / 2.0).abs() < 2e-6);
+        }
     }
 }

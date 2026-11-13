@@ -978,10 +978,10 @@ impl CustomOp3 for PagedDecode {
         let (b, h, d) = ql.shape().dims3()?;
         let kvh = self.kv_heads;
         let dtype = q.dtype();
-        // int8 pools: D int8 + an f32 scale per vector, read by the tensor-core kernel only
-        let q8 = k.dtype() == DType::U8;
-        let width = if q8 { kvh * (d + crate::kvcache::Q8_PAD) } else { kvh * d };
-        if kl.shape() != vl.shape() || kl.shape().dims2()?.1 != width {
+        // packed pools (int8 / TurboQuant) are read by the tensor-core kernels only
+        let fmt = pool_format(k, kl, kvh, d)?;
+        let q8 = fmt != KvFormat::Model;
+        if kl.shape() != vl.shape() {
             candle_core::bail!("paged decode: bad kv shape {:?}", kl.shape());
         }
         if !paged_decode_supported(h, kvh, d) {
@@ -1028,8 +1028,12 @@ impl CustomOp3 for PagedDecode {
             let ncw = pool_slots.div_ceil(PD_WP).max(1);
             // large pools: the row-shared kernel for every step, single-row ones included (each
             // row its own group), so a verify step reproduces single-token steps bit for bit
-            let rows_kernel =
-                (self.force_rows || pool_slots >= attn_rows_min()) && g_heads * MAX_GEMV_ROWS <= 48;
+            // (TurboQuant pools have no per-row kernel)
+            let rows_kernel = (self.force_rows || fmt == KvFormat::Turbo4 || pool_slots >= attn_rows_min())
+                && g_heads * MAX_GEMV_ROWS <= 48;
+            if fmt == KvFormat::Turbo4 && !rows_kernel {
+                candle_core::bail!("paged decode: TurboQuant pools take at most 6 query heads per KV head");
+            }
             let own_links;
             let links = if !rows_kernel {
                 None
@@ -1051,7 +1055,7 @@ impl CustomOp3 for PagedDecode {
                 &format!(
                     "paged_decode_tc_{}{}{}",
                     if links.is_some() { "rows_" } else { "" },
-                    if q8 { "q8_" } else { "" },
+                    pool_tag(fmt),
                     suffix(dtype)?
                 ),
                 "carbon_attn_tc",
@@ -1259,14 +1263,43 @@ pub fn paged_decode_with(
     )
 }
 
-struct KvQ8Write<'a> {
-    pool: &'a Tensor,
-    kv_heads: usize,
+use crate::kvcache::KvFormat;
+
+/// The format of a KV pool `[slots, width]` holding `kvh` vectors of `d` values per slot.
+fn pool_format(k: &CudaStorage, kl: &Layout, kvh: usize, d: usize) -> CResult<KvFormat> {
+    let width = kl.shape().dims2()?.1;
+    let fmt = if k.dtype() != DType::U8 {
+        KvFormat::Model
+    } else if width == kvh * KvFormat::Q8.vector_bytes(d, DType::U8) {
+        KvFormat::Q8
+    } else {
+        KvFormat::Turbo4
+    };
+    let per = if fmt == KvFormat::Model { d } else { fmt.vector_bytes(d, DType::U8) };
+    if width != kvh * per {
+        candle_core::bail!("kv pool: {width} per slot for {kvh} vectors of {d}");
+    }
+    Ok(fmt)
 }
 
-impl CustomOp2 for KvQ8Write<'_> {
+/// The kernel-name infix of a pool format.
+fn pool_tag(fmt: KvFormat) -> &'static str {
+    match fmt {
+        KvFormat::Model => "",
+        KvFormat::Q8 => "q8_",
+        KvFormat::Turbo4 => "tq4_",
+    }
+}
+
+struct KvPackedWrite<'a> {
+    pool: &'a Tensor,
+    kv_heads: usize,
+    fmt: KvFormat,
+}
+
+impl CustomOp2 for KvPackedWrite<'_> {
     fn name(&self) -> &'static str {
-        "carbon-kv-q8-write"
+        "carbon-kv-packed-write"
     }
     fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
         candle_core::bail!("cuda only")
@@ -1277,14 +1310,19 @@ impl CustomOp2 for KvQ8Write<'_> {
         let d = width / kvh.max(1);
         let w = il.shape().elem_count() / t.max(1);
         let pool = Side::new(self.pool, "kv pool")?;
+        let dtype = x.dtype();
+        let kernel = match self.fmt {
+            KvFormat::Q8 => "kv_q8_write",
+            KvFormat::Turbo4 if d.is_multiple_of(64) => "kv_tq4_write",
+            f => candle_core::bail!("kv write: no packed writer for {f:?} at head dim {d}"),
+        };
         if kvh == 0 || width != kvh * d || d > 256 || il.shape().elem_count() != t * w || w == 0
-            || pool.len() % (kvh * (d + crate::kvcache::Q8_PAD)) != 0
+            || pool.len() % (kvh * self.fmt.vector_bytes(d, dtype)) != 0
         {
-            candle_core::bail!("kv q8 write: bad shapes {:?} / {:?}", xl.shape(), il.shape());
+            candle_core::bail!("kv write: bad shapes {:?} / {:?}", xl.shape(), il.shape());
         }
         let dev = x.device().clone();
-        let dtype = x.dtype();
-        let f = dev.get_or_load_custom_func(&format!("kv_q8_write_{}", suffix(dtype)?), "carbon_attn_tc", attn_tc_ptx()?)?;
+        let f = dev.get_or_load_custom_func(&format!("{kernel}_{}", suffix(dtype)?), "carbon_attn_tc", attn_tc_ptx()?)?;
         let (pv, iv) = (pool.view::<u8>()?, view::<u32>(idx, il)?);
         let (kvh32, d32, w32) = (kvh as i32, d as i32, w as i32);
         let cfg = LaunchConfig {
@@ -1308,7 +1346,7 @@ impl CustomOp2 for KvQ8Write<'_> {
         match dtype {
             DType::BF16 => go!(bf16),
             DType::F16 => go!(f16),
-            d => candle_core::bail!("kv q8 write: unsupported dtype {d:?}"),
+            d => candle_core::bail!("kv write: unsupported dtype {d:?}"),
         }
         // nothing to return: the pool was written in place
         let out = unsafe { dev.alloc::<u32>(1)? };
@@ -1316,10 +1354,10 @@ impl CustomOp2 for KvQ8Write<'_> {
     }
 }
 
-/// Quantize new keys or values `x [T, kv_heads * D]` into an int8 pool at the slots of
-/// `scatter_idx` (`[T, W]` u32, a row's elements all its slot).
-pub fn kv_q8_write(x: &Tensor, pool: &Tensor, scatter_idx: &Tensor, kv_heads: usize) -> CResult<()> {
-    x.contiguous()?.apply_op2_no_bwd(&scatter_idx.contiguous()?, &KvQ8Write { pool, kv_heads })?;
+/// Pack new keys or values `x [T, kv_heads * D]` (TurboQuant: already rotated) into a packed
+/// pool at the slots of `scatter_idx` (`[T, W]` u32, a row's elements all its slot).
+pub fn kv_packed_write(x: &Tensor, pool: &Tensor, scatter_idx: &Tensor, kv_heads: usize, fmt: KvFormat) -> CResult<()> {
+    x.contiguous()?.apply_op2_no_bwd(&scatter_idx.contiguous()?, &KvPackedWrite { pool, kv_heads, fmt })?;
     Ok(())
 }
 
@@ -2707,9 +2745,9 @@ impl CustomOp3 for FlashPrefill<'_> {
         let (t, h, d) = ql.shape().dims3()?;
         let kvh = self.kv_heads;
         let dtype = q.dtype();
-        let q8 = k.dtype() == DType::U8;
-        let width = if q8 { kvh * (d + crate::kvcache::Q8_PAD) } else { kvh * d };
-        if kl.shape() != vl.shape() || kl.shape().dims2()?.1 != width {
+        let fmt = pool_format(k, kl, kvh, d)?;
+        let q8 = fmt != KvFormat::Model;
+        if kl.shape() != vl.shape() {
             candle_core::bail!("flash prefill: bad kv shape {:?}", kl.shape());
         }
         if !paged_decode_supported(h, kvh, d) {
@@ -2730,7 +2768,7 @@ impl CustomOp3 for FlashPrefill<'_> {
         let tc = prefill_on_tensor_cores(&dev, dtype, d);
         let (f, blocks) = if tc {
             let f = dev.get_or_load_custom_func(
-                &format!("flash_prefill_tc_{}{}_d{d}", if q8 { "q8_" } else { "" }, suffix(dtype)?),
+                &format!("flash_prefill_tc_{}{}_d{d}", pool_tag(fmt), suffix(dtype)?),
                 "carbon_attn_tc",
                 attn_tc_ptx()?,
             )?;

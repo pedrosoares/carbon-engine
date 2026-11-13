@@ -55,6 +55,20 @@ __device__ __forceinline__ u32 tc_pack(float lo, float hi) {
 // back (D + 4 bytes); the kernels convert rows to the activation dtype as they stage them in
 // shared memory, so the tensor-core math is the same for both pool formats.
 #define Q8_PAD 4
+#define TQ_PAD 4
+#define TQ4_UNBIAS 1.009592f
+
+// 16-level Lloyd-Max quantizer of N(0, 1): centroid of code c (0..15), and the code of a value
+__device__ __forceinline__ float tq4_centroid(int c) {
+    const float half[8] = {0.128395f, 0.388048f, 0.656759f, 0.942340f, 1.256231f, 1.618046f, 2.069017f, 2.732590f};
+    return c >= 8 ? half[c - 8] : -half[7 - c];
+}
+__device__ __forceinline__ int tq4_code(float u) {
+    const float a = fabsf(u);
+    const int m = (a > 0.258222f) + (a > 0.522404f) + (a > 0.799550f) + (a > 1.099286f) + (a > 1.437139f) +
+                  (a > 1.843532f) + (a > 2.400803f);
+    return u >= 0.0f ? 8 + m : 7 - m;
+}
 
 // A small integer (an int8 code) in A's dtype: exact, so no rounding step is needed for bf16.
 template <class A>
@@ -71,20 +85,35 @@ __device__ __forceinline__ u32 tc_int<ABF16>(int v) { return (u32)__float_as_int
 // are multiplied into). Done in two steps, so a thread can issue all its loads before it converts any of them
 // (a load-convert-store loop waits a cache round trip per item): the raw words of elements
 // e .. e + 3, then their values in A's dtype.
-template <bool Q8>
+// Pool formats (F): 0 = the activation dtype, 1 = int8 codes + f32 scale (Q8), 2 = TurboQuant
+// 4-bit codes + f32 scale (TQ4, below).
+template <int F>
+__device__ __forceinline__ long tc_row_bytes(int D) {
+    return F == 1 ? D + Q8_PAD : D / 2 + TQ_PAD;
+}
+template <int F>
 __device__ __forceinline__ void tc_pool_raw(const u16* pool, long vec, int D, int e, u32* w) {
-    if (Q8) {
-        w[0] = *(const u32*)((const signed char*)pool + vec * (D + Q8_PAD) + e);
+    if (F == 1) {
+        w[0] = *(const u32*)((const signed char*)pool + vec * tc_row_bytes<F>(D) + e);
+    } else if (F == 2) {
+        w[0] = *(const u16*)((const signed char*)pool + vec * tc_row_bytes<F>(D) + e / 2);
     } else {
         w[0] = *(const u32*)(pool + vec * D + e);
         w[1] = *(const u32*)(pool + vec * D + e + 2);
     }
 }
-template <class A, bool Q8>
-__device__ __forceinline__ void tc_pool_cvt(const u32* w, u32* x) {
-    if (Q8) {
+// `lut`: the block's TQ4 table (tq4_lut_init), unused by the other formats
+template <class A, int F>
+__device__ __forceinline__ void tc_pool_cvt(const u32* w, u32* x, const u32* lut) {
+    if (F == 1) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) x[i] = tc_int<A>((int)(signed char)(w[0] >> (8 * i)));
+    } else if (F == 2) {
+        const u32 a = lut[w[0] & 0xffu], b = lut[(w[0] >> 8) & 0xffu];
+        x[0] = a & 0xffffu;
+        x[1] = a >> 16;
+        x[2] = b & 0xffffu;
+        x[3] = b >> 16;
     } else {
         x[0] = w[0] & 0xffffu;
         x[1] = w[0] >> 16;
@@ -92,9 +121,22 @@ __device__ __forceinline__ void tc_pool_cvt(const u32* w, u32* x) {
         x[3] = w[1] >> 16;
     }
 }
-template <bool Q8>
+template <int F>
 __device__ __forceinline__ float tc_pool_scale(const u16* pool, long vec, int D) {
-    return Q8 ? *(const float*)((const signed char*)pool + vec * (D + Q8_PAD) + D) : 1.0f;
+    if (F == 0) return 1.0f;
+    return *(const float*)((const signed char*)pool + vec * tc_row_bytes<F>(D) + (F == 1 ? D : D / 2));
+}
+
+// TurboQuant KV pools (TQ4, `--kv-dtype turbo4`): vectors are rotated by a random orthogonal
+// matrix before they are stored (queries are rotated the same way and the attention output is
+// rotated back, so the kernels never apply it), which makes their coordinates close to
+// independent Gaussians of variance |x|^2 / D. A row holds, per KV head, D 4-bit indices into
+// the 16-level Lloyd-Max codebook of N(0, 1) (dims 2j / 2j + 1 in the low / high nibble of
+// byte j) and the f32 scale |x| / sqrt(D): D / 2 + 4 bytes, MSE about 0.95% of |x|^2.
+// A block keeps a table byte -> its two centroids packed in A's dtype.
+template <class A>
+__device__ __forceinline__ void tq4_lut_init(u32* lut) {
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) lut[i] = tc_pack<A>(tq4_centroid(i & 15), tq4_centroid(i >> 4));
 }
 
 #define TC_SB 8   // staging items a thread loads before converting them
@@ -104,7 +146,7 @@ __device__ __forceinline__ float tc_pool_scale(const u16* pool, long vec, int D)
 // K is staged [key][dim], V transposed [dim][key] so both MMAs load their B fragments as whole
 // words. Int8 pools are staged as their codes (exact in bf16 / f16): a key's K scale multiplies
 // its score column and its V scale its probability column.
-template <class A, int D, int DO, bool Q8>
+template <class A, int D, int DO, int F>
 __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, const unsigned* slots,
                                  const unsigned* seqinfo, const unsigned* tiles, u16* out, int H, int KVH,
                                  float scale) {
@@ -115,6 +157,7 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
     __shared__ u16 sk[TC_BK * RSK];
     __shared__ u16 sv[DO * TC_RV];
     __shared__ float ksc[TC_BK], vsc[TC_BK];
+    __shared__ u32 lut[256];
 
     // A block of HB * 128 threads takes HB consecutive query heads (HB divides G = H / KVH, so
     // they share a KV head), 4 warps each, and stages every K / V tile once for all of them.
@@ -152,6 +195,10 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
     unsigned warp_last = prefix + q0 + wq * 16 + 15;
     unsigned kv_end = min(kv_len, prefix + q0 + nq);
 
+    if (F == 2) {
+        tq4_lut_init<A>(lut);
+        __syncthreads();
+    }
     for (unsigned k0 = 0; k0 < kv_end; k0 += TC_BK) {
         int nk = min(kv_end - k0, (unsigned)TC_BK);
         __syncthreads();
@@ -159,7 +206,7 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
         // item, lanes on the 16 key pairs: word (dim, pair) of the transposed tile. Batches of
         // TC_SB items: every load of a batch is issued before the first conversion.
         for (int base = threadIdx.x; base < TC_BK * (D / 4); base += TC_SB * blockDim.x) {
-            u32 w[TC_SB][Q8 ? 1 : 2], sl[TC_SB];
+            u32 w[TC_SB][F ? 1 : 2], sl[TC_SB];
 #pragma unroll
             for (int it = 0; it < TC_SB; ++it) {
                 int i = base + it * blockDim.x, row = i / (D / 4);
@@ -169,15 +216,15 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
             for (int it = 0; it < TC_SB; ++it) {
                 int c4 = (base + it * blockDim.x) % (D / 4);
                 w[it][0] = 0u;
-                if (!Q8) w[it][1] = 0u;
-                if (sl[it] != 0xffffffffu) tc_pool_raw<Q8>(kc, (long)sl[it] * KVH + kvh, D, 4 * c4, w[it]);
+                if (!F) w[it][1] = 0u;
+                if (sl[it] != 0xffffffffu) tc_pool_raw<F>(kc, (long)sl[it] * KVH + kvh, D, 4 * c4, w[it]);
             }
 #pragma unroll
             for (int it = 0; it < TC_SB; ++it) {
                 int i = base + it * blockDim.x, row = i / (D / 4), c4 = i % (D / 4);
                 if (i < TC_BK * (D / 4)) {
                     u32 x[4];
-                    tc_pool_cvt<A, Q8>(w[it], x);
+                    tc_pool_cvt<A, F>(w[it], x, lut);
                     u32* dst = (u32*)(sk + row * RSK + 4 * c4);
                     dst[0] = x[0] | (x[1] << 16);
                     dst[1] = x[2] | (x[3] << 16);
@@ -189,32 +236,32 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
             const int r2 = 2 * (base % (TC_BK / 2));
             const u32 sl[2] = {r2 < nk ? slots[s_start + k0 + r2] : 0xffffffffu,
                                r2 + 1 < nk ? slots[s_start + k0 + r2 + 1] : 0xffffffffu};
-            u32 w[TC_SB][Q8 ? 1 : 2];
+            u32 w[TC_SB][F ? 1 : 2];
 #pragma unroll
             for (int it = 0; it < TC_SB; ++it) {
                 int i = base + (it / 2) * blockDim.x, c4 = i / (TC_BK / 2);
                 w[it][0] = 0u;
-                if (!Q8) w[it][1] = 0u;
+                if (!F) w[it][1] = 0u;
                 if (i < (TC_BK / 2) * (DO / 4) && sl[it & 1] != 0xffffffffu)
-                    tc_pool_raw<Q8>(vc, (long)sl[it & 1] * KVH + kvh, D, 4 * c4, w[it]);
+                    tc_pool_raw<F>(vc, (long)sl[it & 1] * KVH + kvh, D, 4 * c4, w[it]);
             }
 #pragma unroll
             for (int it = 0; it < TC_SB; it += 2) {
                 int i = base + (it / 2) * blockDim.x, rp = i % (TC_BK / 2), c4 = i / (TC_BK / 2);
                 if (i < (TC_BK / 2) * (DO / 4)) {
                     u32 x[4], y[4];
-                    tc_pool_cvt<A, Q8>(w[it], x);
-                    tc_pool_cvt<A, Q8>(w[it + 1], y);
+                    tc_pool_cvt<A, F>(w[it], x, lut);
+                    tc_pool_cvt<A, F>(w[it + 1], y, lut);
 #pragma unroll
                     for (int e = 0; e < 4; ++e) *(u32*)(sv + (4 * c4 + e) * TC_RV + 2 * rp) = x[e] | (y[e] << 16);
                 }
             }
         }
-        if (Q8 && threadIdx.x < TC_BK) {
+        if (F && threadIdx.x < TC_BK) {
             bool in = (int)threadIdx.x < nk;
             long vec = in ? (long)slots[s_start + k0 + threadIdx.x] * KVH + kvh : 0;
-            ksc[threadIdx.x] = in ? tc_pool_scale<Q8>(kc, vec, D) : 0.0f;
-            vsc[threadIdx.x] = in ? tc_pool_scale<Q8>(vc, vec, D) : 0.0f;
+            ksc[threadIdx.x] = in ? tc_pool_scale<F>(kc, vec, D) : 0.0f;
+            vsc[threadIdx.x] = in ? tc_pool_scale<F>(vc, vec, D) : 0.0f;
         }
         __syncthreads();
         if (k0 > warp_last) continue;  // causal: every key of this tile is after the warp's queries
@@ -238,7 +285,7 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
             for (int e = 0; e < 2; ++e) {
                 int kc_ = nb * 8 + 2 * t + e;
                 unsigned key = k0 + kc_;
-                float sc = Q8 ? scale * ksc[kc_] : scale;
+                float sc = F ? scale * ksc[kc_] : scale;
                 s[nb][e] = key <= qpos0 ? s[nb][e] * sc : -1e30f;
                 s[nb][e + 2] = key <= qpos1 ? s[nb][e + 2] * sc : -1e30f;
             }
@@ -260,7 +307,7 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
                 float p = s[nb][e] > -1e29f ? __expf(s[nb][e] - mm) : 0.0f;
                 if (e < 2) sum0 += p; else sum1 += p;
                 // int8 V rows are staged as codes: their scale goes into the probability
-                s[nb][e] = Q8 ? p * vsc[nb * 8 + 2 * t + (e & 1)] : p;
+                s[nb][e] = F ? p * vsc[nb * 8 + 2 * t + (e & 1)] : p;
             }
         }
         for (int off = 1; off < 4; off <<= 1) {
@@ -312,13 +359,19 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
     extern "C" __global__ void flash_prefill_tc_##SUFFIX##_d##D(                                               \
         const u16* q, const u16* k, const u16* v, const unsigned* slots, const unsigned* seqinfo,              \
         const unsigned* tiles, u16* out, int H, int KVH, float scale) {                                        \
-        flash_prefill_tc<A, D, D, false>(q, k, v, slots, seqinfo, tiles, out, H, KVH,      \
+        flash_prefill_tc<A, D, D, 0>(q, k, v, slots, seqinfo, tiles, out, H, KVH,      \
                                                            scale);                                             \
     }                                                                                                          \
     extern "C" __global__ void flash_prefill_tc_q8_##SUFFIX##_d##D(                                            \
         const u16* q, const u16* k, const u16* v, const unsigned* slots, const unsigned* seqinfo,              \
         const unsigned* tiles, u16* out, int H, int KVH, float scale) {                                        \
-        flash_prefill_tc<A, D, D, true>(q, k, v, slots, seqinfo, tiles, out, H, KVH,       \
+        flash_prefill_tc<A, D, D, 1>(q, k, v, slots, seqinfo, tiles, out, H, KVH,       \
+                                                          scale);                                              \
+    }                                                                                                               \
+    extern "C" __global__ void flash_prefill_tc_tq4_##SUFFIX##_d##D(                                            \
+        const u16* q, const u16* k, const u16* v, const unsigned* slots, const unsigned* seqinfo,              \
+        const unsigned* tiles, u16* out, int H, int KVH, float scale) {                                        \
+        flash_prefill_tc<A, D, D, 2>(q, k, v, slots, seqinfo, tiles, out, H, KVH,       \
                                                           scale);                                              \
     }
 
@@ -612,13 +665,14 @@ __device__ void paged_decode_merge(const float* part, const unsigned* starts, u1
 // Per 16-position tile the block stages K [pos][dim] and V transposed [dim][pos] in one pass
 // (every thread issues a batch of loads before it converts any), int8 pools as their codes:
 // a position's K scale multiplies its scores and its V scale its probabilities.
-template <class A, bool Q8>
+template <class A, int F>
 __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc, const unsigned* slots,
                                      const unsigned* starts, const unsigned* links, float* part, int H, int KVH,
                                      int D, float scale, int NCW, int pairs) {
     __shared__ u32 sk[16][PDR_KW];
     __shared__ u16 sv[PD_MAXD * PDR_VS];
     __shared__ float ksc[16], vsc[16];
+    __shared__ u32 lut[256];
     __shared__ float sp[PDR_WARPS][16][PD_G];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane >> 2, tg = lane & 3;
     const int G = H / KVH, KS = D / 16;
@@ -657,9 +711,13 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
 #pragma unroll
     for (int ds = 0; ds < PD_MAXD / 16; ++ds) acc[ds][0] = acc[ds][1] = acc[ds][2] = acc[ds][3] = 0.0f;
     float(*pw)[PD_G] = sp[warp];
-    constexpr int W = Q8 ? 1 : 2;
+    constexpr int W = F ? 1 : 2;
     const int KI = 16 * (D / 4), VI = 8 * (D / 4);  // staging items: (row, 4 dims), (row pair, 4 dims)
 
+    if (F == 2) {
+        tq4_lut_init<A>(lut);
+        __syncthreads();
+    }
     for (unsigned t0 = p0; t0 < p1; t0 += 16) {
         const int nk = (int)min(s1 - t0, 16u);
         for (int base = threadIdx.x; base < KI; base += PDR_SB * blockDim.x) {
@@ -674,14 +732,14 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
                 int c4 = (base + it * blockDim.x) % (D / 4);
 #pragma unroll
                 for (int x = 0; x < W; ++x) w[it][x] = 0u;
-                if (sl[it] != 0xffffffffu) tc_pool_raw<Q8>(kc, (long)sl[it] * KVH + kvh, D, 4 * c4, w[it]);
+                if (sl[it] != 0xffffffffu) tc_pool_raw<F>(kc, (long)sl[it] * KVH + kvh, D, 4 * c4, w[it]);
             }
 #pragma unroll
             for (int it = 0; it < PDR_SB; ++it) {
                 int i = base + it * blockDim.x, row = i / (D / 4), c4 = i % (D / 4);
                 if (i < KI) {
                     u32 x[4];
-                    tc_pool_cvt<A, Q8>(w[it], x);
+                    tc_pool_cvt<A, F>(w[it], x, lut);
                     sk[row][2 * c4] = x[0] | (x[1] << 16);
                     sk[row][2 * c4 + 1] = x[2] | (x[3] << 16);
                 }
@@ -699,25 +757,25 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
                 int c4 = (base + (it / 2) * blockDim.x) / 8;
 #pragma unroll
                 for (int x = 0; x < W; ++x) w[it][x] = 0u;
-                if (sl[it] != 0xffffffffu) tc_pool_raw<Q8>(vc, (long)sl[it] * KVH + kvh, D, 4 * c4, w[it]);
+                if (sl[it] != 0xffffffffu) tc_pool_raw<F>(vc, (long)sl[it] * KVH + kvh, D, 4 * c4, w[it]);
             }
 #pragma unroll
             for (int it = 0; it < PDR_SB; it += 2) {
                 int i = base + (it / 2) * blockDim.x, rp = i % 8, c4 = i / 8;
                 if (i < VI) {
                     u32 x[4], y[4];
-                    tc_pool_cvt<A, Q8>(w[it], x);
-                    tc_pool_cvt<A, Q8>(w[it + 1], y);
+                    tc_pool_cvt<A, F>(w[it], x, lut);
+                    tc_pool_cvt<A, F>(w[it + 1], y, lut);
 #pragma unroll
                     for (int e = 0; e < 4; ++e) *(u32*)(sv + (4 * c4 + e) * PDR_VS + 2 * rp) = x[e] | (y[e] << 16);
                 }
             }
         }
-        if (Q8 && threadIdx.x < 16) {
+        if (F && threadIdx.x < 16) {
             const bool in = (int)threadIdx.x < nk;
             const long vec = in ? (long)slots[t0 + threadIdx.x] * KVH + kvh : 0;
-            ksc[threadIdx.x] = in ? tc_pool_scale<Q8>(kc, vec, D) : 0.0f;
-            vsc[threadIdx.x] = in ? tc_pool_scale<Q8>(vc, vec, D) : 0.0f;
+            ksc[threadIdx.x] = in ? tc_pool_scale<F>(kc, vec, D) : 0.0f;
+            vsc[threadIdx.x] = in ? tc_pool_scale<F>(vc, vec, D) : 0.0f;
         }
         __syncthreads();
         if (!work) {
@@ -735,7 +793,7 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
         }
         // positions g and g + 8 of the tile, relative to the table's start
         const unsigned ia = t0 - s0 + g, ib = ia + 8;
-        const float sca = Q8 ? scale * ksc[g] : scale, scb = Q8 ? scale * ksc[g + 8] : scale;
+        const float sca = F ? scale * ksc[g] : scale, scb = F ? scale * ksc[g + 8] : scale;
         float s00 = (live0 && ia < len0) ? s[0] * sca : -1e30f, s01 = (live1 && ia < len1) ? s[1] * sca : -1e30f;
         float s10 = (live0 && ib < len0) ? s[2] * scb : -1e30f, s11 = (live1 && ib < len1) ? s[3] * scb : -1e30f;
         float t0m = fmaxf(s00, s10), t1m = fmaxf(s01, s11);
@@ -760,7 +818,7 @@ __device__ void paged_decode_tc_rows(const u16* q, const u16* kc, const u16* vc,
         m0 = n0;
         m1 = n1;
         // int8 V rows are staged as codes: their scale goes into the probabilities
-        const float va = Q8 ? vsc[g] : 1.0f, vb = Q8 ? vsc[g + 8] : 1.0f;
+        const float va = F ? vsc[g] : 1.0f, vb = F ? vsc[g + 8] : 1.0f;
         pw[g][2 * tg] = p00 * va;
         pw[g][2 * tg + 1] = p01 * va;
         pw[g + 8][2 * tg] = p10 * vb;
@@ -832,6 +890,32 @@ __device__ void kv_q8_write(const u16* x, signed char* pool, const unsigned* idx
     if (d == 0) *(float*)(row + D) = mx / 127.0f;
 }
 
+// Quantize new K or V rows (already rotated) into a TQ4 pool. grid T * KVH blocks of D threads
+// (D a multiple of 64); x [T, KVH * D], idx as kv_q8_write.
+template <class A>
+__device__ void kv_tq4_write(const u16* x, unsigned char* pool, const unsigned* idx, int KVH, int D, int W) {
+    __shared__ float red[8];
+    __shared__ unsigned char codes[PD_MAXD];
+    const int t = blockIdx.x / KVH, kvh = blockIdx.x % KVH, d = threadIdx.x;
+    const bool on = d < D;
+    const float v = on ? A::load(x, ((long)t * KVH + kvh) * D + d) : 0.0f;
+    float ss = v * v;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, off);
+    if (threadIdx.x % 32 == 0) red[threadIdx.x / 32] = ss;
+    __syncthreads();
+    float tot = 0.0f;
+    for (int w = 0; w < (int)(blockDim.x / 32); ++w) tot += red[w];
+    const float scale = sqrtf(tot / (float)D);  // |x| / sqrt(D): the coordinates' standard deviation
+    if (on) codes[d] = (unsigned char)tq4_code(scale > 0.0f ? v / scale : 0.0f);
+    __syncthreads();
+    unsigned char* row = pool + ((long)idx[(long)t * W] * KVH + kvh) * (D / 2 + TQ_PAD);
+    if (d < D / 2) row[d] = (unsigned char)(codes[2 * d] | (codes[2 * d + 1] << 4));
+    // 1 / (1 - MSE): the centroids' vector is shorter than the original, which would bias every
+    // inner product with it low
+    if (d == 0) *(float*)(row + D / 2) = scale * TQ4_UNBIAS;
+}
+
 #define DEFINE_PD_TC(SUFFIX, A)                                                                               \
     extern "C" __global__ void paged_decode_tc_##SUFFIX(const u16* q, const u16* k, const u16* v,            \
                                                         const unsigned* slots, const unsigned* starts,        \
@@ -850,14 +934,25 @@ __device__ void kv_q8_write(const u16* x, signed char* pool, const unsigned* idx
                                                              const unsigned* links, float* part, int H,       \
                                                              int KVH, int D, float scale, int NCW,            \
                                                              int pairs) {                                     \
-        paged_decode_tc_rows<A, false>(q, k, v, slots, starts, links, part, H, KVH, D, scale, NCW, pairs);    \
+        paged_decode_tc_rows<A, 0>(q, k, v, slots, starts, links, part, H, KVH, D, scale, NCW, pairs);    \
     }                                                                                                         \
     extern "C" __global__ void paged_decode_tc_rows_q8_##SUFFIX(const u16* q, const u16* k, const u16* v,    \
                                                                 const unsigned* slots, const unsigned* starts,\
                                                                 const unsigned* links, float* part, int H,    \
                                                                 int KVH, int D, float scale, int NCW,         \
                                                                 int pairs) {                                  \
-        paged_decode_tc_rows<A, true>(q, k, v, slots, starts, links, part, H, KVH, D, scale, NCW, pairs);     \
+        paged_decode_tc_rows<A, 1>(q, k, v, slots, starts, links, part, H, KVH, D, scale, NCW, pairs);     \
+    }                                                                                                             \
+    extern "C" __global__ void paged_decode_tc_rows_tq4_##SUFFIX(const u16* q, const u16* k, const u16* v,    \
+                                                                const unsigned* slots, const unsigned* starts,\
+                                                                const unsigned* links, float* part, int H,    \
+                                                                int KVH, int D, float scale, int NCW,         \
+                                                                int pairs) {                                  \
+        paged_decode_tc_rows<A, 2>(q, k, v, slots, starts, links, part, H, KVH, D, scale, NCW, pairs);     \
+    }                                                                                                         \
+    extern "C" __global__ void kv_tq4_write_##SUFFIX(const u16* x, unsigned char* pool, const unsigned* idx, \
+                                                     int KVH, int D, int W) {                                 \
+        kv_tq4_write<A>(x, pool, idx, KVH, D, W);                                                             \
     }                                                                                                         \
     extern "C" __global__ void kv_q8_write_##SUFFIX(const u16* x, signed char* pool, const unsigned* idx,    \
                                                     int KVH, int D, int W) {                                  \

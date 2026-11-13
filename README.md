@@ -248,6 +248,14 @@ layers' value heads in a tiled order). The `mmproj` image tower is not loaded ye
   the bf16 run after a few sentences, and the greedy next token agrees with the bf16 cache on
   245 of 250 prefixes of a 44k-token text (`scripts/next_token_agreement.py`). No benchmark-level
   quality evaluation has been done.
+- **`--kv-dtype turbo4`** is TurboQuant (Zandieh et al., arXiv 2504.19874) at 4 bits: keys and
+  values are rotated by a fixed random orthogonal matrix and each coordinate is stored as an
+  index into the 16-level Lloyd-Max codebook of a Gaussian, with an f32 scale per vector (132
+  bytes per 256-dim vector: half of `q8`, a quarter of bf16). Queries are rotated the same way
+  and the attention output is rotated back, so the kernels never apply the rotation per key.
+  The full window then takes 23.5 GiB instead of 28. It is lossier than `q8`: the greedy next
+  token agrees with the bf16 cache on 229 of 250 prefixes (91.6%; `q8` 97.2%), and decode is
+  about 4% slower at short context (two small rotations per attention layer and step).
 - **Prefix reuse**: recurrent state is snapshotted at every prefill chunk boundary, so a prompt
   that shares a long beginning with an earlier one resumes from the last boundary inside it.
 

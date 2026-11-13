@@ -1023,8 +1023,8 @@ impl Attention {
         let (h, kvh, d) = (self.heads, self.kv_heads, self.head_dim);
         let g = h / kvh;
         let (q_len, kv_len) = (s.q_len, s.kv_len);
-        if kv.q8 {
-            bail!("int8 KV pools are only read by the fused CUDA attention kernels");
+        if kv.packed() {
+            bail!("packed KV pools are only read by the fused CUDA attention kernels");
         }
         let idx = s.kv_idx(kv.k.device())?;
         let k = self.gather(&kv.k, idx, kv_len)?;
@@ -1085,7 +1085,7 @@ impl Attention {
         }
         let run = || -> Result<Tensor> {
             let b = q.dim(0)?;
-            let q = q.to_dtype(kv.dtype)?.reshape((b, h, d))?;
+            let q = kv.rotate_queries(&q.to_dtype(kv.dtype)?.reshape((b, h, d))?)?;
             let o = cuda::paged_decode(
                 &q,
                 &kv.k,
@@ -1097,7 +1097,7 @@ impl Attention {
                 links.map(|l| l.0),
                 links.map_or(1, |l| l.1),
             )?;
-            Ok(o.reshape((b, h * d))?)
+            Ok(kv.unrotate_outputs(&o)?.reshape((b, h * d))?)
         };
         match run() {
             Ok(o) => Some(o),
@@ -1118,7 +1118,7 @@ impl Attention {
         }
         let run = || -> Result<Tensor> {
             let t = q.dim(0)?;
-            let q = q.to_dtype(kv.dtype)?.reshape((t, h, d))?;
+            let q = kv.rotate_queries(&q.to_dtype(kv.dtype)?.reshape((t, h, d))?)?;
             let o = cuda::flash_prefill(
                 &q,
                 &kv.k,
@@ -1129,7 +1129,7 @@ impl Attention {
                 kvh,
                 self.scale as f32,
             )?;
-            Ok(o.reshape((t, h * d))?)
+            Ok(kv.unrotate_outputs(&o)?.reshape((t, h * d))?)
         };
         match run() {
             Ok(o) => Some(o),
@@ -1154,8 +1154,8 @@ impl Attention {
         let (h, kvh, d) = (self.heads, self.kv_heads, self.head_dim);
         let g = h / kvh;
         let l = dc.lmax;
-        if kv.q8 {
-            bail!("int8 KV pools are only read by the fused CUDA attention kernels");
+        if kv.packed() {
+            bail!("packed KV pools are only read by the fused CUDA attention kernels");
         }
         let k = kv.k.index_select(&dc.kv_idx, 0)?.reshape((b, l, kvh, d))?;
         let v = kv.v.index_select(&dc.kv_idx, 0)?.reshape((b, l, kvh, d))?;

@@ -213,6 +213,52 @@ Studio's to 128k (12.2 s vs 11.3 s at 32k, 73 s vs 72 s at 128k) and 1.4x slower
   dims), each staging the same K / V rows itself: 12 blocks per KV head re-read and convert
   the prefix, and the scores are computed twice for head dim 256.
 
+### Phase 8: KV cache quantizers behind `--kv-dtype` (TurboQuant done, RotorQuant planned)
+
+Both methods are the same pipeline: normalise a vector, rotate it so its coordinates look like
+independent Gaussians, store a few bits per coordinate from a Lloyd-Max codebook plus the norm.
+TurboQuant (Zandieh, Daliri, Hadian, Mirrokni, arXiv 2504.19874) uses a dense random orthogonal
+matrix; RotorQuant (github.com/scrya-com/rotorquant) replaces it with block rotations: Cl(3,0)
+rotors on 3 coordinates at a time, later 2D Givens ("planar") and 4D quaternion ("iso") blocks.
+
+How it fits this engine: the rotation is orthogonal, so `<q, k> = <Pi q, Pi k>` and
+`sum p_i v_i = Pi^T sum p_i (Pi v_i)`. Vectors are rotated once when written, the queries once
+per step, the output rotated back once; the attention kernels only see codes. The rotation is a
+`[D, D]` matrix applied with a small GEMM, so a different method is a different matrix.
+
+Done, `--kv-dtype turbo4` (`KvFormat::Turbo4`):
+
+- Storage per vector: D / 2 bytes of 4-bit codes (16-level Lloyd-Max of N(0, 1), MSE 0.0095,
+  as the paper gives for 4 bits) and an f32 scale `|x| / sqrt(D) / (1 - MSE)`: 132 bytes at
+  head dim 256 against 260 (`q8`) and 512 (bf16). The rotation is one seeded Gaussian matrix
+  per head dim, orthonormalised on the host (`kvcache::random_rotation`).
+- Kernels: `kv_tq4_write` (norm, codes, packing), and a third pool format in
+  `flash_prefill_tc` and `paged_decode_tc_rows` (a byte -> two centroids table per block; the
+  scales go into scores and probabilities like the int8 ones). TurboQuant pools always take
+  the row-shared decode kernel.
+- Checks: kernel self-checks for prefill, decode and the writer against a CPU encoder; unit
+  tests for the codebook (a Lloyd fixed point) and the rotation.
+- Measured (27B, full-window configuration, pool of 270,854 tokens): 23.5 GiB instead of 28;
+  left to auto-sizing the pool holds 533,501 tokens. Decode 134.1 tok/s short (q8 140.2),
+  67.8 at 128k story (q8 65.6). The attention kernels run at the same speed on both formats
+  (0.36 vs 0.38 ms per layer over 129k): they are bound by conversion and arithmetic, not by
+  bytes, so 4 bits buys memory, not speed.
+- Quality: next token equal to bf16 KV on 229 of 250 prefixes (91.6%; q8 97.2%). A planted
+  fact is recalled at 6k, 50k and 120k tokens. One benchmark prompt (JSON after 128k of filler)
+  gets a refusal instead of the array. The scale's `1 / (1 - MSE)` factor (unbiased inner
+  products) did not change the agreement.
+
+Planned, in order:
+
+1. `--kv-dtype rotor4`: the same storage and kernels with RotorQuant's rotation, built as a
+   block-diagonal `[D, D]` matrix (85 random 3D rotors and one coordinate left as is at head dim
+   256; `planar4` / `iso4` the same way with 2D / 4D blocks). Compare with `turbo4` on the
+   agreement script. Expectation to check, not a result: RotorQuant's selling point is a
+   cheaper rotation, which this engine does not pay per key, and block rotations mix less.
+2. The paper's second stage (1-bit QJL of the residual, unbiased inner products for K).
+3. 3-bit variants (`turbo3` / `rotor3`), mixed formats per pool (e.g. K at 4 bits, V at 8).
+4. The two rotations per attention layer and step as part of existing launches.
+
 ### Phase 5 update 4: decode attention at depth
 
 Profile of a verify step at 128k before this round (graphs off, kernels only): attention 40%
