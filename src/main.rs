@@ -259,6 +259,7 @@ impl EngineArgs {
             mtp_speculate: self.mtp,
             mtp_drafts: self.mtp_drafts,
             mtp_min_prob: self.mtp_min_prob,
+            max_prefill_tokens: self.max_prefill_tokens.max(16),
             kv_format: carbon_engine::kvcache::KvFormat::parse(&self.kv_dtype)
                 .ok_or_else(|| anyhow::anyhow!("unknown --kv-dtype '{}' (model | q8 | turbo4 | rotor4 | planar4 | iso4)", self.kv_dtype))?,
             text_only: self.text_only,

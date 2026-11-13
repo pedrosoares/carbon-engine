@@ -1190,11 +1190,30 @@ impl Drop for DevicePool {
     }
 }
 
+static PREFILL_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The default prefill chunk (`--max-prefill-tokens`).
+pub const BASE_PREFILL_TOKENS: usize = 4096;
+
+/// Bytes of temporaries a prefill chunk holds per token at its peak: about six MLP-wide
+/// activations (measured on Qwen3.8 27B: 0.7 / 1.7 / 2.9 GiB for chunks of 4096 / 8192 / 16384).
+pub fn prefill_bytes_per_token(intermediate_size: usize, dtype: candle_core::DType) -> usize {
+    6 * intermediate_size * dtype.size_in_bytes()
+}
+
+/// Tell [`workspace_reserve`] the prefill chunk size (`--max-prefill-tokens`). Set before
+/// pools are sized.
+pub fn set_prefill_workspace(chunk_tokens: usize, bytes_per_token: usize) {
+    PREFILL_BYTES.store(chunk_tokens * bytes_per_token, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Device memory kept free for activations and allocator slack (prefill chunks, MoE uploads,
-/// attention scratch): 1.5 GiB plus 5% of the card.
+/// attention scratch): 1.5 GiB plus 5% of the card, or what the prefill chunk's temporaries
+/// need plus 0.75 GiB when that is more (chunks beyond about 16k tokens on a 32 GiB card).
 pub fn workspace_reserve(device: &Device) -> usize {
     let total = total_memory(device).unwrap_or(0);
-    (3usize << 29) + total / 20
+    let prefill = PREFILL_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    ((3usize << 29) + total / 20).max((3usize << 28) + prefill)
 }
 
 /// Physical cores (hyper-threads collapsed) from /proc/cpuinfo; logical CPUs elsewhere.

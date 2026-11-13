@@ -57,6 +57,8 @@ pub struct EngineConfig {
     pub mtp_min_prob: f32,
     /// Format of the KV pools on CUDA devices (`--kv-dtype`).
     pub kv_format: crate::kvcache::KvFormat,
+    /// Prefill chunk size the scheduler will use (sizes the activation reserve on GPUs).
+    pub max_prefill_tokens: usize,
     /// Skip the checkpoint's vision tower (no image input, its VRAM left to the caches).
     pub text_only: bool,
 }
@@ -85,6 +87,7 @@ impl EngineConfig {
             mtp_drafts: 1,
             mtp_min_prob: 0.6,
             kv_format: Default::default(),
+            max_prefill_tokens: crate::device::BASE_PREFILL_TOKENS,
             text_only: false,
         }
     }
@@ -189,6 +192,10 @@ impl Engine {
             && ec.rpc_workers.is_empty()
             && ec.devices[0].starts_with("cuda");
         crate::kvcache::set_kv_format(ec.kv_format);
+        crate::device::set_prefill_workspace(
+            ec.max_prefill_tokens,
+            crate::device::prefill_bytes_per_token(cfg.intermediate_size, ec.dtype.unwrap_or(DType::BF16)),
+        );
         #[cfg(feature = "cuda")]
         crate::kernels::cuda::allow_paged_shared_tables(
             // only the tensor-core decode kernels read shared tables (and QSA's selection kernel
@@ -342,6 +349,18 @@ impl Engine {
         topology.push(format!(
             "kv cache: {num_slots} tokens per stage, max context {max_seq_len}"
         ));
+        if num_slots < max_seq_len {
+            let hint = if ec.kv_tokens.is_some() {
+                "raise --kv-tokens or lower --max-seq-len"
+            } else {
+                "lower --max-seq-len, or free device memory: --kv-dtype q8 / turbo4, a smaller \
+                 --max-prefill-tokens, fewer --state-snapshots"
+            };
+            tracing::warn!(
+                "the kv cache holds {num_slots} tokens, less than the max context {max_seq_len}: \
+                 a prompt longer than the cache cannot be served ({hint})"
+            );
+        }
         for line in &topology {
             tracing::info!("{line}");
         }

@@ -283,6 +283,26 @@ Planned, in order:
 3. 3-bit variants (`turbo3` / `rotor3`), mixed formats per pool (e.g. K at 4 bits, V at 8).
 4. The two rotations per attention layer and step as part of existing launches.
 
+### Phase 5 update 5: activation reserve follows the prefill chunk
+
+- `device::workspace_reserve` is now the larger of the fixed part (1.5 GiB + 5% of the card)
+  and 0.75 GiB + chunk x 6 x intermediate size x activation bytes
+  (`--max-prefill-tokens` reaches it through `EngineConfig::max_prefill_tokens`).
+- Measured, full-window q8 + MTP configuration, a 100k prompt, 32.6 GiB card:
+
+  | chunk | auto-sized pool (tokens) | idle | peak |
+  | --- | --- | --- | --- |
+  | 4096 | 270,854 (unchanged) | 28.0 GiB | 28.8 GiB |
+  | 16384 | 242,942 | 27.0 GiB | 29.9 GiB |
+  | 32768 | 140,101 | 23.6 GiB | 30.3 GiB |
+
+  A 32768 chunk adds 6.6 GiB at its peak (the formula says 5.8), so with the old fixed reserve
+  it needed about 34.6 GiB.
+- Chunk size does not change prefill time (100k cold: 51.7 / 49.6 / 50.3 s), so larger chunks
+  only cost pool tokens; the default stays 4096.
+- Startup warns when the pool holds fewer tokens than `--max-seq-len`, with the flags that
+  change it.
+
 ### Phase 5 update 4: decode attention at depth
 
 Profile of a verify step at 128k before this round (graphs off, kernels only): attention 40%
@@ -399,6 +419,7 @@ element-wise ops 17%. After it (5.9 s): GEMMs 66%, recurrence 12%, attention 8%,
    per launch (the grid covers the whole pool; the merge kernel walks every chunk).
 3. Int8 KV: a logit-level comparison with bf16 KV (needs logprobs output; next-token agreement
    is 98.0% over 250 prefixes), and `--kv-dtype auto`.
-4. KV / state auto-sizing: room for prefill temporaries, single-user defaults for long windows.
+4. KV / state auto-sizing: single-user defaults for long windows (the prefill reserve and the
+   pool-smaller-than-context warning are done, see phase 5 update 5).
 5. Plain decode (66 vs 73): fuse norm + prep and SiLU * up into kernel epilogues.
 4. Phase 6 sweep and README; phase 7 image input.

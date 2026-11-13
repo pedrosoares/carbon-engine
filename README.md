@@ -423,7 +423,9 @@ carbon serve --model /models/M --devices cpu --rpc-worker hostA:7070 --rpc-worke
 * A worker started **without `--model`** receives exactly the weights of its layers from
   the coordinator at startup (`PutWeights`), so only the coordinator needs the checkpoint.
 * KV capacity is negotiated: every stage reports how many tokens fit, the minimum wins
-  (override with `--kv-tokens`).
+  (override with `--kv-tokens`). On a GPU the room left for activations follows
+  `--max-prefill-tokens`: chunks beyond about 16k tokens take pool tokens and do not prefill
+  faster, so keep the default. Startup warns when the pool is smaller than `--max-seq-len`.
 * Per decode step each worker hop carries one hidden-state row per sequence plus newly
   allocated slot ids (a few KB), so the link latency, not bandwidth, bounds decode speed.
 * **Security:** the protocol is unencrypted. Use `--token` / `--rpc-token` (or
