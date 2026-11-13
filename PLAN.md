@@ -79,6 +79,7 @@ code / math / json). RTX 5090, LM Studio runtime llama.cpp 2.71.
 - LM Studio cannot load 262,144 context with MTP on ("failed to allocate buffer for kv cache";
   its estimate is 49 GiB). MTP on fits about 100k. Without MTP it loads full context (28.6 GiB).
 - Prefill: 32k in 11.3 s (2,880 tok/s), 91k in 33.9 s, 129k in 72 s, 253k in 148 s (1,710 tok/s).
+  (The 253k figure was on top of a cached 129k prefix; cold it is 217 s, see the TTFT table.)
 - carbon build: `NVCC_CCBIN=/usr/bin/g++-15` is needed (nvcc 13.3 rejects gcc 16). GPU selftest
   passes in bf16 / f16 / f32.
 
@@ -124,10 +125,16 @@ Time to first token (seconds):
 
 | engine | 32k cold | 128k cold | 250k cold | same prefix again |
 |---|---|---|---|---|
-| LM Studio | 11.3 | 72 | 148 | 0.9 - 3.4 |
+| LM Studio | 11.3 | 72 | 148 (not cold, see the correction below) | 0.9 - 3.4 |
 | carbon, first int8 KV build | 24 | 293 | 1041 | (re-prefilled) |
 | carbon, row-shared attention build | 21 | 183 - 201 | not measured cold (481 s on top of a cached 128k prefix) | 3.1 (32k), 7.0 (128k), 14.4 (250k) |
 | carbon, now (prefill round) | 12.2 | 73 | 204 | 1.7 (32k), 2.2 (128k), 4.3 (250k) |
+| LM Studio, re-measured cold (new filler seeds) | | 74.6 | 217.3 | |
+| carbon, the same prompts | | 75.1 | 205.7 | |
+
+Correction: LM Studio's 148 s at 250k was taken right after the 128k run on the same load with
+the same filler seed, so llama.cpp reused the 128k prefix and prefilled only the second half.
+On a fresh prompt it takes 217 s; carbon is 5% ahead at 250k and level at 128k.
 
 With MTP carbon is ahead of LM Studio at short context (+12% on the mean; story +4%, code +28%,
 math +27%, JSON -4% with 5 drafts, level with 7), at 32k (+10%), and 2.3x / 2.5x at 128k / 250k,

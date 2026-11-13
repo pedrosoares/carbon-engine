@@ -281,8 +281,11 @@ greedy answers with thinking off (`scripts/bench_openai.py`; `PLAN.md` has the f
 
 | time to first token, cold prompt (s) | 32k | 128k | 250k |
 |---|---|---|---|
-| LM Studio | 11.3 | 72 | 148 |
-| carbon, full-window configuration above | 12.2 | 73 | 204 |
+| LM Studio | 11.3 | 75 | 217 |
+| carbon, full-window configuration above | 12.2 | 75 | 206 |
+
+The 128k and 250k columns are the same prompt on both engines, each on a freshly loaded
+server (an earlier 148 s for LM Studio at 250k had reused a cached 128k prefix).
 
 A later prompt that shares the beginning starts in 1.7 s at 32k, 2.2 s at 128k and 4.3 s at
 250k. Without `--max-seq-len` the context is capped at 32,768 tokens.
