@@ -40,6 +40,30 @@ template <class A> struct Mma {
 };
 #endif
 
+// D (16 x 8, s32) += A (16 x 32 int8, row-major) * B (32 x 8 int8, column-major): a lane (g = lane / 4,
+// t = lane % 4) holds A rows g, g + 8 at k = 4t .. 4t + 3 and 16 + 4t .. (a[0..3], four int8
+// per word), B column g at the same k (b[0..1]), and D rows g, g + 8 at columns 2t, 2t + 1.
+// The tensor cores run it at twice the instruction rate of the 16-bit float multiply, each
+// covering twice the k: four times the arithmetic (measured: 126 G/s against 63 G/s).
+#ifndef CARBON_HOST_TEST
+__device__ __forceinline__ void mma_s8(int* d, const u32* a, const u32* b) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};"
+                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+// the same with unsigned A (probability planes) and signed B (V codes)
+__device__ __forceinline__ void mma_u8s8(int* d, const u32* a, const u32* b) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};"
+                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+#else
+static void mma_s8(int*, const u32*, const u32*) {} // the integer paths are not host-tested
+static void mma_u8s8(int*, const u32*, const u32*) {}
+#endif
+
 template <class A>
 __device__ __forceinline__ u32 tc_pack(float lo, float hi) {
     u16 x, y;
@@ -146,7 +170,14 @@ __device__ __forceinline__ void tq4_lut_init(u32* lut) {
 // K is staged [key][dim], V transposed [dim][key] so both MMAs load their B fragments as whole
 // words. Int8 pools are staged as their codes (exact in bf16 / f16): a key's K scale multiplies
 // its score column and its V scale its probability column.
-template <class A, int D, int DO, int F>
+// QI (int8 pools): both products on the integer tensor-core multiply, which the kernel's time
+// is mostly spent in. Q K^T: K as stored and each query row quantized to int8 with its own
+// scale. P V over 32-key tiles: V as stored (staged transposed, [dim][key] bytes) and a query
+// row's probabilities of the tile, times the keys' V scales, as 16-bit unsigned fixed point
+// relative to the row's largest, in two byte planes; the integer results join the float
+// accumulators per tile. (Probabilities at 8 bits are faster still and fail the accuracy
+// check; integer Q K^T alone is 5% slower than both.)
+template <class A, int D, int DO, int F, int QI = 0>
 __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, const unsigned* slots,
                                  const unsigned* seqinfo, const unsigned* tiles, u16* out, int H, int KVH,
                                  float scale) {
@@ -154,8 +185,12 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
     constexpr int NT = DO / 8;       // output n-tiles
     constexpr int NB = TC_BK / 8;    // S n-tiles per key tile
     constexpr int RSK = D + 8;       // padded shared rows (conflict-free fragment loads)
-    __shared__ u16 sk[TC_BK * RSK];
-    __shared__ u16 sv[DO * TC_RV];
+    __shared__ u16 sk[QI ? 2 : TC_BK * RSK];
+    __shared__ u32 sk8[QI ? TC_BK : 1][D / 4 + 4];  // QI: K codes, four per word, padded rows
+    constexpr int VI8 = QI, NP = 2;
+    __shared__ u16 sv[VI8 ? 2 : DO * TC_RV];
+    __shared__ u32 sv8[VI8 ? DO : 1][12];              // V codes [dim][key], 8 words + padding
+    __shared__ u16 sp8[VI8 ? 8 : 1][NP][16][TC_BK / 2]; // per warp: P planes [row][key], bytes
     __shared__ float ksc[TC_BK], vsc[TC_BK];
     __shared__ u32 lut[256];
 
@@ -177,14 +212,50 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
     unsigned r0 = q0 + wq * 16 + g, r1 = r0 + 8;  // query rows (within the sequence) of this lane
 
     // Q fragments (A operand, row-major 16 x 16 per k-step)
-    u32 qa[KS][4];
+    u32 qa[QI ? 1 : KS][4];
+    u32 qi[QI ? D / 32 : 1][4];
+    float qs0 = 1.0f, qs1 = 1.0f;  // QI: the scales of query rows r0 and r1
+    if (QI) {
+        // this lane's dims of its two rows: 4t .. 4t + 3 and 16 + 4t .. of every 32-dim slice
 #pragma unroll
-    for (int ks = 0; ks < KS; ++ks) {
+        for (int r = 0; r < 2; ++r) {
+            const unsigned row = r ? r1 : r0;
+            const bool on = row < q0 + nq;
+            const u16* qr = q + ((long)(q_start + (on ? row : q0)) * H + h) * D;
+            float v[D / 32][8], mx = 0.0f;
 #pragma unroll
-        for (int r = 0; r < 4; ++r) {
-            unsigned row = (r & 1) ? r1 : r0;
-            int col = ks * 16 + 2 * t + ((r & 2) ? 8 : 0);
-            qa[ks][r] = row < q0 + nq ? *(const u32*)(q + ((long)(q_start + row) * H + h) * D + col) : 0u;
+            for (int ks = 0; ks < D / 32; ++ks) {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    v[ks][e] = on ? A::load(qr, 32 * ks + 4 * t + (e < 4 ? e : 12 + e)) : 0.0f;
+                    mx = fmaxf(mx, fabsf(v[ks][e]));
+                }
+            }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
+            const float inv = mx > 0.0f ? 127.0f / mx : 0.0f;
+#pragma unroll
+            for (int ks = 0; ks < D / 32; ++ks) {
+                u32 lo = 0u, hi = 0u;
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    lo |= ((u32)__float2int_rn(v[ks][e] * inv) & 0xffu) << (8 * e);
+                    hi |= ((u32)__float2int_rn(v[ks][4 + e] * inv) & 0xffu) << (8 * e);
+                }
+                qi[ks][r] = lo;
+                qi[ks][2 + r] = hi;
+            }
+            if (r) qs1 = mx / 127.0f; else qs0 = mx / 127.0f;
+        }
+    } else {
+#pragma unroll
+        for (int ks = 0; ks < KS; ++ks) {
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                unsigned row = (r & 1) ? r1 : r0;
+                int col = ks * 16 + 2 * t + ((r & 2) ? 8 : 0);
+                qa[ks][r] = row < q0 + nq ? *(const u32*)(q + ((long)(q_start + row) * H + h) * D + col) : 0u;
+            }
         }
     }
     float o[NT][4];
@@ -223,14 +294,45 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
             for (int it = 0; it < TC_SB; ++it) {
                 int i = base + it * blockDim.x, row = i / (D / 4), c4 = i % (D / 4);
                 if (i < TC_BK * (D / 4)) {
-                    u32 x[4];
-                    tc_pool_cvt<A, F>(w[it], x, lut);
-                    u32* dst = (u32*)(sk + row * RSK + 4 * c4);
-                    dst[0] = x[0] | (x[1] << 16);
-                    dst[1] = x[2] | (x[3] << 16);
+                    if (QI) {
+                        sk8[row][c4] = w[it][0];
+                    } else {
+                        u32 x[4];
+                        tc_pool_cvt<A, F>(w[it], x, lut);
+                        u32* dst = (u32*)(sk + row * RSK + 4 * c4);
+                        dst[0] = x[0] | (x[1] << 16);
+                        dst[1] = x[2] | (x[3] << 16);
+                    }
                 }
             }
         }
+        if (VI8) {
+            // item (4 keys, 4 dims): four V words in, their bytes transposed out
+            for (int base = threadIdx.x; base < (TC_BK / 4) * (DO / 4); base += 2 * blockDim.x) {
+                u32 w[2][4];
+#pragma unroll
+                for (int it = 0; it < 2; ++it) {
+                    const int i = base + it * blockDim.x, j = i % (TC_BK / 4), c4 = i / (TC_BK / 4);
+#pragma unroll
+                    for (int m = 0; m < 4; ++m) {
+                        const int row = 4 * j + m;
+                        w[it][m] = 0u;
+                        if (i < (TC_BK / 4) * (DO / 4) && row < nk)
+                            tc_pool_raw<F>(vc, (long)slots[s_start + k0 + row] * KVH + kvh, D, 4 * c4, &w[it][m]);
+                    }
+                }
+#pragma unroll
+                for (int it = 0; it < 2; ++it) {
+                    const int i = base + it * blockDim.x, j = i % (TC_BK / 4), c4 = i / (TC_BK / 4);
+                    if (i < (TC_BK / 4) * (DO / 4)) {
+#pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                            sv8[4 * c4 + e][j] = ((w[it][0] >> (8 * e)) & 0xffu) | (((w[it][1] >> (8 * e)) & 0xffu) << 8) |
+                                                 (((w[it][2] >> (8 * e)) & 0xffu) << 16) | (((w[it][3] >> (8 * e)) & 0xffu) << 24);
+                    }
+                }
+            }
+        } else
         for (int base = threadIdx.x; base < (TC_BK / 2) * (DO / 4); base += (TC_SB / 2) * blockDim.x) {
             // a thread's items share their key pair: two slots
             const int r2 = 2 * (base % (TC_BK / 2));
@@ -266,15 +368,40 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
         __syncthreads();
         if (k0 > warp_last) continue;  // causal: every key of this tile is after the warp's queries
 
+        // k-steps outside, the tile's n-tiles inside: consecutive multiplies then go to different
+        // accumulators and do not wait for each other (each accumulator still adds its k-steps
+        // in order, so the sums are the same)
         float s[NB][4];
 #pragma unroll
-        for (int nb = 0; nb < NB; ++nb) {
-            s[nb][0] = s[nb][1] = s[nb][2] = s[nb][3] = 0.0f;
+        for (int nb = 0; nb < NB; ++nb) s[nb][0] = s[nb][1] = s[nb][2] = s[nb][3] = 0.0f;
+        if (QI) {
+            int si[NB][4];
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb) si[nb][0] = si[nb][1] = si[nb][2] = si[nb][3] = 0;
+#pragma unroll
+            for (int ks = 0; ks < D / 32; ++ks) {
+#pragma unroll
+                for (int nb = 0; nb < NB; ++nb) {
+                    const u32 bf[2] = {sk8[nb * 8 + g][8 * ks + t], sk8[nb * 8 + g][8 * ks + 4 + t]};
+                    mma_s8(si[nb], qi[ks], bf);
+                }
+            }
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb) {
+                s[nb][0] = (float)si[nb][0] * qs0;
+                s[nb][1] = (float)si[nb][1] * qs0;
+                s[nb][2] = (float)si[nb][2] * qs1;
+                s[nb][3] = (float)si[nb][3] * qs1;
+            }
+        } else {
 #pragma unroll
             for (int ks = 0; ks < KS; ++ks) {
-                const u16* kr = sk + (nb * 8 + g) * RSK + ks * 16 + 2 * t;
-                u32 bf[2] = {*(const u32*)kr, *(const u32*)(kr + 8)};
-                Mma<A>::run(s[nb], qa[ks], bf);
+#pragma unroll
+                for (int nb = 0; nb < NB; ++nb) {
+                    const u16* kr = sk + (nb * 8 + g) * RSK + ks * 16 + 2 * t;
+                    u32 bf[2] = {*(const u32*)kr, *(const u32*)(kr + 8)};
+                    Mma<A>::run(s[nb], qa[ks], bf);
+                }
             }
         }
         // scale + causal mask, then the online softmax for rows r0 (elements 0,1) and r1 (2,3)
@@ -318,6 +445,55 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
         l1 = l1 * c1 + sum1;
         m0 = mn0;
         m1 = mn1;
+        if (VI8) {
+            // rows r0 / r1: the tile's largest probability (times V scale), over the row's 4 lanes
+            float pm0 = 0.0f, pm1 = 0.0f;
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb) {
+                pm0 = fmaxf(pm0, fmaxf(s[nb][0], s[nb][1]));
+                pm1 = fmaxf(pm1, fmaxf(s[nb][2], s[nb][3]));
+            }
+            for (int off = 1; off < 4; off <<= 1) {
+                pm0 = fmaxf(pm0, __shfl_xor_sync(0xffffffff, pm0, off));
+                pm1 = fmaxf(pm1, __shfl_xor_sync(0xffffffff, pm1, off));
+            }
+            const float full = 65535.0f;
+            const float f0 = pm0 > 0.0f ? full / pm0 : 0.0f, f1 = pm1 > 0.0f ? full / pm1 : 0.0f;
+            const int wb = threadIdx.x / 32;
+            // this lane's keys 2t, 2t + 1 of every 8-key n-tile, for its two rows
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb) {
+                const unsigned a0 = (unsigned)__float2int_rn(s[nb][0] * f0), a1 = (unsigned)__float2int_rn(s[nb][1] * f0);
+                const unsigned b0 = (unsigned)__float2int_rn(s[nb][2] * f1), b1 = (unsigned)__float2int_rn(s[nb][3] * f1);
+                sp8[wb][0][g][nb * 4 + t] = (u16)((a0 & 0xffu) | ((a1 & 0xffu) << 8));
+                sp8[wb][0][g + 8][nb * 4 + t] = (u16)((b0 & 0xffu) | ((b1 & 0xffu) << 8));
+                sp8[wb][1][g][nb * 4 + t] = (u16)((a0 >> 8) | ((a1 >> 8) << 8));
+                sp8[wb][1][g + 8][nb * 4 + t] = (u16)((b0 >> 8) | ((b1 >> 8) << 8));
+            }
+            __syncwarp();
+            // A fragments: rows g, g + 8 at keys 4t .. 4t + 3 and 16 + 4t ..
+            u32 pa[NP][4];
+#pragma unroll
+            for (int pl = 0; pl < NP; ++pl) {
+                pa[pl][0] = *(const u32*)&sp8[wb][pl][g][2 * t];
+                pa[pl][1] = *(const u32*)&sp8[wb][pl][g + 8][2 * t];
+                pa[pl][2] = *(const u32*)&sp8[wb][pl][g][8 + 2 * t];
+                pa[pl][3] = *(const u32*)&sp8[wb][pl][g + 8][8 + 2 * t];
+            }
+            const float u0 = pm0 / full, u1 = pm1 / full;
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const u32 bf[2] = {sv8[nt * 8 + g][t], sv8[nt * 8 + g][4 + t]};
+                int lo[4] = {0, 0, 0, 0}, hi[4] = {0, 0, 0, 0};
+                mma_u8s8(lo, pa[0], bf);
+                mma_u8s8(hi, pa[1], bf);
+                o[nt][0] = o[nt][0] * c0 + (float)(lo[0] + (hi[0] << 8)) * u0;
+                o[nt][1] = o[nt][1] * c0 + (float)(lo[1] + (hi[1] << 8)) * u0;
+                o[nt][2] = o[nt][2] * c1 + (float)(lo[2] + (hi[2] << 8)) * u1;
+                o[nt][3] = o[nt][3] * c1 + (float)(lo[3] + (hi[3] << 8)) * u1;
+            }
+            continue;
+        }
 #pragma unroll
         for (int i = 0; i < NT; ++i) {
             o[i][0] *= c0;
@@ -366,6 +542,12 @@ __device__ void flash_prefill_tc(const u16* q, const u16* kc, const u16* vc, con
         const u16* q, const u16* k, const u16* v, const unsigned* slots, const unsigned* seqinfo,              \
         const unsigned* tiles, u16* out, int H, int KVH, float scale) {                                        \
         flash_prefill_tc<A, D, D, 1>(q, k, v, slots, seqinfo, tiles, out, H, KVH,       \
+                                                                 scale);                                         \
+    }                                                                                                             \
+    extern "C" __global__ void flash_prefill_tc_q8i_##SUFFIX##_d##D(                                           \
+        const u16* q, const u16* k, const u16* v, const unsigned* slots, const unsigned* seqinfo,                 \
+        const unsigned* tiles, u16* out, int H, int KVH, float scale) {                                           \
+        flash_prefill_tc<A, D, D, 1, 1>(q, k, v, slots, seqinfo, tiles, out, H, KVH,    \
                                                           scale);                                              \
     }                                                                                                               \
     extern "C" __global__ void flash_prefill_tc_tq4_##SUFFIX##_d##D(                                            \

@@ -976,6 +976,14 @@ fn attn_rows_min() -> usize {
     *MIN.get_or_init(|| std::env::var("CARBON_ATTN_ROWS_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(131072))
 }
 
+/// Prefill attention over int8 pools on the integer tensor-core multiply (query rows at 8
+/// bits, probabilities at 16): about a third faster than converting K and V to the activation
+/// dtype. `CARBON_ATTN_I8=0` selects the float kernel.
+fn attn_int8() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CARBON_ATTN_I8").map_or(true, |v| v != "0"))
+}
+
 /// Fewest warps of a `paged_decode_tc_rows` block: warps beyond a step's (row, head) columns
 /// only stage K and V, which is most of a block's work at one or two rows.
 fn pdr_min_warps() -> usize {
@@ -2831,7 +2839,11 @@ impl CustomOp3 for FlashPrefill<'_> {
         let tc = prefill_on_tensor_cores(&dev, dtype, d);
         let (f, blocks) = if tc {
             let f = dev.get_or_load_custom_func(
-                &format!("flash_prefill_tc_{}{}_d{d}", pool_tag(fmt), suffix(dtype)?),
+                &format!(
+                    "flash_prefill_tc_{}{}_d{d}",
+                    if fmt == KvFormat::Q8 && d % 32 == 0 && attn_int8() { "q8i_" } else { pool_tag(fmt) },
+                    suffix(dtype)?
+                ),
                 "carbon_attn_tc",
                 attn_tc_ptx()?,
             )?;
