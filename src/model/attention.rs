@@ -132,6 +132,10 @@ pub struct DeviceBatch {
     /// fused CUDA kernels): the sub-steps and, u32 `[T]`, where each token's row lands when the
     /// sub-steps' outputs are concatenated (to put them back in token order).
     pub substeps: Option<(Vec<SubStep>, Tensor)>,
+    /// Multi-token decode steps, for kernels that walk a sequence's tokens themselves (GDN):
+    /// per token row, u32 `[T]`, the recurrent-state slot it leaves its state in, and its chain
+    /// link (bit 0 fresh, bit 1 not the first row of its sequence, `>> 8` rows that follow).
+    pub chain: Option<(Tensor, Tensor)>,
 }
 
 impl DeviceBatch {
@@ -221,6 +225,10 @@ impl DeviceBatch {
                 )),
                 None => None,
             },
+            chain: match &self.chain {
+                Some((a, b)) => Some((a.copy()?, b.copy()?)),
+                None => None,
+            },
         })
     }
 
@@ -261,6 +269,14 @@ impl DeviceBatch {
                     }
                 }
                 ao.slice_set(bo, 0, 0)?;
+            }
+            (None, None) => {}
+            _ => bail!("batch does not fit the captured graph"),
+        }
+        match (&self.chain, &o.chain) {
+            (Some((a, al)), Some((b, bl))) if a.dims() == b.dims() => {
+                a.slice_set(b, 0, 0)?;
+                al.slice_set(bl, 0, 0)?;
             }
             (None, None) => {}
             _ => bail!("batch does not fit the captured graph"),
@@ -349,18 +365,38 @@ impl DeviceBatch {
             && fused_decode_enabled()
             && meta.seqs.iter().all(|s| s.q_len <= MULTI_DECODE_MAX);
         let paged = if device.is_cuda() && fused_decode_enabled() && (all_decode || multi) {
-            let mut slots = Vec::with_capacity(meta.seqs.iter().map(|s| s.kv_len * s.q_len).sum());
-            let mut starts = Vec::with_capacity(t + 1);
-            starts.push(0u32);
-            for s in &meta.seqs {
-                for j in 0..s.q_len {
-                    slots.extend_from_slice(&s.slots[..s.kv_len - s.q_len + j + 1]);
-                    starts.push(slots.len() as u32);
+            #[cfg(feature = "cuda")]
+            let shared = multi
+                && crate::kernels::cuda::paged_shared_tables()
+                // half-precision activations: the tensor-core kernels' dtypes
+                && matches!(rotary.tables().0.dtype(), DType::BF16 | DType::F16);
+            #[cfg(not(feature = "cuda"))]
+            let shared = false;
+            let mut slots = Vec::new();
+            let mut starts = Vec::with_capacity(2 * t);
+            if shared {
+                // one table per sequence; row j sees its first kv_len - q_len + j + 1 slots
+                for s in &meta.seqs {
+                    let off = slots.len() as u32;
+                    slots.extend_from_slice(&s.slots[..s.kv_len]);
+                    for j in 0..s.q_len {
+                        starts.push(off);
+                        starts.push(off + (s.kv_len - s.q_len + j + 1) as u32);
+                    }
+                }
+            } else {
+                starts.push(0u32);
+                for s in &meta.seqs {
+                    for j in 0..s.q_len {
+                        slots.extend_from_slice(&s.slots[..s.kv_len - s.q_len + j + 1]);
+                        starts.push(slots.len() as u32);
+                    }
                 }
             }
+            let n_starts = starts.len();
             Some(PagedCtx {
                 slots: Tensor::from_vec(slots.clone(), slots.len(), device)?,
-                starts: Tensor::from_vec(starts, t + 1, device)?,
+                starts: Tensor::from_vec(starts, n_starts, device)?,
             })
         } else {
             None
@@ -398,6 +434,22 @@ impl DeviceBatch {
                 });
             }
             Some((steps, Tensor::from_vec(order, t, device)?))
+        } else {
+            None
+        };
+        let chain = if multi {
+            let (mut slots, mut links) = (Vec::with_capacity(t), Vec::with_capacity(t));
+            for s in &meta.seqs {
+                for j in 0..s.q_len {
+                    slots.push(s.token_state_slots.get(j).copied().unwrap_or(s.state_slot));
+                    links.push(if j == 0 {
+                        u32::from(s.kv_len == s.q_len) | (((s.q_len - 1) as u32) << 8)
+                    } else {
+                        2
+                    });
+                }
+            }
+            Some((Tensor::from_vec(slots, t, device)?, Tensor::from_vec(links, t, device)?))
         } else {
             None
         };
@@ -463,6 +515,7 @@ impl DeviceBatch {
             mrope_layout: meta.mrope_layout.clone(),
             ple_emb: vec![],
             substeps,
+            chain,
         })
     }
 }
@@ -805,8 +858,7 @@ impl Attention {
             k = kn.forward(&k)?;
         }
         let k = Rotary::apply(&k, &b.cos, &b.sin)?.reshape((t, kvh * d))?;
-        kv.k.scatter_set(&b.scatter_idx, &k.to_dtype(kv.k.dtype())?.contiguous()?, 0)?;
-        kv.v.scatter_set(&b.scatter_idx, &v.to_dtype(kv.v.dtype())?.contiguous()?, 0)?;
+        kv.write(&b.scatter_idx, &k, &v, kvh)?;
         if let (Some(ix), Some(pool)) = (&self.indexer, &kv.idx) {
             ix.queries(x, b, pool)?;
         }
@@ -816,25 +868,26 @@ impl Attention {
     pub fn forward(&self, x: &Tensor, b: &DeviceBatch, kv: &LayerKv) -> Result<Tensor> {
         let t = b.num_tokens;
         let (h, kvh, d) = (self.heads, self.kv_heads, self.head_dim);
+        let mut qkv = QLinear::forward_many(&[&self.q, &self.k, &self.v], x)?;
+        let v = qkv.pop().expect("v").reshape((t, kvh * d))?;
+        let mut k = qkv.pop().expect("k").reshape((t, kvh, d))?;
+        let qp = qkv.pop().expect("q");
         let (mut q, gate) = if self.output_gate {
-            let qg = self.q.forward(x)?.reshape((t, h, 2 * d))?;
+            let qg = qp.reshape((t, h, 2 * d))?;
             (
                 qg.narrow(2, 0, d)?,
                 Some(qg.narrow(2, d, d)?.reshape((t, h * d))?),
             )
         } else {
-            (self.q.forward(x)?.reshape((t, h, d))?, None)
+            (qp.reshape((t, h, d))?, None)
         };
-        let mut k = self.k.forward(x)?.reshape((t, kvh, d))?;
-        let v = self.v.forward(x)?.reshape((t, kvh * d))?;
         if let (Some(qn), Some(kn)) = (&self.q_norm, &self.k_norm) {
             q = qn.forward(&q)?;
             k = kn.forward(&k)?;
         }
         let q = Rotary::apply(&q, &b.cos, &b.sin)?;
         let k = Rotary::apply(&k, &b.cos, &b.sin)?.reshape((t, kvh * d))?;
-        kv.k.scatter_set(&b.scatter_idx, &k.to_dtype(kv.k.dtype())?.contiguous()?, 0)?;
-        kv.v.scatter_set(&b.scatter_idx, &v.to_dtype(kv.v.dtype())?.contiguous()?, 0)?;
+        kv.write(&b.scatter_idx, &k, &v, kvh)?;
         let out = match (&self.indexer, &kv.idx) {
             (Some(ix), Some(pool)) => {
                 let qi = ix.queries(x, b, pool)?;
@@ -868,7 +921,7 @@ impl Attention {
             return None;
         }
         match ix.select_device(qi, b, pool)? {
-            Ok(pc) => self.decode_fused(q, &pc, kv),
+            Ok(pc) => self.decode_fused(q, &pc, kv, None),
             Err(e) => {
                 disable_fused_decode(&e);
                 None
@@ -884,7 +937,12 @@ impl Attention {
     /// Every query over its whole causal history.
     fn attend_all(&self, q: &Tensor, b: &DeviceBatch, kv: &LayerKv) -> Result<Tensor> {
         let fused = match (&b.paged, &b.prefill) {
-            (Some(pc), _) => self.decode_fused(q, pc, kv),
+            (Some(pc), _) => self.decode_fused(
+                q,
+                pc,
+                kv,
+                b.chain.as_ref().map(|c| (&c.1, b.seqs.iter().map(|s| s.q_len).max().unwrap_or(1))),
+            ),
             (None, Some(pf)) => self.prefill_fused(q, pf, kv),
             (None, None) => None,
         };
@@ -924,7 +982,7 @@ impl Attention {
                 slots: Tensor::from_vec(slots, n, device)?,
                 starts: Tensor::from_vec(starts, b.seqs.len() + 1, device)?,
             };
-            if let Some(o) = self.decode_fused(q, &pc, kv) {
+            if let Some(o) = self.decode_fused(q, &pc, kv, None) {
                 return Ok(o);
             }
         }
@@ -965,6 +1023,9 @@ impl Attention {
         let (h, kvh, d) = (self.heads, self.kv_heads, self.head_dim);
         let g = h / kvh;
         let (q_len, kv_len) = (s.q_len, s.kv_len);
+        if kv.packed() {
+            bail!("packed KV pools are only read by the fused CUDA attention kernels");
+        }
         let idx = s.kv_idx(kv.k.device())?;
         let k = self.gather(&kv.k, idx, kv_len)?;
         let v = self.gather(&kv.v, idx, kv_len)?;
@@ -1016,7 +1077,7 @@ impl Attention {
 
     /// carbon's fused paged-attention kernel; `None` when unavailable (the caller falls back).
     #[cfg(feature = "cuda")]
-    fn decode_fused(&self, q: &Tensor, pc: &PagedCtx, kv: &LayerKv) -> Option<Tensor> {
+    fn decode_fused(&self, q: &Tensor, pc: &PagedCtx, kv: &LayerKv, links: Option<(&Tensor, usize)>) -> Option<Tensor> {
         use crate::kernels::cuda;
         let (h, kvh, d) = (self.heads, self.kv_heads, self.head_dim);
         if !cuda::paged_decode_supported(h, kvh, d) {
@@ -1024,7 +1085,7 @@ impl Attention {
         }
         let run = || -> Result<Tensor> {
             let b = q.dim(0)?;
-            let q = q.to_dtype(kv.k.dtype())?.reshape((b, h, d))?;
+            let q = kv.rotate_queries(&q.to_dtype(kv.dtype)?.reshape((b, h, d))?)?;
             let o = cuda::paged_decode(
                 &q,
                 &kv.k,
@@ -1033,8 +1094,10 @@ impl Attention {
                 &pc.starts,
                 kvh,
                 self.scale as f32,
+                links.map(|l| l.0),
+                links.map_or(1, |l| l.1),
             )?;
-            Ok(o.reshape((b, h * d))?)
+            Ok(kv.unrotate_outputs(&o)?.reshape((b, h * d))?)
         };
         match run() {
             Ok(o) => Some(o),
@@ -1055,7 +1118,7 @@ impl Attention {
         }
         let run = || -> Result<Tensor> {
             let t = q.dim(0)?;
-            let q = q.to_dtype(kv.k.dtype())?.reshape((t, h, d))?;
+            let q = kv.rotate_queries(&q.to_dtype(kv.dtype)?.reshape((t, h, d))?)?;
             let o = cuda::flash_prefill(
                 &q,
                 &kv.k,
@@ -1066,7 +1129,7 @@ impl Attention {
                 kvh,
                 self.scale as f32,
             )?;
-            Ok(o.reshape((t, h * d))?)
+            Ok(kv.unrotate_outputs(&o)?.reshape((t, h * d))?)
         };
         match run() {
             Ok(o) => Some(o),
@@ -1083,7 +1146,7 @@ impl Attention {
     }
 
     #[cfg(not(feature = "cuda"))]
-    fn decode_fused(&self, _: &Tensor, _: &PagedCtx, _: &LayerKv) -> Option<Tensor> {
+    fn decode_fused(&self, _: &Tensor, _: &PagedCtx, _: &LayerKv, _: Option<(&Tensor, usize)>) -> Option<Tensor> {
         None
     }
 
@@ -1091,6 +1154,9 @@ impl Attention {
         let (h, kvh, d) = (self.heads, self.kv_heads, self.head_dim);
         let g = h / kvh;
         let l = dc.lmax;
+        if kv.packed() {
+            bail!("packed KV pools are only read by the fused CUDA attention kernels");
+        }
         let k = kv.k.index_select(&dc.kv_idx, 0)?.reshape((b, l, kvh, d))?;
         let v = kv.v.index_select(&dc.kv_idx, 0)?.reshape((b, l, kvh, d))?;
         let kt = k.permute((0, 2, 3, 1))?.contiguous()?; // [b, kvh, d, l]

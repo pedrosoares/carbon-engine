@@ -354,6 +354,15 @@ pub fn kernel_selftest(device: &Device, dtype: DType) -> Vec<(&'static str, Resu
                 "carbon fp8 kernels (gemv + dequant vs cpu)",
                 Box::new(move || check_quant_kernels(d, dtype, false)),
             ));
+            ops.push(("carbon greedy pick (argmax + probability vs cpu)", Box::new(move || check_logit_pick(d))));
+            ops.push((
+                "carbon q4_k kernels (gemv + dequant vs cpu)",
+                Box::new(move || check_kquant_kernels(d, dtype, crate::gguf::KKind::Q4K)),
+            ));
+            ops.push((
+                "carbon q6_k kernels (gemv + dequant vs cpu)",
+                Box::new(move || check_kquant_kernels(d, dtype, crate::gguf::KKind::Q6K)),
+            ));
             for (name, fmt) in [
                 ("carbon moe kernels, dense experts (vs cpu)", 0),
                 ("carbon moe kernels, fp8 experts (vs cpu)", 1),
@@ -371,6 +380,18 @@ pub fn kernel_selftest(device: &Device, dtype: DType) -> Vec<(&'static str, Resu
                         candle_core::bail!(
                             "mismatch: output rel err {ey:.2e}, state rel err {es:.2e}"
                         );
+                    }
+                    Ok(())
+                }),
+            ));
+            ops.push((
+                "carbon gated deltanet prefill (vs generic path)",
+                Box::new(move || {
+                    let (ey, es) = crate::model::gdn::fused_prefill_selftest(d, dtype)
+                        .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
+                    let tol = if dtype == DType::F32 { 1e-4 } else { 5e-2 };
+                    if ey > tol || es > tol {
+                        candle_core::bail!("mismatch: output rel err {ey:.2e}, state rel err {es:.2e}");
                     }
                     Ok(())
                 }),
@@ -441,6 +462,98 @@ fn check_quant_kernels(d: &Device, dtype: DType, nvfp4: bool) -> candle_core::Re
     let (ew, ey) = (rel(&w_gpu, &w_ref)?, rel(&y_gpu, &y_ref)?);
     if ew > tol || ey > tol {
         candle_core::bail!("mismatch vs cpu: dequant rel err {ew:.2e}, gemv rel err {ey:.2e}");
+    }
+    Ok(())
+}
+
+/// Compare the one-pass greedy pick with a CPU argmax / softmax (a vocabulary that does not
+/// divide into the kernel's parts, a tie resolved to the lower index).
+#[cfg(feature = "cuda")]
+fn check_logit_pick(d: &Device) -> candle_core::Result<()> {
+    let (r, v) = (3usize, 100_003usize);
+    let mut x = Tensor::randn(0f32, 3.0, (r, v), &Device::Cpu)?.to_vec2::<f32>()?;
+    x[1][777] = 50.0;
+    x[1][90_001] = 50.0;
+    let flat: Vec<f32> = x.iter().flatten().copied().collect();
+    let got = crate::kernels::cuda::logit_pick(&Tensor::from_vec(flat, (r, v), d)?)?;
+    for (row, (id, p)) in x.iter().zip(got) {
+        let (mut best, mut m) = (0usize, f32::NEG_INFINITY);
+        for (i, &val) in row.iter().enumerate() {
+            if val > m {
+                (best, m) = (i, val);
+            }
+        }
+        let want = 1.0 / row.iter().map(|&val| ((val - m) as f64).exp()).sum::<f64>();
+        if id as usize != best || (p as f64 - want).abs() > 1e-4 * want.max(1e-3) {
+            candle_core::bail!("pick ({id}, {p}) differs from the cpu's ({best}, {want})");
+        }
+    }
+    Ok(())
+}
+
+/// Compare the GGUF K-quant kernels (random blocks with finite scales) with the CPU decoder.
+#[cfg(feature = "cuda")]
+fn check_kquant_kernels(d: &Device, dtype: DType, kind: crate::gguf::KKind) -> candle_core::Result<()> {
+    use crate::gguf::{dequant_kquant, KKind, KQuant};
+    use crate::kernels::cuda as k;
+    let cpu = Device::Cpu;
+    // 9 super-blocks per row: 36 units of 64 weights, so lanes take one or two each
+    let (n, kk) = (40usize, 9 * 256usize);
+    let block = kind.block_bytes();
+    let row_bytes = kk / 256 * block;
+    let mut bytes = Tensor::rand(0f32, 255.99, n * row_bytes, &cpu)?.to_dtype(DType::U8)?.to_vec1::<u8>()?;
+    for (i, b) in bytes.chunks_exact_mut(block).enumerate() {
+        let d16 = half::f16::from_f32(0.001 + 0.0001 * (i % 13) as f32).to_le_bytes();
+        match kind {
+            KKind::Q4K => {
+                b[0..2].copy_from_slice(&d16);
+                b[2..4].copy_from_slice(&half::f16::from_f32(0.002).to_le_bytes());
+            }
+            KKind::Q6K => b[208..210].copy_from_slice(&d16),
+        }
+    }
+    let w_ref = Tensor::from_vec(dequant_kquant(kind, &bytes, n, kk), (n, kk), &cpu)?;
+    let q = KQuant { kind, data: Tensor::from_vec(bytes, (n, row_bytes), &cpu)?.to_device(d)?, rows: n, cols: kk };
+    let rel = |a: &Tensor, b: &Tensor| -> candle_core::Result<f32> {
+        let a = a.to_device(&cpu)?.to_dtype(DType::F32)?;
+        let diff = (&a - b)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        Ok(diff / (b.abs()?.max_all()?.to_scalar::<f32>()? + 1e-6))
+    };
+    let tol = if dtype == DType::F32 { 1e-4 } else { 2e-2 };
+    let ew = rel(&k::kquant_dequant(&q, dtype)?, &w_ref)?;
+    if ew > tol {
+        candle_core::bail!("mismatch vs cpu: dequant rel err {ew:.2e}");
+    }
+    for t in [1usize, 3, 8] {
+        let x = Tensor::rand(-1f32, 1.0, (t, kk), &cpu)?.to_dtype(dtype)?;
+        let y_ref = x.to_dtype(DType::F32)?.matmul(&w_ref.t()?)?;
+        let xd = x.to_device(d)?;
+        let ey = rel(&k::kquant_gemv_exact(&xd, &q)?, &y_ref)?;
+        if ey > tol {
+            candle_core::bail!("mismatch vs cpu: gemv ({t} rows) rel err {ey:.2e}");
+        }
+        // 8-bit activations: the error is the activations' rounding, not the kernel's
+        let ei = rel(&k::kquant_gemv_prepared(&k::kquant_prep(&xd)?, &q, dtype)?, &y_ref)?;
+        if ei > 3e-2 {
+            candle_core::bail!("mismatch vs cpu: 8-bit gemv ({t} rows) rel err {ei:.2e}");
+        }
+        // SiLU * up with its activation prep in one launch against the separate kernels
+        let f32c = |a: &Tensor| a.to_device(&cpu)?.to_dtype(DType::F32);
+        let r = Tensor::rand(-1f32, 1.0, (t, kk), &cpu)?.to_dtype(dtype)?.to_device(d)?;
+        let sp = k::kquant_silu_mul_prep(&xd, &r)?;
+        let sp_ref = k::kquant_prep(&(candle_nn::ops::silu(&xd)? * &r)?)?;
+        let es = rel(&k::kquant_gemv_prepared(&sp, &q, DType::F32)?, &f32c(&k::kquant_gemv_prepared(&sp_ref, &q, DType::F32)?)?)?;
+        if es > tol {
+            candle_core::bail!("fused silu * up prep ({t} rows): rel err {es:.2e}");
+        }
+        if k::kquant_tc_enabled() {
+            let prep = k::kquant_prep(&xd)?;
+            let a = k::kquant_gemv_prepared(&prep, &q, DType::F32)?.to_device(&cpu)?;
+            let et = rel(&k::kquant_gemm_tc(&prep, &q, DType::F32)?, &a)?;
+            if et > 1e-4 {
+                candle_core::bail!("tensor-core gemm ({t} rows) differs from the dp4a kernel: rel err {et:.2e}");
+            }
+        }
     }
     Ok(())
 }
@@ -549,13 +662,127 @@ fn check_moe_kernels(d: &Device, dtype: DType, fmt: u8) -> candle_core::Result<(
 /// ragged tiles, two sequences in one launch).
 #[cfg(feature = "cuda")]
 fn check_flash_prefill(d: &Device, dtype: DType) -> candle_core::Result<()> {
+    use crate::kvcache::KvFormat::{Model, Turbo4, Q8};
+    check_flash_prefill_geometry(d, dtype, 128, Model)?;
+    let tc = matches!(d, Device::Cuda(c) if crate::kernels::cuda::prefill_on_tensor_cores(c, dtype, 256));
+    if dtype != DType::F32 && tc {
+        // head dim 256 and the int8 KV pool (tensor-core kernels only)
+        check_flash_prefill_geometry(d, dtype, 256, Model)?;
+        check_flash_prefill_geometry(d, dtype, 256, Q8)?;
+        check_flash_prefill_geometry(d, dtype, 128, Q8)?;
+        check_flash_prefill_geometry(d, dtype, 256, Turbo4)?;
+        check_flash_prefill_geometry(d, dtype, 128, Turbo4)?;
+    }
+    Ok(())
+}
+
+/// An int8 KV pool holding `x [rows, kvh * hd]` (codes and an inline f32 scale per vector), and
+/// the values it decodes to.
+#[cfg(feature = "cuda")]
+fn q8_pool(x: &Tensor, kvh: usize, hd: usize) -> candle_core::Result<(Tensor, Tensor)> {
+    let rows = x.dim(0)?;
+    let vals = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let (mut bytes, mut deq) = (Vec::with_capacity(rows * kvh * (hd + 4)), Vec::with_capacity(vals.len()));
+    for vec in vals.chunks(hd) {
+        let scale = vec.iter().fold(0f32, |m, v| m.max(v.abs())) / 127.0;
+        for v in vec {
+            let c = if scale > 0.0 { (v / scale).round().clamp(-127.0, 127.0) } else { 0.0 };
+            bytes.push(c as i8 as u8);
+            deq.push(c * scale);
+        }
+        bytes.extend_from_slice(&scale.to_le_bytes());
+    }
+    Ok((
+        Tensor::from_vec(bytes, (rows, kvh * (hd + 4)), x.device())?,
+        Tensor::from_vec(deq, (rows, kvh * hd), x.device())?,
+    ))
+}
+
+/// A TurboQuant pool holding `x [rows, kvh * hd]` (taken as already rotated: 4-bit codes and an
+/// f32 scale per vector), and the values it decodes to.
+#[cfg(feature = "cuda")]
+fn tq4_pool(x: &Tensor, kvh: usize, hd: usize) -> candle_core::Result<(Tensor, Tensor)> {
+    use crate::kvcache::{tq4_centroid, tq4_code};
+    let rows = x.dim(0)?;
+    let vals = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let (mut bytes, mut deq) = (Vec::with_capacity(rows * kvh * (hd / 2 + 4)), Vec::with_capacity(vals.len()));
+    for vec in vals.chunks(hd) {
+        let scale = (vec.iter().map(|v| v * v).sum::<f32>() / hd as f32).sqrt();
+        let codes: Vec<u8> = vec.iter().map(|v| tq4_code(if scale > 0.0 { v / scale } else { 0.0 })).collect();
+        let scale = scale * crate::kvcache::TQ4_UNBIAS;
+        deq.extend(codes.iter().map(|c| tq4_centroid(*c) * scale));
+        bytes.extend(codes.chunks(2).map(|p| p[0] | (p[1] << 4)));
+        bytes.extend_from_slice(&scale.to_le_bytes());
+    }
+    Ok((
+        Tensor::from_vec(bytes, (rows, kvh * (hd / 2 + 4)), x.device())?,
+        Tensor::from_vec(deq, (rows, kvh * hd), x.device())?,
+    ))
+}
+
+/// `x` as a pool of format `fmt`: (what the kernel reads, the values it stands for).
+#[cfg(feature = "cuda")]
+fn packed_pool(x: &Tensor, kvh: usize, hd: usize, fmt: crate::kvcache::KvFormat) -> candle_core::Result<(Tensor, Tensor)> {
+    match fmt {
+        crate::kvcache::KvFormat::Model => Ok((x.clone(), x.clone())),
+        crate::kvcache::KvFormat::Q8 => q8_pool(x, kvh, hd),
+        _ => tq4_pool(x, kvh, hd),
+    }
+}
+
+/// The TurboQuant write kernel against the CPU encoder: codes (a value on a cell boundary may
+/// fall either side) and scales.
+#[cfg(feature = "cuda")]
+fn check_tq4_write(d: &Device, dtype: DType) -> candle_core::Result<()> {
+    let (t, kvh, hd, slots) = (5usize, 2usize, 256usize, 9usize);
+    let x = Tensor::randn(0f32, 1.5, (t, kvh * hd), &Device::Cpu)?.to_dtype(dtype)?;
+    let (want, _) = tq4_pool(&x, kvh, hd)?;
+    let pool = Tensor::zeros((slots, kvh * (hd / 2 + 4)), DType::U8, d)?;
+    let rows: Vec<u32> = (0..t as u32).map(|i| (i * 2) % slots as u32).collect();
+    let idx: Vec<u32> = rows.iter().flat_map(|r| std::iter::repeat_n(*r, kvh * hd)).collect();
+    let idx = Tensor::from_vec(idx, (t, kvh * hd), d)?;
+    crate::kernels::cuda::kv_packed_write(&x.to_device(d)?, &pool, &idx, kvh, crate::kvcache::KvFormat::Turbo4)?;
+    let got = pool.to_device(&Device::Cpu)?.to_vec2::<u8>()?;
+    let want = want.to_vec2::<u8>()?;
+    let per = hd / 2 + 4;
+    let (mut off, mut total) = (0usize, 0usize);
+    for (i, r) in rows.iter().enumerate() {
+        for h in 0..kvh {
+            let (g, w) = (&got[*r as usize][h * per..(h + 1) * per], &want[i][h * per..(h + 1) * per]);
+            let scale = |b: &[u8]| f32::from_le_bytes([b[hd / 2], b[hd / 2 + 1], b[hd / 2 + 2], b[hd / 2 + 3]]);
+            if (scale(g) - scale(w)).abs() > 1e-3 * scale(w) {
+                candle_core::bail!("scale {} vs {}", scale(g), scale(w));
+            }
+            for j in 0..hd / 2 {
+                for (a, b) in [(g[j] & 15, w[j] & 15), (g[j] >> 4, w[j] >> 4)] {
+                    total += 1;
+                    if a != b {
+                        off += 1;
+                        if a.abs_diff(b) > 1 {
+                            candle_core::bail!("code {a} vs {b}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if off * 100 > total {
+        candle_core::bail!("{off} of {total} codes differ from the cpu encoder");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn check_flash_prefill_geometry(d: &Device, dtype: DType, hd: usize, q8: crate::kvcache::KvFormat) -> candle_core::Result<()> {
     let cpu = Device::Cpu;
-    let (h, kvh, hd, pool) = (8usize, 2usize, 128usize, 200usize);
+    let (h, kvh, pool) = (8usize, 2usize, 200usize);
     let seqs = [(5usize, 37usize), (0, 20)]; // (cached prefix, new queries)
     let t: usize = seqs.iter().map(|s| s.1).sum();
     let q = Tensor::randn(0f32, 1.0, (t, h, hd), &cpu)?.to_dtype(dtype)?;
     let k = Tensor::randn(0f32, 1.0, (pool, kvh * hd), &cpu)?.to_dtype(dtype)?;
     let v = Tensor::randn(0f32, 1.0, (pool, kvh * hd), &cpu)?.to_dtype(dtype)?;
+    // (what the kernel reads, what it stands for)
+    let ((k_dev, k), (v_dev, v)) = (packed_pool(&k, kvh, hd, q8)?, packed_pool(&v, kvh, hd, q8)?);
     let (mut slots, mut seqinfo, mut tiles) = (Vec::new(), Vec::new(), Vec::new());
     let mut q_start = 0u32;
     for (i, &(pre, n)) in seqs.iter().enumerate() {
@@ -570,8 +797,8 @@ fn check_flash_prefill(d: &Device, dtype: DType) -> candle_core::Result<()> {
     let scale = 1.0 / (hd as f32).sqrt();
     let got = crate::kernels::cuda::flash_prefill(
         &q.to_device(d)?,
-        &k.to_device(d)?,
-        &v.to_device(d)?,
+        &k_dev.to_device(d)?,
+        &v_dev.to_device(d)?,
         &Tensor::new(&slots[..], d)?,
         &Tensor::new(&seqinfo[..], d)?,
         &Tensor::new(&tiles[..], d)?,
@@ -614,7 +841,7 @@ fn check_flash_prefill(d: &Device, dtype: DType) -> candle_core::Result<()> {
     }
     let tol = if dtype == DType::F32 { 1e-4 } else { 3e-2 };
     if worst > tol {
-        candle_core::bail!("mismatch vs cpu: max abs err {worst:.2e}");
+        candle_core::bail!("mismatch vs cpu (head dim {hd}, kv {q8:?}): max abs err {worst:.2e}");
     }
     Ok(())
 }
@@ -662,9 +889,84 @@ fn check_gdn_sequence(d: &Device) -> candle_core::Result<()> {
 /// Compare carbon's fused paged decode attention with a CPU softmax reference (GQA, ragged).
 #[cfg(feature = "cuda")]
 fn check_paged_decode(d: &Device, dtype: DType) -> candle_core::Result<()> {
+    // short ragged rows; then several chunks of the chunked kernel at Qwen3.5's head geometry
+    check_paged_decode_with(d, dtype, (8, 2, 128, 300), &[1, 17, 200])?;
+    check_paged_decode_with(d, dtype, (12, 2, 256, 2000), &[3, 600, 1337])?;
+    if crate::kernels::cuda::paged_decode_tc_supported(12, 2, 256, dtype) {
+        // the row-shared kernel (verify steps on large pools), bf16 / f16 and int8 pools
+        use crate::kvcache::KvFormat::{Model, Turbo4, Q8};
+        for fmt in [Model, Q8, Turbo4] {
+            check_paged_decode_rows(d, dtype, fmt, 1, 530)?;
+            check_paged_decode_rows(d, dtype, fmt, 4, 701)?;
+        }
+        check_tq4_write(d, dtype)?;
+    }
+    Ok(())
+}
+
+/// `rows` token rows of one sequence in one step: row j attends to the first `len + j` slots of
+/// a shared table (several 256-position chunks, the last one ragged).
+#[cfg(feature = "cuda")]
+fn check_paged_decode_rows(d: &Device, dtype: DType, q8: crate::kvcache::KvFormat, rows: usize, len: usize) -> candle_core::Result<()> {
     let cpu = Device::Cpu;
-    let (h, kvh, hd, pool) = (8usize, 2usize, 128usize, 300usize);
-    let lens = [1usize, 17, 200];
+    let (h, kvh, hd, pool) = (12usize, 2usize, 256usize, 2000usize);
+    let q = Tensor::randn(0f32, 1.0, (rows, h, hd), &cpu)?.to_dtype(dtype)?;
+    let k = Tensor::randn(0f32, 1.0, (pool, kvh * hd), &cpu)?.to_dtype(dtype)?;
+    let v = Tensor::randn(0f32, 1.0, (pool, kvh * hd), &cpu)?.to_dtype(dtype)?;
+    let ((k_dev, k), (v_dev, v)) = (packed_pool(&k, kvh, hd, q8)?, packed_pool(&v, kvh, hd, q8)?);
+    let slots: Vec<u32> = (0..len + rows - 1).map(|j| (pool - 1 - j * 3 % pool) as u32).collect();
+    let starts: Vec<u32> = if rows == 1 {
+        vec![0, len as u32]
+    } else {
+        (0..rows).flat_map(|j| [0u32, (len + j) as u32]).collect()
+    };
+    let links: Vec<u32> = (0..rows).map(|j| if j == 0 { ((rows - 1) as u32) << 8 } else { 2 }).collect();
+    let scale = 1.0 / (hd as f32).sqrt();
+    let got = crate::kernels::cuda::paged_decode_with(
+        &q.to_device(d)?,
+        &k_dev.to_device(d)?,
+        &v_dev.to_device(d)?,
+        &Tensor::new(&slots[..], d)?,
+        &Tensor::new(&starts[..], d)?,
+        kvh,
+        scale,
+        Some(&Tensor::new(&links[..], d)?),
+        rows,
+        true,
+    )?
+    .to_device(&cpu)?
+    .to_dtype(DType::F32)?;
+    let (q, k, v) = (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?, v.to_dtype(DType::F32)?);
+    let mut worst = 0f32;
+    for b in 0..rows {
+        let idx = Tensor::new(&slots[..len + b], &cpu)?;
+        let kb = k.index_select(&idx, 0)?.reshape(((), kvh, hd))?;
+        let vb = v.index_select(&idx, 0)?.reshape(((), kvh, hd))?;
+        for hh in 0..h {
+            let g = hh / (h / kvh);
+            let qh = q.get(b)?.get(hh)?.reshape((1, hd))?;
+            let kh = kb.narrow(1, g, 1)?.squeeze(1)?;
+            let vh = vb.narrow(1, g, 1)?.squeeze(1)?;
+            let p = candle_nn::ops::softmax_last_dim(&(qh.matmul(&kh.t()?)? * scale as f64)?)?;
+            let want = p.matmul(&vh)?.squeeze(0)?;
+            let diff = (got.get(b)?.get(hh)? - want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            worst = if diff.is_nan() { f32::INFINITY } else { worst.max(diff) };
+        }
+    }
+    if worst > 3e-2 {
+        candle_core::bail!("row-shared kernel ({rows} rows, kv {q8:?}): max abs err {worst:.2e}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn check_paged_decode_with(
+    d: &Device,
+    dtype: DType,
+    (h, kvh, hd, pool): (usize, usize, usize, usize),
+    lens: &[usize],
+) -> candle_core::Result<()> {
+    let cpu = Device::Cpu;
     let q = Tensor::randn(0f32, 1.0, (lens.len(), h, hd), &cpu)?.to_dtype(dtype)?;
     let k = Tensor::randn(0f32, 1.0, (pool, kvh * hd), &cpu)?.to_dtype(dtype)?;
     let v = Tensor::randn(0f32, 1.0, (pool, kvh * hd), &cpu)?.to_dtype(dtype)?;
@@ -684,6 +986,8 @@ fn check_paged_decode(d: &Device, dtype: DType) -> candle_core::Result<()> {
         &Tensor::new(&starts[..], d)?,
         kvh,
         scale,
+        None,
+        1,
     )?
     .to_device(&cpu)?
     .to_dtype(DType::F32)?;
@@ -895,11 +1199,30 @@ impl Drop for DevicePool {
     }
 }
 
+static PREFILL_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The default prefill chunk (`--max-prefill-tokens`).
+pub const BASE_PREFILL_TOKENS: usize = 4096;
+
+/// Bytes of temporaries a prefill chunk holds per token at its peak: about six MLP-wide
+/// activations (measured on Qwen3.8 27B: 0.7 / 1.7 / 2.9 GiB for chunks of 4096 / 8192 / 16384).
+pub fn prefill_bytes_per_token(intermediate_size: usize, dtype: candle_core::DType) -> usize {
+    6 * intermediate_size * dtype.size_in_bytes()
+}
+
+/// Tell [`workspace_reserve`] the prefill chunk size (`--max-prefill-tokens`). Set before
+/// pools are sized.
+pub fn set_prefill_workspace(chunk_tokens: usize, bytes_per_token: usize) {
+    PREFILL_BYTES.store(chunk_tokens * bytes_per_token, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Device memory kept free for activations and allocator slack (prefill chunks, MoE uploads,
-/// attention scratch): 1.5 GiB plus 5% of the card.
+/// attention scratch): 1.5 GiB plus 5% of the card, or what the prefill chunk's temporaries
+/// need plus 0.75 GiB when that is more (chunks beyond about 16k tokens on a 32 GiB card).
 pub fn workspace_reserve(device: &Device) -> usize {
     let total = total_memory(device).unwrap_or(0);
-    (3usize << 29) + total / 20
+    let prefill = PREFILL_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    ((3usize << 29) + total / 20).max((3usize << 28) + prefill)
 }
 
 /// Physical cores (hyper-threads collapsed) from /proc/cpuinfo; logical CPUs elsewhere.

@@ -262,6 +262,29 @@ impl RadixCache {
         None
     }
 
+    /// Detach a snapshot from a strict ancestor of `node`, for a request that is prefilling
+    /// along that path and has run out of snapshot slots (its own path is locked, so the LRU
+    /// eviction cannot touch it). Keeps the shallowest one, a reuse point for prompts that only
+    /// share the beginning, and gives up the next: the deepest ones are what a prompt with the
+    /// same long beginning and a different ending resumes from.
+    pub fn take_ancestor_snapshot(&mut self, node: NodeId) -> Option<u32> {
+        let mut with = vec![];
+        let mut n = self.nodes[node].parent?;
+        while n != ROOT {
+            if self.nodes[n].snapshot.is_some() {
+                with.push(n);
+            }
+            n = self.nodes[n].parent.unwrap();
+        }
+        // `with` runs from deep to shallow
+        let victim = match with.len() {
+            0 => return None,
+            1 => with[0],
+            k => with[k - 2],
+        };
+        self.nodes[victim].snapshot.take()
+    }
+
     /// Number of tokens from the root to the end of `node`.
     pub fn depth(&self, mut node: NodeId) -> usize {
         let mut d = 0;

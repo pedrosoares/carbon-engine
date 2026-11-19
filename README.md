@@ -39,7 +39,7 @@ few runtime choices.
 | MoE placement | resident, offload (global LRU expert cache), CPU, hybrid CPU-GPU split, picked from a bandwidth benchmark | the same four strategies, picked from `carbon bench bw` |
 | Offloaded experts | expert cache on the GPU fed from pinned host memory, CUDA-graph compatible | a device slot cache fed from pinned host memory by a GPU kernel at PCIe speed, routing and caching on the GPU, CUDA-graph compatible |
 | Elastic memory | VRAM moved between KV and experts at runtime | `POST /v1/cache/rebuild`, `carbon ctl cache --kv N --moe N` |
-| Quantized weights | FP8, NVFP4, MXFP4, GGUF Q4_0, BF16 | FP8 (block and per-tensor), NVFP4 (ModelOpt and compressed-tensors), BF16/F16/F32 |
+| Quantized weights | FP8, NVFP4, MXFP4, GGUF Q4_0, BF16 | FP8 (block and per-tensor), NVFP4 (ModelOpt and compressed-tensors), GGUF Q4_K / Q6_K (dense Qwen3.5-family), BF16/F16/F32 |
 | Hybrid attention models | Gated DeltaNet (Qwen3.5/3.6/3.8) | Gated DeltaNet (Qwen3.5/3.6/3.8), fused decode and prefill kernels |
 | CUDA graphs | decode steps | decode steps, including offloaded experts and multi-token (MTP verify) steps |
 | CLI | `ft serve / ctl / bench` | `carbon serve / generate / ctl / bench bw / devices / worker / launch / shell` |
@@ -59,8 +59,9 @@ few runtime choices.
 | Distribution | Python package, desktop app | one Rust binary |
 | Implementation | Python, Triton and CUDA on PyTorch | Rust on [candle](https://github.com/huggingface/candle), with its own CUDA kernels |
 
-Not supported yet (see [Roadmap](#roadmap)): MXFP4 and GGUF weights, sliding-window and MLA
-attention (DeepSeek, GLM, gpt-oss, Gemma), video input.
+Not supported yet (see [Roadmap](#roadmap)): MXFP4 weights, GGUF files of other architectures
+or quantizations than the ones below, sliding-window and MLA attention (DeepSeek, GLM, gpt-oss,
+Gemma), video input.
 
 ## Running Qwen3.6-35B-A3B-FP8
 
@@ -208,6 +209,93 @@ sampling):
 `ctl bench --prompt-tokens 64 --max-tokens 256` (output tok/s, plain / `--mtp`): one request
 47.4 / 55.3, two 59.5 / 74.9, four 81.3 / 74.1.
 
+## Running Qwen3.8-27B from a GGUF file (Q4_K_M)
+
+```bash
+# speculative decoding with the file's MTP head
+carbon serve --model ~/models/Qwen3.8-27B-Q4_K_M.gguf --devices cuda:0 --cuda-graphs \
+  --mtp --mtp-drafts 5 --mtp-min-prob 0.75
+
+# the full 262,144-token window on a 32 GB card: int8 KV, recurrent-state pools for one user
+carbon serve --model ~/models/Qwen3.8-27B-Q4_K_M.gguf --devices cuda:0 --cuda-graphs \
+  --mtp --mtp-drafts 5 --mtp-min-prob 0.75 --kv-dtype q8 --max-seq-len 262144 \
+  --max-running-requests 2 --state-snapshots 4
+```
+
+`--model` takes a `.gguf` file (or a directory holding one): the config, the tokenizer and the
+chat template come from its metadata (`src/gguf.rs`). Supported: architecture `qwen35` (dense
+Qwen3.5 / 3.6 / 3.8: 48 Gated DeltaNet + 16 full-attention layers at 27B), tensors stored F32 /
+F16 / BF16 / Q4_K / Q6_K, on one local GPU (no tensor parallelism: the file stores the linear
+layers' value heads in a tiled order). Image input: a projector file
+(`mmproj-*.gguf`, type `qwen3vl_merger`) next to the model is loaded as the vision tower
+(`--mmproj FILE` names another one, `--mmproj none` or `--text-only` loads none); see
+[Images](#images). The tower takes about 0.6 GiB, which leaves the int8 KV cache at 246k tokens
+on a 32 GiB card: for the full 262,144 window use `--text-only` or `--kv-dtype turbo4`.
+
+- **Weights stay packed** (15.6 GiB). A decode step quantizes each projection's input to 8 bits
+  per 32 values and multiplies it with the 4- / 6-bit codes in integer arithmetic: a dp4a kernel
+  for single tokens, an integer tensor-core GEMM for the multi-token steps of speculative
+  decoding, where 8 tokens cost about 1.2x one. Projections that share an input run in one
+  launch. Prefill dequantizes a layer's weights per chunk and uses cuBLAS; the Gated DeltaNet
+  layers and attention run in carbon's own prefill kernels.
+- **MTP** (`--mtp`): the head (`blk.64` + `nextn.*`) drafts up to `--mtp-drafts` tokens, going
+  on while its last draft has probability `--mtp-min-prob`; the next step verifies them all.
+  With `--mtp` every K-quant weight uses the tensor-core kernel for every step, so the output is
+  the same as without drafts on those kernels (checked token for token on 400-token greedy
+  runs). Without `--mtp` the dp4a kernel is used (about 10% faster for single tokens), and its
+  rounding differs in the last bits.
+- **Decode attention** is chunked (256 positions per block) and reads K and V once per KV head
+  for its six query heads; on pools of 131,072 slots or more a verify step's rows also share one
+  pass (`CARBON_ATTN_ROWS_MIN`), about 0.38 ms per layer over 129k positions.
+- **`--kv-dtype q8`** keeps each key / value vector as 256 int8 values and an f32 scale: half
+  the memory and attention traffic of bf16. It is lossy: the text of a greedy run drifts from
+  the bf16 run after a few sentences, and the greedy next token agrees with the bf16 cache on
+  244 of 250 prefixes of a 44k-token text (`scripts/next_token_agreement.py`); all six changed
+  tokens were near-ties, and the KL divergence from the bf16 distribution averages 0.002 nats
+  (`turbo4`: 0.017). No benchmark-level
+  quality evaluation has been done.
+- **`--kv-dtype turbo4`** is TurboQuant (Zandieh et al., arXiv 2504.19874) at 4 bits: keys and
+  values are rotated by a fixed random orthogonal matrix and each coordinate is stored as an
+  index into the 16-level Lloyd-Max codebook of a Gaussian, with an f32 scale per vector (132
+  bytes per 256-dim vector: half of `q8`, a quarter of bf16). Queries are rotated the same way
+  and the attention output is rotated back, so the kernels never apply the rotation per key.
+  The full window then takes 23.5 GiB instead of 28. It is lossier than `q8`: the greedy next
+  token agrees with the bf16 cache on 229 of 250 prefixes (91.6%; `q8` 97.2%), and decode is
+  about 4% slower at short context (two small rotations per attention layer and step).
+- **`--kv-dtype rotor4`** is RotorQuant (scrya-com/rotorquant): the storage of `turbo4`, the
+  rotation made of independent random 3D rotations on consecutive coordinate triples
+  (`planar4` and `iso4` use 2D and 4D blocks). Same memory as `turbo4` and no faster here,
+  since this engine never applies the rotation per key. It is the lossiest option: next-token
+  agreement with the bf16 cache is 80.0% (`planar4` 82.8%, `iso4` 82.0%) against 91.6% for
+  `turbo4`. Prefer `turbo4` unless you are comparing the methods.
+- **Prefix reuse**: recurrent state is snapshotted at every prefill chunk boundary, so a prompt
+  that shares a long beginning with an earlier one resumes from the last boundary inside it.
+
+Measured on an RTX 5090 against LM Studio (llama.cpp runtime 2.71) on the same file, 400-token
+greedy answers with thinking off (`scripts/bench_openai.py`; `PLAN.md` has the full tables):
+
+| decode tok/s | story | code | math | json |
+|---|---|---|---|---|
+| LM Studio, MTP on, short context | 87.5 | 113.6 | 117.8 | 180.6 |
+| carbon `--mtp --mtp-drafts 5 --mtp-min-prob 0.75`, short context | 91.4 | 145.5 | 149.4 | 174.2 |
+| LM Studio without MTP / carbon without `--mtp` | 73 / 66 | | | |
+
+| decode tok/s at depth (story / json) | 32k | 128k | 250k |
+|---|---|---|---|
+| LM Studio (MTP on to about 100k; it cannot load more with MTP) | 78 / 154 | 37 / 37 (no MTP) | 25 / 25 (no MTP) |
+| carbon, full-window configuration above | 78 / 152 | 66 / 127 | 50 / 95 |
+
+| time to first token, cold prompt (s) | 32k | 128k | 250k |
+|---|---|---|---|
+| LM Studio | 11.3 | 75 | 217 |
+| carbon, full-window configuration above | 12.2 | 75 | 206 |
+
+The 128k and 250k columns are the same prompt on both engines, each on a freshly loaded
+server (an earlier 148 s for LM Studio at 250k had reused a cached 128k prefix).
+
+A later prompt that shares the beginning starts in 1.7 s at 32k, 2.2 s at 128k and 4.3 s at
+250k. Without `--max-seq-len` the context is capped at 32,768 tokens.
+
 ## Architecture
 
 ```
@@ -344,7 +432,9 @@ carbon serve --model /models/M --devices cpu --rpc-worker hostA:7070 --rpc-worke
 * A worker started **without `--model`** receives exactly the weights of its layers from
   the coordinator at startup (`PutWeights`), so only the coordinator needs the checkpoint.
 * KV capacity is negotiated: every stage reports how many tokens fit, the minimum wins
-  (override with `--kv-tokens`).
+  (override with `--kv-tokens`). On a GPU the room left for activations follows
+  `--max-prefill-tokens`: chunks beyond about 16k tokens take pool tokens and do not prefill
+  faster, so keep the default. Startup warns when the pool is smaller than `--max-seq-len`.
 * Per decode step each worker hop carries one hidden-state row per sequence plus newly
   allocated slot ids (a few KB), so the link latency, not bandwidth, bounds decode speed.
 * **Security:** the protocol is unencrypted. Use `--token` / `--rpc-token` (or
@@ -410,7 +500,7 @@ each rank's cache holds only its experts. `GET /v1/cache/status` shows per-stage
 | Endpoint | |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI chat, streaming, tools (`tool_choice` none / auto / named), `reasoning_content`, `reasoning_effort`, `thinking`, `stream_options.include_usage`, `chat_template_kwargs` |
-| `POST /v1/completions` | text or token-id prompts |
+| `POST /v1/completions` | text or token-id prompts; `logprobs: N` (1-20, non-streaming) adds each output token's log-probability and the N most likely tokens, with their ids in `token_ids` / `top_token_ids` |
 | `POST /v1/responses` | OpenAI Responses (what codex speaks): `instructions`, input items incl. reasoning / function_call / function_call_output, function tools, `reasoning.effort`, typed streaming events. Stateless: `GET /v1/responses/{id}` and `/cancel` answer 404, `previous_response_id` is refused |
 | `GET /v1/models` | incl. `context_length`, `supported_reasoning_efforts`, `default_reasoning_effort` |
 | `POST /v1/messages` | Anthropic Messages: system, tool_use / tool_result, thinking, `output_config.effort`, streaming events with `ping` keep-alives; late system messages are kept in place or folded into the next user turn (`--anthropic-inline-system`, probed from the template) |
@@ -442,6 +532,13 @@ through the vision tower once per request, and their tokens take 3-D mRoPE posit
 cache keys image tokens by the image's content, so a conversation that resends an image reuses
 its KV. `/v1/stats` lists `image` in `input_modalities`; a model without a vision tower answers
 400. `--text-only` skips the tower (~0.9 GB in bf16 for Qwen3.8).
+
+GGUF models take images at 256 x 256 pixels' worth or more and at most 4096 tokens each
+(llama.cpp's cap; there is no preprocessor config to read). On Qwen3.8-27B Q4_K_M (RTX 5090) a
+640x480 image is 300 tokens and is encoded in 27 ms; the largest, 4032 tokens, takes 3.6 s. A
+snapshot is kept at the end of every image, so another question about the same image starts
+in 0.3 s. On three test images (shapes with a caption, eight lines of small text, a colour
+grid) the answers and prompt token counts equal llama.cpp's.
 
 On Qwen3.8-Flash-Next (RTX 5090, offloaded experts), a 640x480 image is 300 tokens and the first
 token comes after 2.1 s.
@@ -522,7 +619,7 @@ hardware yet, so treat it as unvalidated until you run the suite on your GPUs.
 ## Roadmap
 
 - Image input for Qwen3-VL; video input
-- MXFP4 and GGUF Q4 weights
+- MXFP4 weights; GGUF for more architectures and K-quants, other `mmproj` projector types
 - Prefill: fuse Qwen3.8's hyper-connection elementwise ops (~0.6 s of a 4096-token chunk)
 - MTP speculative decoding across several local GPUs
 - Micro-batched pipeline execution (overlap stages for different sequences)

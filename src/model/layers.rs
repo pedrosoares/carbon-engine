@@ -35,7 +35,7 @@ impl Placement {
 
 /// Column-parallel projection, kept quantized when the placement allows (single rank only).
 pub fn load_column_q(src: &dyn WeightSource, prefix: &str, p: &Placement) -> Result<QLinear> {
-    if p.keep_quantized && p.world == 1 {
+    if (p.keep_quantized || src.is_kquant(&format!("{prefix}.weight"))) && p.world == 1 {
         return QLinear::load(src, prefix, true, p);
     }
     Ok(QLinear::Dense(load_column_parallel(src, prefix, p)?))
@@ -43,7 +43,7 @@ pub fn load_column_q(src: &dyn WeightSource, prefix: &str, p: &Placement) -> Res
 
 /// Row-parallel projection, kept quantized when the placement allows (single rank only).
 pub fn load_row_q(src: &dyn WeightSource, prefix: &str, p: &Placement) -> Result<QLinear> {
-    if p.keep_quantized && p.world == 1 {
+    if (p.keep_quantized || src.is_kquant(&format!("{prefix}.weight"))) && p.world == 1 {
         return QLinear::load(src, prefix, true, p);
     }
     Ok(QLinear::Dense(load_row_parallel(src, prefix, p)?))
@@ -330,11 +330,11 @@ pub use crate::weights::{dequant_fp8, dequant_nvfp4, Nvfp4};
 /// Run one of carbon's CUDA kernels; on failure warn once and return None so the caller falls
 /// back to the generic tensor-op path.
 #[cfg(feature = "cuda")]
-fn cuda_quant(
+fn cuda_quant<T>(
     x: &Tensor,
     what: &str,
-    f: impl FnOnce() -> candle_core::Result<Tensor>,
-) -> Option<Tensor> {
+    f: impl FnOnce() -> candle_core::Result<T>,
+) -> Option<T> {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     match f() {
         Ok(t) => Some(t),
@@ -360,14 +360,86 @@ pub enum QLinear {
     Dense(Linear),
     Fp8 { w: Tensor, scale: Tensor },
     Nvfp4(Nvfp4),
+    /// GGUF Q4_K / Q6_K blocks as stored.
+    KQuant(crate::gguf::KQuant),
 }
 
 impl QLinear {
+    /// A packed K-quant projection: the GEMV kernel for decode-sized batches on a GPU, a
+    /// dequantized GEMM otherwise.
+    fn kquant_forward(q: &crate::gguf::KQuant, x: &Tensor) -> Result<Tensor> {
+        if x.rank() != 2 {
+            let mut dims = x.dims().to_vec();
+            let rows: usize = dims[..dims.len() - 1].iter().product();
+            let y = Self::kquant_forward(q, &x.reshape((rows, q.cols))?)?;
+            *dims.last_mut().unwrap() = q.rows;
+            return Ok(y.reshape(dims)?);
+        }
+        #[cfg(feature = "cuda")]
+        if x.device().is_cuda() {
+            use crate::kernels::cuda as k;
+            if let Some(y) = cuda_quant(x, "kquant", || {
+                if x.dim(0)? <= k::MAX_GEMV_ROWS {
+                    k::kquant_gemv(x, q)
+                } else {
+                    Linear::new(k::kquant_dequant(q, x.dtype())?, None).forward(x)
+                }
+            }) {
+                return Ok(y);
+            }
+        }
+        let bytes = q.data.to_device(&candle_core::Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
+        let w = crate::gguf::dequant_kquant(q.kind, &bytes, q.rows, q.cols);
+        let w = Tensor::from_vec(w, (q.rows, q.cols), &candle_core::Device::Cpu)?
+            .to_dtype(x.dtype())?
+            .to_device(x.device())?;
+        Ok(Linear::new(w, None).forward(x)?)
+    }
+
+    /// Several projections of the same input. Packed K-quant projections on a GPU share one
+    /// quantization of the activations (a decode step otherwise repeats it per projection).
+    pub fn forward_many(qs: &[&QLinear], x: &Tensor) -> Result<Vec<Tensor>> {
+        #[cfg(feature = "cuda")]
+        if x.device().is_cuda()
+            && x.rank() == 2
+            && x.dim(0)? <= crate::kernels::cuda::MAX_GEMV_ROWS
+            && !crate::kernels::cuda::kquant_exact()
+            && qs.iter().filter(|q| matches!(q, Self::KQuant(_))).count() > 1
+        {
+            use crate::kernels::cuda as k;
+            let packed: Vec<&crate::gguf::KQuant> = qs
+                .iter()
+                .filter_map(|q| match q {
+                    Self::KQuant(kq) => Some(kq),
+                    _ => None,
+                })
+                .collect();
+            if packed.len() <= 4 {
+                // one activation prep and one launch for the packed projections
+                let ys = cuda_quant(x, "kquant multi", || {
+                    k::kquant_gemv_multi(&k::kquant_prep(x)?, &packed, x.dtype())
+                });
+                if let Some(ys) = ys {
+                    let mut ys = ys.into_iter();
+                    return qs
+                        .iter()
+                        .map(|q| match q {
+                            Self::KQuant(_) => Ok(ys.next().expect("one output per packed weight")),
+                            other => other.forward(x),
+                        })
+                        .collect();
+                }
+            }
+        }
+        qs.iter().map(|q| q.forward(x)).collect()
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let fused =
             x.device().is_cpu() && x.rank() == 2 && x.dim(0)? <= crate::kernels::MAX_FUSED_ROWS;
         match self {
             Self::Dense(l) => Ok(l.forward(x)?),
+            Self::KQuant(q) => Self::kquant_forward(q, x),
             Self::Nvfp4(q)
                 if fused
                     && q.packed.device().is_cpu()
@@ -438,6 +510,7 @@ impl QLinear {
                 scale: up(&q.scale)?,
                 global: q.global,
             }),
+            Self::KQuant(q) => Self::KQuant(crate::gguf::KQuant { data: up(&q.data)?, ..q.clone() }),
         })
     }
 
@@ -450,6 +523,7 @@ impl QLinear {
             Self::Nvfp4(q) => {
                 q.packed.elem_count() + q.scale.elem_count() * q.scale.dtype().size_in_bytes()
             }
+            Self::KQuant(q) => q.data.elem_count(),
         }
     }
 
@@ -465,6 +539,12 @@ impl QLinear {
         p: &Placement,
     ) -> Result<Self> {
         let name = format!("{prefix}.weight");
+        // GGUF K-quants always stay packed: the dense copy is 3.5x (Q4_K, bf16) the size
+        if p.world == 1 {
+            if let Some(q) = src.load_kquant(&name)? {
+                return Ok(Self::KQuant(crate::gguf::KQuant { data: q.data.to_device(&p.device)?, ..q }));
+            }
+        }
         // a bias only exists on dense projections here; keep those dense
         if keep_quantized && p.world == 1 && !src.contains(&format!("{prefix}.bias")) {
             if let Some(q) = src.load_nvfp4(&name)? {
@@ -543,8 +623,27 @@ impl Mlp {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let g = activation(&self.act, &self.gate.forward(x)?)?;
-        let u = self.up.forward(x)?;
+        let mut gu = QLinear::forward_many(&[&self.gate, &self.up], x)?;
+        let u = gu.pop().expect("up");
+        #[cfg(feature = "cuda")]
+        if let (QLinear::KQuant(down), true, true) = (
+            &self.down,
+            matches!(self.act.as_str(), "silu" | "swish"),
+            u.device().is_cuda()
+                && crate::kernels::cuda::kquant_step_fusion()
+                && !crate::kernels::cuda::kquant_exact()
+                && u.dims2().is_ok_and(|(t, k)| t <= crate::kernels::cuda::MAX_GEMV_ROWS && k % 256 == 0),
+        ) {
+            // SiLU, the product and the down projection's activation prep in one launch
+            use crate::kernels::cuda as k;
+            let g = &gu[0];
+            if let Some(y) =
+                cuda_quant(x, "kquant silu", || k::kquant_gemv_with(&k::kquant_silu_mul_prep(g, &u)?, down, x.dtype()))
+            {
+                return Ok(y);
+            }
+        }
+        let g = activation(&self.act, &gu.pop().expect("gate"))?;
         self.down.forward(&(g * u)?)
     }
 
@@ -570,7 +669,7 @@ impl Mlp {
                     scale: q.scale.clone(),
                     global: q.global,
                 },
-                QLinear::Nvfp4(_) => return None,
+                QLinear::Nvfp4(_) | QLinear::KQuant(_) => return None,
             })
         };
         Some([one(&self.gate)?, one(&self.up)?, one(&self.down)?])

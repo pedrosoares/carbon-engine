@@ -20,6 +20,9 @@ pub struct SamplingParams {
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
     pub repetition_penalty: f32,
+    /// Report each output token's log-probability and this many most likely alternatives
+    /// (0: off). Taken from the model's distribution, before penalties and sampling filters.
+    pub logprobs: usize,
 }
 
 impl Default for SamplingParams {
@@ -36,6 +39,7 @@ impl Default for SamplingParams {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             repetition_penalty: 1.0,
+            logprobs: 0,
         }
     }
 }
@@ -56,6 +60,36 @@ impl SamplingParams {
             Some(s) => StdRng::seed_from_u64(s),
             None => StdRng::from_entropy(),
         }
+    }
+}
+
+/// One output token's log-probability and the most likely tokens at its position.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenLogprobs {
+    pub token: u32,
+    pub logprob: f32,
+    /// (token, log-probability), most likely first.
+    pub top: Vec<(u32, f32)>,
+}
+
+/// Log-probabilities over a logits row: of `token`, and of the `n` most likely tokens.
+pub fn top_logprobs(logits: &[f32], token: u32, n: usize) -> TokenLogprobs {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let lse = max + logits.iter().map(|&l| (l as f64 - max).exp()).sum::<f64>().ln();
+    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+    let n = n.min(idx.len());
+    // lower index first on ties, like the greedy pick
+    let by = |a: &u32, b: &u32| logits[*b as usize].total_cmp(&logits[*a as usize]).then(a.cmp(b));
+    if n > 0 && n < idx.len() {
+        idx.select_nth_unstable_by(n - 1, by);
+    }
+    idx.truncate(n);
+    idx.sort_unstable_by(by);
+    let lp = |t: u32| (logits[t as usize] as f64 - lse) as f32;
+    TokenLogprobs {
+        token,
+        logprob: logits.get(token as usize).map_or(f32::NEG_INFINITY, |_| lp(token)),
+        top: idx.into_iter().map(|t| (t, lp(t))).collect(),
     }
 }
 
@@ -149,6 +183,17 @@ pub fn sample(logits: &mut [f32], p: &SamplingParams, rng: &mut StdRng) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_logprobs_orders_and_normalises() {
+        let l = [0.0f32, 2.0, 1.0, 2.0, -1.0];
+        let t = top_logprobs(&l, 2, 3);
+        assert_eq!(t.top.iter().map(|x| x.0).collect::<Vec<_>>(), vec![1, 3, 2]);
+        let total: f64 = l.iter().map(|&x| (x as f64).exp()).sum();
+        assert!((t.logprob as f64 - (1.0 - total.ln())).abs() < 1e-6);
+        assert_eq!(t.top[2].1, t.logprob);
+        assert_eq!(top_logprobs(&l, 0, 99).top.len(), 5);
+    }
 
     #[test]
     fn greedy_and_topk() {

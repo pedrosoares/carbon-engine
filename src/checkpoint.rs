@@ -440,6 +440,9 @@ impl WeightSource for CarbonWeightSource {
 
 /// The weight source for a model directory: carbon checkpoint or safetensors.
 pub fn open_weights(dir: &Path) -> Result<std::sync::Arc<dyn WeightSource>> {
+    if let Some(file) = crate::gguf::find(dir) {
+        return Ok(std::sync::Arc::new(crate::gguf::GgufSource::open(&file)?));
+    }
     Ok(if is_checkpoint(dir) {
         std::sync::Arc::new(CarbonWeightSource::open(dir)?)
     } else {

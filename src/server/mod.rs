@@ -49,10 +49,15 @@ pub struct SamplingDefaults {
 impl SamplingDefaults {
     /// Read `generation_config.json` (the checkpoint's recommended sampling).
     pub fn from_model_dir(dir: &Path) -> Self {
-        let v: Value = std::fs::read_to_string(dir.join("generation_config.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(Value::Null);
+        let v: Value = match crate::gguf::find(dir) {
+            Some(file) => crate::gguf::Gguf::open(&file)
+                .map(|g| g.generation_config())
+                .unwrap_or(Value::Null),
+            None => std::fs::read_to_string(dir.join("generation_config.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(Value::Null),
+        };
         let f = |k: &str| v.get(k).and_then(|x| x.as_f64()).map(|x| x as f32);
         let sample = v.get("do_sample").and_then(|x| x.as_bool()).unwrap_or(true);
         Self {
@@ -446,6 +451,8 @@ impl AppState {
             repetition_penalty: f("repetition_penalty")
                 .or(d.repetition_penalty)
                 .unwrap_or(1.0),
+            // the endpoints that report them set it
+            logprobs: 0,
         }
     }
 
@@ -503,6 +510,7 @@ pub struct Generation {
     first_token: Option<Instant>,
     prompt_len: usize,
     generated: usize,
+    logprobs: Vec<crate::sampling::TokenLogprobs>,
 }
 
 impl Generation {
@@ -542,6 +550,7 @@ impl Generation {
             first_token: None,
             prompt_len,
             generated: 0,
+            logprobs: vec![],
         }
     }
 
@@ -571,6 +580,11 @@ impl Generation {
         });
     }
 
+    /// Log-probabilities of the tokens received so far (requests that asked for them).
+    pub fn logprobs(&self) -> &[crate::sampling::TokenLogprobs] {
+        &self.logprobs
+    }
+
     pub fn output_ids(&self) -> &[u32] {
         self.detok.ids()
     }
@@ -589,6 +603,7 @@ impl Generation {
                     self.record(500, None, Some("engine stopped".into()));
                     return Some(Chunk::Error("engine stopped".into()));
                 }
+                Some(Event::Logprobs(lp)) => self.logprobs.push(lp),
                 Some(Event::Token(t)) => {
                     self.first_token.get_or_insert_with(Instant::now);
                     self.generated += 1;
@@ -977,9 +992,11 @@ pub async fn with_images(
                     "image {i}: expected a data: or http(s) URL or base64 image data"
                 )));
             };
+            let t0 = Instant::now();
             let img = bytes
                 .and_then(|b| proc.prepare(&b))
                 .map_err(|e| ApiError::bad_request(format!("image {i}: {e:#}")))?;
+            tracing::debug!("image {i} prepared in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
             images.push(img);
         }
         crate::images::expand_image_tokens(&ids, image_id, images, proc.merge_size)

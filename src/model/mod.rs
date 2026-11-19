@@ -22,7 +22,7 @@ use crate::parallel::comm::Communicator;
 use crate::weights::WeightSource;
 use anyhow::{bail, Result};
 use attention::{Attention, DeviceBatch};
-use candle_core::{DType, Device, Module, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::Linear;
 use gdn::{GatedDeltaNet, LinearState};
 use layers::{Mlp, Placement, RmsNorm, Rotary};
@@ -175,8 +175,8 @@ impl LayerStack {
         // the KV floor and the recurrent-state pools allocated after loading
         let kv_reserve_bytes = moe_opts.kv_reserve_tokens.unwrap_or(max_seq_len)
             * n_attn_stage
-            * (2 * kv_width + index_dim)
-            * p.dtype.size_in_bytes()
+            * (crate::kvcache::kv_layer_bytes(kv_width / cfg.head_dim.max(1), cfg.head_dim, p.dtype, &p.device)
+                + index_dim * p.dtype.size_in_bytes())
             + moe_opts.state_slots * state_bytes;
         // per-expert bytes as stored (quantized experts stay quantized unless dequant_fp8)
         let (expert_bytes, local_experts, format) = match (has_moe, cfg.moe.as_ref()) {
@@ -394,7 +394,11 @@ impl LayerStack {
     }
 
     pub fn kv_bytes_per_token(&self) -> usize {
-        self.n_attn * (2 * self.kv_width + self.index_dim) * self.placement.dtype.size_in_bytes()
+        let p = &self.placement;
+        let kvh = self.kv_width / self.cfg.head_dim.max(1);
+        self.n_attn
+            * (crate::kvcache::kv_layer_bytes(kvh, self.cfg.head_dim, p.dtype, &p.device)
+                + self.index_dim * p.dtype.size_in_bytes())
     }
 
     /// How many KV tokens fit in `memory_ratio` of the device's free memory (None when the
@@ -710,7 +714,7 @@ pub struct ModelHead {
     norm: FinalNorm,
     /// Qwen3.8: the embedding is copied into this many residual streams.
     streams: usize,
-    lm_head: Linear,
+    lm_head: layers::QLinear,
     pub device: Device,
     pub dtype: DType,
 }
@@ -723,10 +727,12 @@ impl ModelHead {
         // stays in host memory and leaves the VRAM to the KV and expert caches
         let host_embed = untied && p.device.is_cuda();
         let embed = src.get(&name, if host_embed { &Device::Cpu } else { &p.device }, p.dtype)?;
-        let lm_head = if untied {
-            Linear::new(src.get("lm_head.weight", &p.device, p.dtype)?, None)
+        let lm_head = if untied && src.is_kquant("lm_head.weight") {
+            layers::QLinear::load(src, "lm_head", true, p)?
+        } else if untied {
+            layers::QLinear::Dense(Linear::new(src.get("lm_head.weight", &p.device, p.dtype)?, None))
         } else {
-            Linear::new(embed.clone(), None)
+            layers::QLinear::Dense(Linear::new(embed.clone(), None))
         };
         let (norm, streams) = match &cfg.qwen38 {
             Some(q) => (

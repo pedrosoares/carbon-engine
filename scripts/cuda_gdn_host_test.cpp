@@ -31,7 +31,11 @@ std::barrier<>* block_bar = nullptr;
 #define __shared__ static  // blocks run one after another, so one copy is block-shared
 static float __int_as_float(int i) { float f; memcpy(&f, &i, 4); return f; }
 static int __float_as_int(float f) { int i; memcpy(&i, &f, 4); return i; }
+#define rsqrtf carbon_rsqrtf  // newer C libraries declare their own
 static float rsqrtf(float x) { return 1.0f / std::sqrt(x); }
+static int __float2int_rn(float x) { return (int)std::nearbyint(x); }
+using std::min;
+#define __expf expf
 static void __syncthreads() { block_bar->arrive_and_wait(); }
 static float shfl(float v, unsigned src) {
     unsigned lane = threadIdx.x % 32;

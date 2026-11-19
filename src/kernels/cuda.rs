@@ -435,6 +435,486 @@ pub fn fp8_gemv(x: &Tensor, w: &Tensor, scale: &Tensor) -> CResult<Tensor> {
     )
 }
 
+struct KqDequant {
+    dtype: DType,
+    kind: crate::gguf::KKind,
+    cols: usize,
+}
+
+impl candle_core::CustomOp1 for KqDequant {
+    fn name(&self) -> &'static str {
+        "carbon-kquant-dequant"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, w: &CudaStorage, wl: &Layout) -> CResult<(CudaStorage, Shape)> {
+        let (n, row_bytes) = wl.shape().dims2()?;
+        let k = self.cols;
+        if row_bytes != k / 256 * self.kind.block_bytes() {
+            candle_core::bail!("kquant dequant: {row_bytes} bytes per row for {k} columns");
+        }
+        let dev = w.device().clone();
+        let f = kernel!(dev, format!("kq_dequant_{}", suffix(self.dtype)?));
+        let wv = view::<u8>(w, wl)?;
+        let (n32, k32, kind) = (n as i32, k as i32, self.kind as i32);
+        let out = with_out!(dev, self.dtype, n * k, |out| {
+            let mut b = f.builder();
+            b.arg(&wv);
+            b.arg(&out);
+            b.arg(&n32);
+            b.arg(&k32);
+            b.arg(&kind);
+            unsafe { b.launch(grid_stride(n * k / 32)) }.w()?;
+        });
+        Ok((out, Shape::from((n, k))))
+    }
+}
+
+struct KqGemv {
+    kind: crate::gguf::KKind,
+    cols: usize,
+}
+
+impl CustomOp2 for KqGemv {
+    fn name(&self) -> &'static str {
+        "carbon-kquant-gemv"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, w: &CudaStorage, wl: &Layout, x: &CudaStorage, xl: &Layout) -> CResult<(CudaStorage, Shape)> {
+        let (n, row_bytes) = wl.shape().dims2()?;
+        let (t, k) = xl.shape().dims2()?;
+        if k != self.cols || t > MAX_GEMV_ROWS || row_bytes != k / 256 * self.kind.block_bytes() {
+            candle_core::bail!("kquant gemv: bad shapes {:?} x {:?}", wl.shape(), xl.shape());
+        }
+        let dev = w.device().clone();
+        let dtype = x.dtype();
+        let f = kernel!(dev, format!("kq_gemv_{}", suffix(dtype)?));
+        let wv = view::<u8>(w, wl)?;
+        let (n32, k32, t32, kind) = (n as i32, k as i32, t as i32, self.kind as i32);
+        macro_rules! go {
+            ($ty:ty) => {{
+                let xv = view::<$ty>(x, xl)?;
+                let out = unsafe { dev.alloc::<$ty>(t * n)? };
+                let mut b = f.builder();
+                b.arg(&wv);
+                b.arg(&xv);
+                b.arg(&out);
+                b.arg(&n32);
+                b.arg(&k32);
+                b.arg(&t32);
+                b.arg(&kind);
+                unsafe { b.launch(warp_per_row(n)) }.w()?;
+                CudaStorage::wrap_cuda_slice(out, dev.clone())
+            }};
+        }
+        let out = match dtype {
+            DType::F32 => go!(f32),
+            DType::BF16 => go!(bf16),
+            DType::F16 => go!(f16),
+            d => candle_core::bail!("kquant gemv: unsupported dtype {d:?}"),
+        };
+        Ok((out, Shape::from((t, n))))
+    }
+}
+
+/// Decode a packed K-quant weight (`data` U8 `[rows, row_bytes]`) to `[rows, cols]` of `dtype`.
+pub fn kquant_dequant(q: &crate::gguf::KQuant, dtype: DType) -> CResult<Tensor> {
+    q.data.contiguous()?.apply_op1_no_bwd(&KqDequant { dtype, kind: q.kind, cols: q.cols })
+}
+
+/// `x [T <= 8, cols]` times a packed K-quant weight -> `[T, rows]`, in float arithmetic on the
+/// activations as they are (the reference for [`kquant_gemv`]).
+pub fn kquant_gemv_exact(x: &Tensor, q: &crate::gguf::KQuant) -> CResult<Tensor> {
+    q.data.contiguous()?.apply_op2_no_bwd(&x.contiguous()?, &KqGemv { kind: q.kind, cols: q.cols })
+}
+
+struct KqPrep;
+
+/// f32 words one row of prepared activations takes (`KQ_PREP_STRIDE` in quant.cu).
+fn kq_prep_stride(k: usize) -> usize {
+    k / 4 + k / 32 + k / 16
+}
+
+impl candle_core::CustomOp1 for KqPrep {
+    fn name(&self) -> &'static str {
+        "carbon-kquant-prep"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, x: &CudaStorage, xl: &Layout) -> CResult<(CudaStorage, Shape)> {
+        let (t, k) = xl.shape().dims2()?;
+        if k % 256 != 0 {
+            candle_core::bail!("kquant prep: {k} columns");
+        }
+        let dev = x.device().clone();
+        let dtype = x.dtype();
+        let f = kernel!(dev, format!("kq_prep_{}", suffix(dtype)?));
+        let stride = kq_prep_stride(k);
+        let out = unsafe { dev.alloc::<f32>(t * stride)? };
+        let (k32, t32) = (k as i32, t as i32);
+        macro_rules! go {
+            ($ty:ty) => {{
+                let xv = view::<$ty>(x, xl)?;
+                let mut b = f.builder();
+                b.arg(&xv);
+                b.arg(&out);
+                b.arg(&k32);
+                b.arg(&t32);
+                unsafe { b.launch(warp_per_group(t * k / 32)) }.w()?;
+            }};
+        }
+        match dtype {
+            DType::F32 => go!(f32),
+            DType::BF16 => go!(bf16),
+            DType::F16 => go!(f16),
+            d => candle_core::bail!("kquant prep: unsupported dtype {d:?}"),
+        }
+        Ok((CudaStorage::wrap_cuda_slice(out, dev), Shape::from((t, stride))))
+    }
+}
+
+struct KqGemvI8 {
+    kind: crate::gguf::KKind,
+    cols: usize,
+    dtype: DType,
+}
+
+impl CustomOp2 for KqGemvI8 {
+    fn name(&self) -> &'static str {
+        "carbon-kquant-gemv-i8"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, w: &CudaStorage, wl: &Layout, p: &CudaStorage, pl: &Layout) -> CResult<(CudaStorage, Shape)> {
+        let (n, row_bytes) = wl.shape().dims2()?;
+        let (t, stride) = pl.shape().dims2()?;
+        let k = self.cols;
+        if stride != kq_prep_stride(k) || t > MAX_GEMV_ROWS || row_bytes != k / 256 * self.kind.block_bytes() {
+            candle_core::bail!("kquant gemv: bad shapes {:?} x {:?}", wl.shape(), pl.shape());
+        }
+        let dev = w.device().clone();
+        let f = kernel!(dev, format!("kq_gemv_i8_{}", suffix(self.dtype)?));
+        let (wv, pv) = (view::<u8>(w, wl)?, view::<f32>(p, pl)?);
+        let (n32, k32, t32, kind) = (n as i32, k as i32, t as i32, self.kind as i32);
+        let out = with_out!(dev, self.dtype, t * n, |out| {
+            let mut b = f.builder();
+            b.arg(&wv);
+            b.arg(&pv);
+            b.arg(&out);
+            b.arg(&n32);
+            b.arg(&k32);
+            b.arg(&t32);
+            b.arg(&kind);
+            unsafe { b.launch(warp_per_row(n)) }.w()?;
+        });
+        Ok((out, Shape::from((t, n))))
+    }
+}
+
+fn kq_tc_ptx() -> CResult<&'static str> {
+    static PTX: OnceLock<Result<String, String>> = OnceLock::new();
+    PTX.get_or_init(|| {
+        let opts = CompileOptions {
+            arch: Some(nvrtc_arch(80)),
+            ..Default::default()
+        };
+        let src = format!("{}\n{}", include_str!("quant.cu"), include_str!("kquant_tc.cu"));
+        compile_ptx_with_opts(src, opts)
+            .map(|p| p.to_src())
+            .map_err(|e| format!("{e:?}"))
+    })
+    .as_ref()
+    .map(|s| s.as_str())
+    .map_err(|e| candle_core::Error::Msg(format!("NVRTC failed to compile carbon kquant tc: {e}")))
+}
+
+struct KqGemmTc {
+    kind: crate::gguf::KKind,
+    cols: usize,
+    dtype: DType,
+}
+
+impl CustomOp2 for KqGemmTc {
+    fn name(&self) -> &'static str {
+        "carbon-kquant-gemm-tc"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, w: &CudaStorage, wl: &Layout, p: &CudaStorage, pl: &Layout) -> CResult<(CudaStorage, Shape)> {
+        let (n, row_bytes) = wl.shape().dims2()?;
+        let (t, stride) = pl.shape().dims2()?;
+        let k = self.cols;
+        if stride != kq_prep_stride(k) || t > MAX_GEMV_ROWS || row_bytes != k / 256 * self.kind.block_bytes() {
+            candle_core::bail!("kquant gemm: bad shapes {:?} x {:?}", wl.shape(), pl.shape());
+        }
+        let dev = w.device().clone();
+        let f = dev.get_or_load_custom_func(
+            &format!("kq_gemm_tc_{}", suffix(self.dtype)?),
+            "carbon_kq_tc",
+            kq_tc_ptx()?,
+        )?;
+        let (wv, pv) = (view::<u8>(w, wl)?, view::<f32>(p, pl)?);
+        let (n32, k32, t32, kind) = (n as i32, k as i32, t as i32, self.kind as i32);
+        // one warp per 16 rows; wide weights with few rows give a block's 4 warps the same rows
+        // and a quarter of the columns each
+        let split: i32 = if k / 256 >= 32 && n <= 16384 { 4 } else { 1 };
+        let tiles = n.div_ceil(16);
+        let cfg = LaunchConfig {
+            grid_dim: (if split > 1 { tiles } else { tiles.div_ceil(4) } as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let out = with_out!(dev, self.dtype, t * n, |out| {
+            let mut b = f.builder();
+            b.arg(&wv);
+            b.arg(&pv);
+            b.arg(&out);
+            b.arg(&n32);
+            b.arg(&k32);
+            b.arg(&t32);
+            b.arg(&kind);
+            b.arg(&split);
+            unsafe { b.launch(cfg) }.w()?;
+        });
+        Ok((out, Shape::from((t, n))))
+    }
+}
+
+/// [`kquant_gemv_prepared`] on integer tensor cores (sm_80+): up to 8 rows at about the cost of
+/// one, for multi-token decode steps.
+pub fn kquant_gemm_tc(prep: &Tensor, q: &crate::gguf::KQuant, dtype: DType) -> CResult<Tensor> {
+    q.data.contiguous()?.apply_op2_no_bwd(prep, &KqGemmTc { kind: q.kind, cols: q.cols, dtype })
+}
+
+/// The tensor-core K-quant GEMM is usable here (`CARBON_KQ_TC=0` turns it off).
+pub fn kquant_tc_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("CARBON_KQ_TC").is_ok_and(|v| v == "0") && kq_tc_ptx().is_ok())
+}
+
+static KQ_MULTI_TOKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tell the K-quant kernels whether decode steps of several tokens are expected (speculative
+/// decoding). Set once, before the first step: see [`kquant_use_tc`].
+pub fn kquant_expect_multi_token(on: bool) {
+    KQ_MULTI_TOKEN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether an `n`-row weight uses the tensor-core GEMM instead of the per-row dp4a kernel.
+/// The choice must not depend on the number of token rows: the two kernels add a row's terms
+/// in different orders, and a multi-token verify step has to reproduce exactly what
+/// single-token steps compute. So it follows the engine's mode: with speculative decoding most
+/// steps carry several tokens, which the GEMM takes at about the cost of one (dp4a's cost grows
+/// with every row); without it dp4a is about 10% faster. A warp of the GEMM walks its 16 weight
+/// rows' columns serially, so small weights stay on dp4a either way.
+/// `CARBON_KQ_TC_ROWS=N` sets the smallest weight (rows) for the GEMM regardless of the mode.
+pub fn kquant_use_tc(_kind: crate::gguf::KKind, n: usize, _t: usize) -> bool {
+    static MIN: OnceLock<Option<usize>> = OnceLock::new();
+    let forced = *MIN.get_or_init(|| std::env::var("CARBON_KQ_TC_ROWS").ok().and_then(|v| v.parse().ok()));
+    let min = match forced {
+        Some(m) => m,
+        None if KQ_MULTI_TOKEN.load(std::sync::atomic::Ordering::Relaxed) => 4096,
+        None => return false,
+    };
+    n >= min && kquant_tc_enabled()
+}
+
+/// Activations `x [T <= 8, cols]` quantized to 8 bits per 32 inputs, for [`kquant_gemv_prepared`].
+/// Projections that read the same input share one.
+pub fn kquant_prep(x: &Tensor) -> CResult<Tensor> {
+    x.contiguous()?.apply_op1_no_bwd(&KqPrep)
+}
+
+/// `CARBON_KQ_FUSE=0`: a decode step's SiLU, gate * up product and activation prep stay
+/// separate launches (for comparisons).
+pub fn kquant_step_fusion() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CARBON_KQ_FUSE").map_or(true, |v| v != "0"))
+}
+
+/// A warp per 32 inputs (`kq_prep_warp`).
+fn warp_per_group(groups: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (groups.div_ceil(8).max(1) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+struct KqSiluMulPrep;
+
+impl CustomOp2 for KqSiluMulPrep {
+    fn name(&self) -> &'static str {
+        "carbon-kquant-silu-mul-prep"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, g: &CudaStorage, gl: &Layout, u: &CudaStorage, ul: &Layout) -> CResult<(CudaStorage, Shape)> {
+        let (t, k) = gl.shape().dims2()?;
+        if k % 256 != 0 || gl.shape() != ul.shape() || g.dtype() != u.dtype() {
+            candle_core::bail!("kquant silu mul prep: bad shapes {:?} / {:?}", gl.shape(), ul.shape());
+        }
+        let dev = g.device().clone();
+        let dtype = g.dtype();
+        let f = kernel!(dev, format!("kq_silu_mul_prep_{}", suffix(dtype)?));
+        let stride = kq_prep_stride(k);
+        let out = unsafe { dev.alloc::<f32>(t * stride)? };
+        let (k32, t32) = (k as i32, t as i32);
+        macro_rules! go {
+            ($ty:ty) => {{
+                let (gv, uv) = (view::<$ty>(g, gl)?, view::<$ty>(u, ul)?);
+                let mut b = f.builder();
+                b.arg(&gv);
+                b.arg(&uv);
+                b.arg(&out);
+                b.arg(&k32);
+                b.arg(&t32);
+                unsafe { b.launch(warp_per_group(t * k / 32)) }.w()?;
+            }};
+        }
+        match dtype {
+            DType::F32 => go!(f32),
+            DType::BF16 => go!(bf16),
+            DType::F16 => go!(f16),
+            d => candle_core::bail!("kquant silu mul prep: unsupported dtype {d:?}"),
+        }
+        Ok((CudaStorage::wrap_cuda_slice(out, dev), Shape::from((t, stride))))
+    }
+}
+
+/// Prepared activations of `silu(g) * u` (`[T <= 8, k]` each) for [`kquant_gemv_with`].
+pub fn kquant_silu_mul_prep(g: &Tensor, u: &Tensor) -> CResult<Tensor> {
+    g.contiguous()?.apply_op2_no_bwd(&u.contiguous()?, &KqSiluMulPrep)
+}
+
+/// A packed K-quant weight times prepared activations -> `[T, rows]` of `dtype`.
+pub fn kquant_gemv_prepared(prep: &Tensor, q: &crate::gguf::KQuant, dtype: DType) -> CResult<Tensor> {
+    q.data.contiguous()?.apply_op2_no_bwd(prep, &KqGemvI8 { kind: q.kind, cols: q.cols, dtype })
+}
+
+/// `CARBON_KQ_EXACT=1`: K-quant GEMVs in float arithmetic on unquantized activations.
+pub fn kquant_exact() -> bool {
+    static EXACT: OnceLock<bool> = OnceLock::new();
+    *EXACT.get_or_init(|| std::env::var("CARBON_KQ_EXACT").is_ok_and(|v| v == "1"))
+}
+
+struct KqMulti<'a> {
+    weights: &'a [&'a crate::gguf::KQuant],
+    dtype: DType,
+    tc: bool,
+}
+
+impl candle_core::CustomOp1 for KqMulti<'_> {
+    fn name(&self) -> &'static str {
+        "carbon-kquant-multi"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, p: &CudaStorage, pl: &Layout) -> CResult<(CudaStorage, Shape)> {
+        let (t, stride) = pl.shape().dims2()?;
+        let ws = self.weights;
+        if ws.is_empty() || ws.len() > 4 || t > MAX_GEMV_ROWS {
+            candle_core::bail!("kquant multi: {} weights, {t} rows", ws.len());
+        }
+        let k = ws[0].cols;
+        if stride != kq_prep_stride(k) || ws.iter().any(|q| q.cols != k) {
+            candle_core::bail!("kquant multi: the weights do not share their input width");
+        }
+        let sides = ws.iter().map(|q| Side::new(&q.data, "weight")).collect::<CResult<Vec<_>>>()?;
+        for (q, side) in ws.iter().zip(&sides) {
+            if side.len() != q.rows * (k / 256) * q.kind.block_bytes() {
+                candle_core::bail!("kquant multi: weight size does not match its shape");
+            }
+        }
+        let views = sides.iter().map(|s| s.view::<u8>()).collect::<CResult<Vec<_>>>()?;
+        let dev = p.device().clone();
+        let sfx = suffix(self.dtype)?;
+        let f = if self.tc {
+            dev.get_or_load_custom_func(&format!("kq_gemm_tc_multi_{sfx}"), "carbon_kq_tc", kq_tc_ptx()?)?
+        } else {
+            kernel!(dev, format!("kq_gemv_i8_multi_{sfx}"))
+        };
+        let pv = view::<f32>(p, pl)?;
+        let mut n = [0i32; 4];
+        let mut kinds = 0i32;
+        for (i, q) in ws.iter().enumerate() {
+            n[i] = q.rows as i32;
+            kinds |= (q.kind as i32) << (4 * i);
+        }
+        let total: usize = ws.iter().map(|q| q.rows).sum();
+        let warps: usize = if self.tc { ws.iter().map(|q| q.rows.div_ceil(16)).sum() } else { total };
+        let cfg = LaunchConfig {
+            grid_dim: (warps.div_ceil(4) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k32, t32) = (k as i32, t as i32);
+        let out = with_out!(dev, self.dtype, t * total, |out| {
+            let mut b = f.builder();
+            // unused weight slots repeat the first pointer (their row count is 0)
+            for i in 0..4 {
+                b.arg(&views[i.min(views.len() - 1)]);
+            }
+            b.arg(&pv);
+            b.arg(&out);
+            b.arg(&n[0]);
+            b.arg(&n[1]);
+            b.arg(&n[2]);
+            b.arg(&n[3]);
+            b.arg(&kinds);
+            b.arg(&k32);
+            b.arg(&t32);
+            unsafe { b.launch(cfg) }.w()?;
+        });
+        Ok((out, Shape::from(t * total)))
+    }
+}
+
+/// Up to 4 packed K-quant weights times the same prepared activations, in one launch:
+/// `[T, rows]` per weight. A decode step otherwise pays each launch's ramp-up and tail.
+pub fn kquant_gemv_multi(prep: &Tensor, ws: &[&crate::gguf::KQuant], dtype: DType) -> CResult<Vec<Tensor>> {
+    let t = prep.dim(0)?;
+    // one kernel for the group whatever the number of rows (see `kquant_use_tc`)
+    let tc = ws.iter().any(|q| kquant_use_tc(q.kind, q.rows, t));
+    let flat = prep.apply_op1_no_bwd(&KqMulti { weights: ws, dtype, tc })?;
+    let mut out = Vec::with_capacity(ws.len());
+    let mut before = 0;
+    for q in ws {
+        out.push(flat.narrow(0, t * before, t * q.rows)?.reshape((t, q.rows))?);
+        before += q.rows;
+    }
+    Ok(out)
+}
+
+/// A packed K-quant weight times prepared activations ([`kquant_prep`]), on the kernel that
+/// suits the weight and the number of rows.
+pub fn kquant_gemv_with(prep: &Tensor, q: &crate::gguf::KQuant, dtype: DType) -> CResult<Tensor> {
+    if kquant_use_tc(q.kind, q.rows, prep.dim(0)?) {
+        return kquant_gemm_tc(prep, q, dtype);
+    }
+    kquant_gemv_prepared(prep, q, dtype)
+}
+
+/// `x [T <= 8, cols]` times a packed K-quant weight -> `[T, rows]`.
+pub fn kquant_gemv(x: &Tensor, q: &crate::gguf::KQuant) -> CResult<Tensor> {
+    if kquant_exact() {
+        return kquant_gemv_exact(x, q);
+    }
+    let prep = kquant_prep(x)?;
+    if kquant_use_tc(q.kind, q.rows, x.dim(0)?) {
+        return kquant_gemm_tc(&prep, q, x.dtype());
+    }
+    kquant_gemv_prepared(&prep, q, x.dtype())
+}
+
 fn attn_ptx() -> CResult<&'static str> {
     static PTX: OnceLock<Result<String, String>> = OnceLock::new();
     PTX.get_or_init(|| {
@@ -458,6 +938,74 @@ struct PagedDecode {
     starts: Tensor,
     kv_heads: usize,
     scale: f32,
+    /// The chunked kernel's partials (`attn_scratch`), when that kernel runs.
+    scratch: Option<Tensor>,
+    /// Multi-token steps: the rows' chain links (`DeviceBatch::chain`).
+    links: Option<Tensor>,
+    /// Most rows one sequence has in this step (1 without links).
+    max_rows: usize,
+    /// The row-shared kernel whatever the pool size.
+    force_rows: bool,
+}
+
+/// Multi-token steps give every row of a sequence the same slot table (an (offset, end) pair per
+/// row) instead of a copy each: copies make the tables rows x context long, which stops fitting
+/// captured CUDA graphs and costs the host a pass over them every step. Needs the tensor-core
+/// decode kernels (`CARBON_ATTN_SHARED_TABLES=0`: a copy per row).
+pub fn paged_shared_tables() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    SHARED_TABLES.load(std::sync::atomic::Ordering::Relaxed)
+        && *ON.get_or_init(|| {
+            !std::env::var("CARBON_ATTN_SHARED_TABLES").is_ok_and(|v| v == "0") && attn_tc_ptx().is_ok()
+        })
+}
+
+static SHARED_TABLES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The engine allows shared slot tables for models whose attention only goes through the
+/// paged decode kernels (QSA's selection kernel reads cumulative per-row tables).
+pub fn allow_paged_shared_tables(on: bool) {
+    SHARED_TABLES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Pool size (slots) from which a multi-token step's rows share one pass over K and V
+/// (`paged_decode_tc_rows`). Its blocks walk 16 tiles in a row, 4x the per-row kernel's latency,
+/// which only pays once reading K and V dominates. `CARBON_ATTN_ROWS_MIN` overrides.
+fn attn_rows_min() -> usize {
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("CARBON_ATTN_ROWS_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(131072))
+}
+
+/// Prefill attention over int8 pools on the integer tensor-core multiply (query rows at 8
+/// bits, probabilities at 16): about a third faster than converting K and V to the activation
+/// dtype. `CARBON_ATTN_I8=0` selects the float kernel.
+fn attn_int8() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CARBON_ATTN_I8").map_or(true, |v| v != "0"))
+}
+
+/// Fewest warps of a `paged_decode_tc_rows` block: warps beyond a step's (row, head) columns
+/// only stage K and V, which is most of a block's work at one or two rows.
+fn pdr_min_warps() -> usize {
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("CARBON_ATTN_ROWS_WARPS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).clamp(1, 6))
+}
+
+/// f32 scratch of at least `len` elements on `dev`, shared by every decode-attention call that
+/// asks for this size. The chunked kernel writes its per-chunk partials there and the merge
+/// kernel reads them right after, on the same stream, so layers can share it. Allocating per
+/// call would make every captured CUDA graph keep one buffer per layer and batch shape
+/// (gigabytes at long contexts). Buffers are never freed: a captured graph holds their address.
+fn attn_scratch(dev: &candle_core::Device, len: usize) -> CResult<Tensor> {
+    static POOL: OnceLock<parking_lot::Mutex<Vec<(String, Tensor)>>> = OnceLock::new();
+    let key = format!("{:?}", dev.location());
+    let mut pool = POOL.get_or_init(Default::default).lock();
+    if let Some((_, t)) = pool.iter().find(|(k, t)| *k == key && t.elem_count() == len) {
+        return Ok(t.clone());
+    }
+    let t = Tensor::zeros(len, DType::F32, dev)?;
+    pool.push((key, t.clone()));
+    Ok(t)
 }
 
 /// Contiguous range of a u32 CUDA tensor that lives outside the op's inputs.
@@ -500,14 +1048,21 @@ impl CustomOp3 for PagedDecode {
     ) -> CResult<(CudaStorage, Shape)> {
         let (b, h, d) = ql.shape().dims3()?;
         let kvh = self.kv_heads;
-        if kl.shape() != vl.shape() || kl.shape().dims2()?.1 != kvh * d {
+        let dtype = q.dtype();
+        // packed pools (int8 / TurboQuant) are read by the tensor-core kernels only
+        let fmt = pool_format(k, kl, kvh, d)?;
+        let q8 = fmt != KvFormat::Model;
+        if kl.shape() != vl.shape() {
             candle_core::bail!("paged decode: bad kv shape {:?}", kl.shape());
         }
         if !paged_decode_supported(h, kvh, d) {
             candle_core::bail!("paged decode: unsupported head geometry h={h} kvh={kvh} d={d}");
         }
-        let dtype = q.dtype();
-        if k.dtype() != dtype || v.dtype() != dtype {
+        if q8 {
+            if v.dtype() != DType::U8 || !d.is_multiple_of(128) || !paged_decode_tc_supported(h, kvh, d, dtype) {
+                candle_core::bail!("paged decode: int8 KV needs the tensor-core kernel (head dim 128 or 256)");
+            }
+        } else if k.dtype() != dtype || v.dtype() != dtype {
             candle_core::bail!("paged decode: q/k/v dtypes differ");
         }
         let dev = q.device().clone();
@@ -523,13 +1078,143 @@ impl CustomOp3 for PagedDecode {
         let (ta, tb) = u32_range(&self.starts)?;
         let slots = cuda_of(&sg)?.as_cuda_slice::<u32>()?.slice(sa..sb);
         let starts = cuda_of(&tg)?.as_cuda_slice::<u32>()?.slice(ta..tb);
-        if tb - ta != b + 1 {
+        // B + 1 cumulative offsets, or an (offset, end) pair per row (multi-token steps whose rows
+        // share their sequence's table; tensor-core kernels only)
+        let pairs = b >= 2 && tb - ta == 2 * b;
+        if tb - ta != b + 1 && !pairs {
             candle_core::bail!(
                 "paged decode: starts has {} entries for {b} sequences",
                 tb - ta
             );
         }
         let (h32, kvh32, d32) = (h as i32, kvh as i32, d as i32);
+        let pairs32 = i32::from(pairs);
+        if pairs && !paged_decode_tc_supported(h, kvh, d, dtype) {
+            candle_core::bail!("paged decode: shared slot tables need the tensor-core kernel");
+        }
+        if paged_decode_tc_supported(h, kvh, d, dtype) {
+            // chunked tensor-core path: launch shapes depend on the pool size alone (graph safe)
+            let pool_slots = kl.shape().dims2()?.0;
+            let g_heads = h / kvh;
+            let ncw = pool_slots.div_ceil(PD_WP).max(1);
+            // large pools: the row-shared kernel for every step, single-row ones included (each
+            // row its own group), so a verify step reproduces single-token steps bit for bit
+            // (TurboQuant pools have no per-row kernel)
+            let rows_kernel = (self.force_rows || fmt == KvFormat::Turbo4 || pool_slots >= attn_rows_min())
+                && g_heads * MAX_GEMV_ROWS <= 48;
+            if fmt == KvFormat::Turbo4 && !rows_kernel {
+                candle_core::bail!("paged decode: TurboQuant pools take at most 6 query heads per KV head");
+            }
+            let own_links;
+            let links = if !rows_kernel {
+                None
+            } else {
+                Some(match &self.links {
+                    Some(l) => Side::new(l, "links")?,
+                    None => {
+                        own_links = Tensor::zeros(b, DType::U32, &candle_core::Device::Cuda(dev.clone()))?;
+                        Side::new(&own_links, "links")?
+                    }
+                })
+            };
+            if let Some(l) = &links {
+                if l.len() != b {
+                    candle_core::bail!("paged decode: {} links for {b} rows", l.len());
+                }
+            }
+            let f_tc = dev.get_or_load_custom_func(
+                &format!(
+                    "paged_decode_tc_{}{}{}",
+                    if links.is_some() { "rows_" } else { "" },
+                    pool_tag(fmt),
+                    suffix(dtype)?
+                ),
+                "carbon_attn_tc",
+                attn_tc_ptx()?,
+            )?;
+            let f_merge = dev.get_or_load_custom_func(
+                &format!("paged_decode_merge_{}", suffix(dtype)?),
+                "carbon_attn_tc",
+                attn_tc_ptx()?,
+            )?;
+            let scratch = self.scratch.as_ref().ok_or_else(|| candle_core::Error::Msg("paged decode: no scratch".into()))?;
+            let part_side = Side::new(scratch, "scratch")?;
+            if part_side.len() < b * kvh * ncw * PD_G * (d + 2) {
+                candle_core::bail!("paged decode: scratch too small");
+            }
+            let part = part_side.view::<f32>()?;
+            let ncw32 = ncw as i32;
+            macro_rules! go_tc {
+                ($ty:ty) => {{
+                    let qv = view::<$ty>(q, ql)?;
+                    let out = unsafe { dev.alloc::<$ty>(b * h * d)? };
+                    let mut bld = f_tc.builder();
+                    bld.arg(&qv);
+                    let (k8, v8, kh, vh);
+                    if q8 {
+                        (k8, v8) = (view::<u8>(k, kl)?, view::<u8>(v, vl)?);
+                        bld.arg(&k8);
+                        bld.arg(&v8);
+                    } else {
+                        (kh, vh) = (view::<$ty>(k, kl)?, view::<$ty>(v, vl)?);
+                        bld.arg(&kh);
+                        bld.arg(&vh);
+                    }
+                    bld.arg(&slots);
+                    bld.arg(&starts);
+                    let lv;
+                    if let Some(l) = &links {
+                        lv = l.view::<u32>()?;
+                        bld.arg(&lv);
+                    }
+                    bld.arg(&part);
+                    bld.arg(&h32);
+                    bld.arg(&kvh32);
+                    bld.arg(&d32);
+                    bld.arg(&self.scale);
+                    bld.arg(&ncw32);
+                    bld.arg(&pairs32);
+                    let cfg = LaunchConfig {
+                        grid_dim: ((b * kvh * ncw) as u32, 1, 1),
+                        block_dim: (
+                            if links.is_some() {
+                                // one warp per 8 (row, head) columns, and more to help staging
+                                32 * (self.max_rows.clamp(1, MAX_GEMV_ROWS) * g_heads).div_ceil(8).max(pdr_min_warps())
+                                    as u32
+                            } else {
+                                128
+                            },
+                            1,
+                            1,
+                        ),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe { bld.launch(cfg) }.w()?;
+                    let mut bld = f_merge.builder();
+                    bld.arg(&part);
+                    bld.arg(&starts);
+                    bld.arg(&out);
+                    bld.arg(&h32);
+                    bld.arg(&kvh32);
+                    bld.arg(&d32);
+                    bld.arg(&ncw32);
+                    bld.arg(&pairs32);
+                    let cfg = LaunchConfig {
+                        grid_dim: ((b * h) as u32, 1, 1),
+                        block_dim: (d as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe { bld.launch(cfg) }.w()?;
+                    CudaStorage::wrap_cuda_slice(out, dev.clone())
+                }};
+            }
+            let out = match dtype {
+                DType::BF16 => go_tc!(bf16),
+                DType::F16 => go_tc!(f16),
+                d => candle_core::bail!("paged decode tc: unsupported dtype {d:?}"),
+            };
+            return Ok((out, Shape::from((b, h, d))));
+        }
         let cfg = LaunchConfig {
             grid_dim: ((b * h) as u32, 1, 1),
             block_dim: (128, 1, 1),
@@ -568,6 +1253,26 @@ impl CustomOp3 for PagedDecode {
     }
 }
 
+/// Positions per chunk (a block) and query heads per KV head of the chunked decode kernel
+/// (PD_WARPS * PD_WP, PD_G in attention_tc.cu).
+const PD_WP: usize = 256;
+const PD_G: usize = 8;
+
+/// Whether decode attention runs on the chunked tensor-core kernel (sm_80+, half-precision
+/// pools, at most 8 query heads per KV head). `CARBON_ATTN_DECODE_TC=0` keeps the per-head kernel.
+pub fn paged_decode_tc_supported(heads: usize, kv_heads: usize, head_dim: usize, dtype: DType) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    matches!(dtype, DType::BF16 | DType::F16)
+        && head_dim.is_multiple_of(64)
+        && head_dim <= 256
+        && kv_heads > 0
+        && heads.is_multiple_of(kv_heads)
+        && heads / kv_heads <= PD_G
+        && *ON.get_or_init(|| {
+            !std::env::var("CARBON_ATTN_DECODE_TC").is_ok_and(|v| v == "0") && attn_tc_ptx().is_ok()
+        })
+}
+
 /// Whether [`paged_decode`] handles this head geometry.
 pub fn paged_decode_supported(heads: usize, kv_heads: usize, head_dim: usize) -> bool {
     head_dim.is_multiple_of(32) && head_dim <= 256 && kv_heads > 0 && heads.is_multiple_of(kv_heads)
@@ -575,6 +1280,7 @@ pub fn paged_decode_supported(heads: usize, kv_heads: usize, head_dim: usize) ->
 
 /// One decode step of attention for `B` sequences: `q [B, H, D]`, pools `[S, KVH*D]`,
 /// `slots`/`starts` u32 on the same device. Returns `[B, H, D]` in q's dtype.
+#[allow(clippy::too_many_arguments)]
 pub fn paged_decode(
     q: &Tensor,
     k_pool: &Tensor,
@@ -583,7 +1289,35 @@ pub fn paged_decode(
     starts: &Tensor,
     kv_heads: usize,
     scale: f32,
+    links: Option<&Tensor>,
+    max_rows: usize,
 ) -> CResult<Tensor> {
+    paged_decode_with(q, k_pool, v_pool, slots, starts, kv_heads, scale, links, max_rows, false)
+}
+
+/// [`paged_decode`]; `force_rows` takes the row-shared kernel whatever the pool size (self-check
+/// and benchmarks: the engine picks by pool size alone, so that a model's steps all agree).
+#[allow(clippy::too_many_arguments)]
+pub fn paged_decode_with(
+    q: &Tensor,
+    k_pool: &Tensor,
+    v_pool: &Tensor,
+    slots: &Tensor,
+    starts: &Tensor,
+    kv_heads: usize,
+    scale: f32,
+    links: Option<&Tensor>,
+    max_rows: usize,
+    force_rows: bool,
+) -> CResult<Tensor> {
+    let (b, h, d) = q.dims3()?;
+    let scratch = if paged_decode_tc_supported(h, kv_heads, d, q.dtype()) {
+        // sized for a decode step's 8 rows, so every batch shape shares one buffer
+        let ncw = k_pool.dim(0)?.div_ceil(PD_WP).max(1);
+        Some(attn_scratch(q.device(), b.max(MAX_GEMV_ROWS) * kv_heads * ncw * PD_G * (d + 2))?)
+    } else {
+        None
+    };
     q.contiguous()?.apply_op3_no_bwd(
         &k_pool.contiguous()?,
         &v_pool.contiguous()?,
@@ -592,8 +1326,110 @@ pub fn paged_decode(
             starts: starts.contiguous()?,
             kv_heads,
             scale,
+            scratch,
+            links: links.map(|l| l.contiguous()).transpose()?,
+            max_rows: if links.is_some() { max_rows } else { 1 },
+            force_rows,
         },
     )
+}
+
+use crate::kvcache::KvFormat;
+
+/// The format of a KV pool `[slots, width]` holding `kvh` vectors of `d` values per slot.
+fn pool_format(k: &CudaStorage, kl: &Layout, kvh: usize, d: usize) -> CResult<KvFormat> {
+    let width = kl.shape().dims2()?.1;
+    let fmt = if k.dtype() != DType::U8 {
+        KvFormat::Model
+    } else if width == kvh * KvFormat::Q8.vector_bytes(d, DType::U8) {
+        KvFormat::Q8
+    } else {
+        KvFormat::Turbo4
+    };
+    let per = if fmt == KvFormat::Model { d } else { fmt.vector_bytes(d, DType::U8) };
+    if width != kvh * per {
+        candle_core::bail!("kv pool: {width} per slot for {kvh} vectors of {d}");
+    }
+    Ok(fmt)
+}
+
+/// The kernel-name infix of a pool format.
+fn pool_tag(fmt: KvFormat) -> &'static str {
+    match fmt {
+        KvFormat::Model => "",
+        KvFormat::Q8 => "q8_",
+        _ => "tq4_", // pools are detected by storage: the rotated formats all read as Turbo4
+    }
+}
+
+struct KvPackedWrite<'a> {
+    pool: &'a Tensor,
+    kv_heads: usize,
+    fmt: KvFormat,
+}
+
+impl CustomOp2 for KvPackedWrite<'_> {
+    fn name(&self) -> &'static str {
+        "carbon-kv-packed-write"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, x: &CudaStorage, xl: &Layout, idx: &CudaStorage, il: &Layout) -> CResult<(CudaStorage, Shape)> {
+        let (t, width) = xl.shape().dims2()?;
+        let kvh = self.kv_heads;
+        let d = width / kvh.max(1);
+        let w = il.shape().elem_count() / t.max(1);
+        let pool = Side::new(self.pool, "kv pool")?;
+        let dtype = x.dtype();
+        let kernel = match self.fmt {
+            KvFormat::Q8 => "kv_q8_write",
+            KvFormat::Turbo4 if d.is_multiple_of(64) => "kv_tq4_write",
+            f => candle_core::bail!("kv write: no packed writer for {f:?} at head dim {d}"),
+        };
+        if kvh == 0 || width != kvh * d || d > 256 || il.shape().elem_count() != t * w || w == 0
+            || pool.len() % (kvh * self.fmt.vector_bytes(d, dtype)) != 0
+        {
+            candle_core::bail!("kv write: bad shapes {:?} / {:?}", xl.shape(), il.shape());
+        }
+        let dev = x.device().clone();
+        let f = dev.get_or_load_custom_func(&format!("{kernel}_{}", suffix(dtype)?), "carbon_attn_tc", attn_tc_ptx()?)?;
+        let (pv, iv) = (pool.view::<u8>()?, view::<u32>(idx, il)?);
+        let (kvh32, d32, w32) = (kvh as i32, d as i32, w as i32);
+        let cfg = LaunchConfig {
+            grid_dim: ((t * kvh) as u32, 1, 1),
+            block_dim: ((d.div_ceil(32) * 32) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        macro_rules! go {
+            ($ty:ty) => {{
+                let xv = view::<$ty>(x, xl)?;
+                let mut b = f.builder();
+                b.arg(&xv);
+                b.arg(&pv);
+                b.arg(&iv);
+                b.arg(&kvh32);
+                b.arg(&d32);
+                b.arg(&w32);
+                unsafe { b.launch(cfg) }.w()?;
+            }};
+        }
+        match dtype {
+            DType::BF16 => go!(bf16),
+            DType::F16 => go!(f16),
+            d => candle_core::bail!("kv write: unsupported dtype {d:?}"),
+        }
+        // nothing to return: the pool was written in place
+        let out = unsafe { dev.alloc::<u32>(1)? };
+        Ok((CudaStorage::wrap_cuda_slice(out, dev), Shape::from(1)))
+    }
+}
+
+/// Pack new keys or values `x [T, kv_heads * D]` (TurboQuant: already rotated) into a packed
+/// pool at the slots of `scatter_idx` (`[T, W]` u32, a row's elements all its slot).
+pub fn kv_packed_write(x: &Tensor, pool: &Tensor, scatter_idx: &Tensor, kv_heads: usize, fmt: KvFormat) -> CResult<()> {
+    x.contiguous()?.apply_op2_no_bwd(&scatter_idx.contiguous()?, &KvPackedWrite { pool, kv_heads, fmt })?;
+    Ok(())
 }
 
 // ---- MoE decode: device routing + grouped expert GEMVs over raw weight pointers (moe.cu) ----
@@ -1508,6 +2344,8 @@ pub struct GdnLayer<'a> {
     pub eps: f32,
     /// Output gate `sigmoid(z)` instead of `silu(z)`.
     pub gate_sigmoid: bool,
+    /// Value heads tiled over the key heads (GGUF layout) instead of grouped by key head.
+    pub v_tiled: bool,
 }
 
 /// Whether [`gdn_decode`] handles these head dims.
@@ -1644,11 +2482,18 @@ impl candle_core::CustomOp1 for GdnDecode<'_> {
                 bld.arg(&dk32);
                 bld.arg(&dv32);
                 bld.arg(&l.eps);
-                let gs = i32::from(l.gate_sigmoid);
+                let gs = i32::from(l.gate_sigmoid) | (i32::from(l.v_tiled) << 1);
                 bld.arg(&gs);
+                // several threads per state column (GDN_MAX_PARTS, GDN_PART_ROWS in gdn.cu); blocks
+                // of 1024 threads exceed the register budget of a launch
+                let jw = dv.div_ceil(32) * 32;
+                let parts = [4usize, 2]
+                    .into_iter()
+                    .find(|&p| p * jw <= 512 && dk.is_multiple_of(p) && dk / p <= 32)
+                    .unwrap_or(1);
                 let cfg = LaunchConfig {
                     grid_dim: ((b * hv) as u32, 1, 1),
-                    block_dim: (128, 1, 1),
+                    block_dim: (if parts > 1 { parts * jw } else { 128 } as u32, 1, 1),
                     shared_mem_bytes: 0,
                 };
                 unsafe { bld.launch(cfg) }.w()?;
@@ -1663,6 +2508,208 @@ impl candle_core::CustomOp1 for GdnDecode<'_> {
         };
         Ok((out, Shape::from((b, hv * dv))))
     }
+}
+
+// ---- prefill of one sequence on the fused kernels (gdn.cu: gdn_pre / gates / seq2 / post) ----
+
+struct GdnPrefill<'a> {
+    layer: &'a GdnLayer<'a>,
+    z: &'a Tensor,
+    braw: &'a Tensor,
+    araw: &'a Tensor,
+    /// u32 `[1]`: the sequence's state slot.
+    idx: &'a Tensor,
+    /// The sequence starts in this chunk: its state is zero.
+    zero: bool,
+}
+
+/// State rows a thread of `gdn_seq2` holds (gdn.cu).
+const GDN_SEQ_ROWS: usize = 32;
+/// Warps per block of `gdn_seq2` (gdn.cu).
+const GDN_SEQ_WARPS: usize = 4;
+
+/// Whether [`gdn_prefill`] handles this layer geometry.
+pub fn gdn_prefill_supported(hk: usize, hv: usize, dk: usize, dv: usize) -> bool {
+    matches!(dk, 32 | 64 | 128 | 256) && hk > 0 && hv.is_multiple_of(hk) && (hv * dv).is_multiple_of(32)
+}
+
+impl candle_core::CustomOp1 for GdnPrefill<'_> {
+    fn name(&self) -> &'static str {
+        "carbon-gdn-prefill"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, qkv: &CudaStorage, ql: &Layout) -> CResult<(CudaStorage, Shape)> {
+        let l = self.layer;
+        let (t, c) = ql.shape().dims2()?;
+        let (hk, hv, dk, dv) = (l.hk, l.hv, l.dk, l.dv);
+        if c != 2 * hk * dk + hv * dv || !gdn_prefill_supported(hk, hv, dk, dv) {
+            candle_core::bail!("gdn prefill: bad geometry");
+        }
+        let dtype = qkv.dtype();
+        let taps = Side::new(l.taps, "taps")?;
+        let kernel = taps.len() / c;
+        let sides = [
+            (Side::new(self.z, "z")?, t * hv * dv),
+            (Side::new(self.braw, "b")?, t * hv),
+            (Side::new(self.araw, "a")?, t * hv),
+            (Side::new(self.idx, "slot")?, 1),
+            (Side::new(l.dt_bias, "dt_bias")?, hv),
+            (Side::new(l.a_neg, "a_neg")?, hv),
+            (Side::new(l.norm_w, "norm")?, dv),
+        ];
+        if taps.len() != kernel * c || kernel == 0 || kernel > 9 || sides.iter().any(|(s, n)| s.len() != *n) {
+            candle_core::bail!("gdn prefill: input sizes do not match the layer");
+        }
+        let km1 = kernel - 1;
+        let [(z, _), (braw, _), (araw, _), (idx, _), (dt_bias, _), (a_neg, _), (norm_w, _)] = sides;
+        let conv_pool = Side::new(l.conv_pool, "conv pool")?;
+        let ssm_pool = Side::new(l.ssm_pool, "ssm pool")?;
+        if conv_pool.len() % (km1 * c).max(1) != 0 || ssm_pool.len() % (hv * dk * dv) != 0 {
+            candle_core::bail!("gdn prefill: state pools do not match the layer");
+        }
+        let dev = qkv.device().clone();
+        let sfx = suffix(dtype)?;
+        let load = |name: String| dev.get_or_load_custom_func(&name, "carbon_gdn", gdn_ptx()?);
+        let (f_pre, f_tail, f_gates, f_post) = (
+            load(format!("gdn_pre_{sfx}"))?,
+            load(format!("gdn_conv_tail_{sfx}"))?,
+            load(format!("gdn_gates_{sfx}"))?,
+            load(format!("gdn_post_{sfx}"))?,
+        );
+        let f_seq = load("gdn_seq2".to_string())?;
+        let act = unsafe { dev.alloc::<f32>(t * c)? };
+        let bd = unsafe { dev.alloc::<f32>(2 * t * hv)? };
+        let o = unsafe { dev.alloc::<f32>(t * hv * dv)? };
+        let idx = idx.view::<u32>()?;
+        let (dt_bias, a_neg) = (dt_bias.view::<f32>()?, a_neg.view::<f32>()?);
+        let ssm = ssm_pool.view::<f32>()?;
+        let (t32, c32, km1_32, zero) = (t as i32, c as i32, km1 as i32, i32::from(self.zero));
+        let (hk32, hv32, dk32, dv32) = (hk as i32, hv as i32, dk as i32, dv as i32);
+        let warps = |n: usize| LaunchConfig {
+            grid_dim: (n.div_ceil(8).clamp(1, 8192) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        macro_rules! go {
+            ($ty:ty) => {{
+                let xv = view::<$ty>(qkv, ql)?;
+                let pool = conv_pool.view::<$ty>()?;
+                let tv = taps.view::<$ty>()?;
+                let mut b = f_pre.builder();
+                b.arg(&xv);
+                b.arg(&pool);
+                b.arg(&idx);
+                b.arg(&tv);
+                b.arg(&act);
+                b.arg(&t32);
+                b.arg(&c32);
+                b.arg(&km1_32);
+                b.arg(&hk32);
+                b.arg(&dk32);
+                b.arg(&zero);
+                unsafe { b.launch(warps(t * (2 * hk + hv * dv / 32))) }.w()?;
+                drop(b);
+                // the conv state moves on only after gdn_pre has read it
+                let mut b = f_tail.builder();
+                b.arg(&xv);
+                b.arg(&pool);
+                b.arg(&idx);
+                b.arg(&t32);
+                b.arg(&c32);
+                b.arg(&km1_32);
+                b.arg(&zero);
+                unsafe { b.launch(grid_stride(c)) }.w()?;
+                drop(b);
+
+                let (zv, bv, av, nv) =
+                    (z.view::<$ty>()?, braw.view::<$ty>()?, araw.view::<$ty>()?, norm_w.view::<$ty>()?);
+                let mut b = f_gates.builder();
+                b.arg(&bv);
+                b.arg(&av);
+                b.arg(&dt_bias);
+                b.arg(&a_neg);
+                b.arg(&bd);
+                b.arg(&t32);
+                b.arg(&hv32);
+                unsafe { b.launch(grid_stride(t * hv)) }.w()?;
+                drop(b);
+
+                let flags = zero | (i32::from(l.v_tiled) << 1);
+                let mut b = f_seq.builder();
+                b.arg(&act);
+                b.arg(&bd);
+                b.arg(&ssm);
+                b.arg(&idx);
+                b.arg(&o);
+                b.arg(&t32);
+                b.arg(&c32);
+                b.arg(&hk32);
+                b.arg(&hv32);
+                b.arg(&dk32);
+                b.arg(&dv32);
+                b.arg(&flags);
+                // a warp holds 32 / (dk / GDN_SEQ_ROWS) state columns of a head; a block is
+                // GDN_SEQ_WARPS warps of one head
+                let bph = dv.div_ceil(GDN_SEQ_WARPS * 32 / (dk / GDN_SEQ_ROWS));
+                let cfg = LaunchConfig {
+                    grid_dim: ((hv * bph) as u32, 1, 1),
+                    block_dim: ((GDN_SEQ_WARPS * 32) as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe { b.launch(cfg) }.w()?;
+                drop(b);
+
+                let out = unsafe { dev.alloc::<$ty>(t * hv * dv)? };
+                let rows = (t * hv) as i64;
+                let gate = i32::from(l.gate_sigmoid);
+                let mut b = f_post.builder();
+                b.arg(&o);
+                b.arg(&zv);
+                b.arg(&nv);
+                b.arg(&out);
+                b.arg(&rows);
+                b.arg(&dv32);
+                b.arg(&l.eps);
+                b.arg(&gate);
+                unsafe { b.launch(warps(t * hv)) }.w()?;
+                drop(b);
+                CudaStorage::wrap_cuda_slice(out, dev.clone())
+            }};
+        }
+        let out = match dtype {
+            DType::F32 => go!(f32),
+            DType::BF16 => go!(bf16),
+            DType::F16 => go!(f16),
+            d => candle_core::bail!("gdn prefill: unsupported dtype {d:?}"),
+        };
+        Ok((out, Shape::from((t, hv * dv))))
+    }
+}
+
+/// A whole chunk of one sequence through a Gated DeltaNet layer: `qkv [T, conv_dim]`,
+/// `z [T, hv*dv]`, `braw` / `araw [T, hv]` (projection outputs, model dtype), `slot` u32 `[1]`.
+/// Reads the sequence's conv and recurrent state from its slot (zero when `start`), leaves the
+/// state after the chunk there and returns the gated, normalised core output `[T, hv*dv]`.
+pub fn gdn_prefill(
+    layer: &GdnLayer<'_>,
+    qkv: &Tensor,
+    z: &Tensor,
+    braw: &Tensor,
+    araw: &Tensor,
+    slot: &Tensor,
+    start: bool,
+) -> CResult<Tensor> {
+    let (z, braw, araw) = (z.contiguous()?, braw.contiguous()?, araw.contiguous()?);
+    qkv.contiguous()?.apply_op1_no_bwd(&GdnPrefill {
+        layer,
+        z: &z,
+        braw: &braw,
+        araw: &araw,
+        idx: &slot.contiguous()?,
+        zero: start,
+    })
 }
 
 /// One Gated DeltaNet decode step for `B` sequences (one token each): `qkv [B, conv_dim]`,
@@ -1722,7 +2769,7 @@ fn attn_tc_ptx() -> CResult<&'static str> {
 
 /// Whether prefill attention on `dev` runs on tensor cores for this dtype / head dim:
 /// bf16 or f16, head dim 64 / 128 / 256, compute capability 8.0+, `CARBON_ATTN_TC` not `0`.
-fn prefill_on_tensor_cores(dev: &candle_core::CudaDevice, dtype: DType, d: usize) -> bool {
+pub(crate) fn prefill_on_tensor_cores(dev: &candle_core::CudaDevice, dtype: DType, d: usize) -> bool {
     static ENV: OnceLock<bool> = OnceLock::new();
     let on = *ENV.get_or_init(|| std::env::var("CARBON_ATTN_TC").map_or(true, |v| v != "0"));
     on && matches!(dtype, DType::BF16 | DType::F16)
@@ -1768,14 +2815,20 @@ impl CustomOp3 for FlashPrefill<'_> {
     ) -> CResult<(CudaStorage, Shape)> {
         let (t, h, d) = ql.shape().dims3()?;
         let kvh = self.kv_heads;
-        if kl.shape() != vl.shape() || kl.shape().dims2()?.1 != kvh * d {
+        let dtype = q.dtype();
+        let fmt = pool_format(k, kl, kvh, d)?;
+        let q8 = fmt != KvFormat::Model;
+        if kl.shape() != vl.shape() {
             candle_core::bail!("flash prefill: bad kv shape {:?}", kl.shape());
         }
         if !paged_decode_supported(h, kvh, d) {
             candle_core::bail!("flash prefill: unsupported head geometry h={h} kvh={kvh} d={d}");
         }
-        let dtype = q.dtype();
-        if k.dtype() != dtype || v.dtype() != dtype {
+        if q8 {
+            if v.dtype() != DType::U8 || !prefill_on_tensor_cores(q.device(), dtype, d) {
+                candle_core::bail!("flash prefill: int8 KV needs the tensor-core kernel");
+            }
+        } else if k.dtype() != dtype || v.dtype() != dtype {
             candle_core::bail!("flash prefill: q/k/v dtypes differ");
         }
         let slots = Side::new(self.slots, "slots")?;
@@ -1786,12 +2839,16 @@ impl CustomOp3 for FlashPrefill<'_> {
         let tc = prefill_on_tensor_cores(&dev, dtype, d);
         let (f, blocks) = if tc {
             let f = dev.get_or_load_custom_func(
-                &format!("flash_prefill_tc_{}_d{d}", suffix(dtype)?),
+                &format!(
+                    "flash_prefill_tc_{}{}_d{d}",
+                    if fmt == KvFormat::Q8 && d % 32 == 0 && attn_int8() { "q8i_" } else { pool_tag(fmt) },
+                    suffix(dtype)?
+                ),
                 "carbon_attn_tc",
                 attn_tc_ptx()?,
             )?;
-            // one block per (tile, head, slice of up to 128 output dims)
-            (f, n_tiles * h * d.div_ceil(128))
+            // one block per (tile, head, slice of up to 128 output dims); see `group` below
+            (f, n_tiles * h)
         } else {
             let f = dev.get_or_load_custom_func(
                 &format!("flash_prefill_{}", suffix(dtype)?),
@@ -1807,24 +2864,38 @@ impl CustomOp3 for FlashPrefill<'_> {
             tiles.view::<u32>()?,
         );
         let (h32, kvh32, d32) = (h as i32, kvh as i32, d as i32);
+        // tensor cores: heads that share a KV head go in one block (4 warps each) and share the
+        // staged K / V tiles: 3 per block, 2 at head dim 256, whose kernel holds more registers
+        // (a launch's register budget caps threads x registers). `CARBON_PREFILL_GROUP=N` caps it.
+        static GROUP: OnceLock<usize> = OnceLock::new();
+        let cap = *GROUP.get_or_init(|| {
+            std::env::var("CARBON_PREFILL_GROUP").ok().and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 3)
+        });
+        let max_group = cap.min(if d > 128 { 2 } else { 3 });
+        let g = h / kvh;
+        let hb = if tc { (1..=max_group).rev().find(|n| g.is_multiple_of(*n)).unwrap_or(1) } else { 1 };
         let cfg = LaunchConfig {
-            grid_dim: (blocks as u32, 1, 1),
-            block_dim: (128, 1, 1),
+            grid_dim: ((blocks / hb) as u32, 1, 1),
+            block_dim: ((hb * 128) as u32, 1, 1),
             shared_mem_bytes: 0,
         };
         macro_rules! go {
             ($ty:ty) => {{
-                let (qv, kv, vv) = (
-                    view::<$ty>(q, ql)?,
-                    view::<$ty>(k, kl)?,
-                    view::<$ty>(v, vl)?,
-                );
+                let qv = view::<$ty>(q, ql)?;
                 // zeroed: rows no tile covers (none, when the tables are consistent) stay finite
                 let out = dev.alloc_zeros::<$ty>(t * h * d)?;
                 let mut b = f.builder();
                 b.arg(&qv);
-                b.arg(&kv);
-                b.arg(&vv);
+                let (k8, v8, kh, vh);
+                if q8 {
+                    (k8, v8) = (view::<u8>(k, kl)?, view::<u8>(v, vl)?);
+                    b.arg(&k8);
+                    b.arg(&v8);
+                } else {
+                    (kh, vh) = (view::<$ty>(k, kl)?, view::<$ty>(v, vl)?);
+                    b.arg(&kh);
+                    b.arg(&vh);
+                }
                 b.arg(&sv);
                 b.arg(&iv);
                 b.arg(&tv);
@@ -2129,6 +3200,50 @@ pub fn sample_on_gpu(logits: &Tensor, rows: &[RowSampling]) -> CResult<Vec<(u32,
         .apply_op2_no_bwd(&params, &GpuSample)?
         .to_vec2::<u32>()?;
     Ok(out.into_iter().map(|r| (r[0], r[1] != 0)).collect())
+}
+
+struct LogitPick;
+
+impl candle_core::CustomOp1 for LogitPick {
+    fn name(&self) -> &'static str {
+        "carbon-logit-pick"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> CResult<(CpuStorage, Shape)> {
+        candle_core::bail!("cuda only")
+    }
+    fn cuda_fwd(&self, x: &CudaStorage, xl: &Layout) -> CResult<(CudaStorage, Shape)> {
+        const PARTS: usize = 32; // LP_PARTS in quant.cu
+        let (r, v) = xl.shape().dims2()?;
+        let dev = x.device().clone();
+        let f_part = kernel!(dev, "logit_pick_part".to_string());
+        let f_merge = kernel!(dev, "logit_pick_merge".to_string());
+        let xv = view::<f32>(x, xl)?;
+        let part = unsafe { dev.alloc::<f32>(r * PARTS * 3)? };
+        let out = unsafe { dev.alloc::<f32>(r * 2)? };
+        let (r32, v32) = (r as i32, v as i32);
+        let mut b = f_part.builder();
+        b.arg(&xv);
+        b.arg(&part);
+        b.arg(&r32);
+        b.arg(&v32);
+        let cfg = LaunchConfig { grid_dim: ((r * PARTS) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(cfg) }.w()?;
+        let mut b = f_merge.builder();
+        b.arg(&part);
+        b.arg(&out);
+        b.arg(&r32);
+        let cfg = LaunchConfig { grid_dim: (r as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(cfg) }.w()?;
+        Ok((CudaStorage::wrap_cuda_slice(out, dev), Shape::from((r, 2))))
+    }
+}
+
+/// Greedy pick per row of f32 `logits` `[R, V]` on CUDA: the argmax (lowest index on ties) and
+/// its softmax probability, in one pass (the generic argmax / max / sum reductions take about
+/// 0.1 ms each over a 250k vocabulary).
+pub fn logit_pick(logits: &Tensor) -> CResult<Vec<(u32, f32)>> {
+    let out = logits.to_dtype(DType::F32)?.contiguous()?.apply_op1_no_bwd(&LogitPick)?.to_vec2::<f32>()?;
+    Ok(out.into_iter().map(|r| (r[0].to_bits(), r[1])).collect())
 }
 
 // ---- QSA decode selection (qsa.cu) ----

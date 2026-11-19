@@ -52,6 +52,13 @@ pub struct EngineConfig {
     pub mtp_speculate: bool,
     /// Drafts per verify step (1..=MTP_MAX_DRAFTS).
     pub mtp_drafts: usize,
+    /// With more than two drafts per step: the head keeps drafting while its last draft's
+    /// probability is at least this (`--mtp-min-prob`).
+    pub mtp_min_prob: f32,
+    /// Format of the KV pools on CUDA devices (`--kv-dtype`).
+    pub kv_format: crate::kvcache::KvFormat,
+    /// Prefill chunk size the scheduler will use (sizes the activation reserve on GPUs).
+    pub max_prefill_tokens: usize,
     /// Skip the checkpoint's vision tower (no image input, its VRAM left to the caches).
     pub text_only: bool,
 }
@@ -78,13 +85,16 @@ impl EngineConfig {
             mtp: false,
             mtp_speculate: false,
             mtp_drafts: 1,
+            mtp_min_prob: 0.6,
+            kv_format: Default::default(),
+            max_prefill_tokens: crate::device::BASE_PREFILL_TOKENS,
             text_only: false,
         }
     }
 }
 
 /// Most drafts per verify step (`--mtp-drafts`).
-pub const MTP_MAX_DRAFTS: usize = 2;
+pub const MTP_MAX_DRAFTS: usize = 7;
 
 /// Tests only: a draft from the request's tokens so far (see `Engine::mtp_oracle`).
 pub type MtpOracle = std::sync::Arc<dyn Fn(&[u32]) -> u32 + Send + Sync>;
@@ -112,6 +122,7 @@ pub struct Engine {
     /// slots hold drafts' states during verify steps.
     mtp_speculate: bool,
     mtp_max_drafts: usize,
+    mtp_min_prob: f32,
     pub spare_states: usize,
     /// Tests only: replaces the MTP head's draft with `oracle(request tokens so far)`, so the
     /// accept path of speculative decoding can be exercised with a random head.
@@ -180,6 +191,24 @@ impl Engine {
             && ec.tp_size == 1
             && ec.rpc_workers.is_empty()
             && ec.devices[0].starts_with("cuda");
+        crate::kvcache::set_kv_format(ec.kv_format);
+        crate::device::set_prefill_workspace(
+            ec.max_prefill_tokens,
+            crate::device::prefill_bytes_per_token(cfg.intermediate_size, ec.dtype.unwrap_or(DType::BF16)),
+        );
+        #[cfg(feature = "cuda")]
+        crate::kernels::cuda::allow_paged_shared_tables(
+            // only the tensor-core decode kernels read shared tables (and QSA's selection kernel
+            // reads per-row ones): head dims they take, at most 8 query heads per KV head
+            cfg.qwen38.is_none()
+                && cfg.head_dim.is_multiple_of(64)
+                && cfg.head_dim <= 256
+                && cfg.num_kv_heads > 0
+                && cfg.num_heads / cfg.num_kv_heads <= 8,
+        );
+        // verify steps carry several tokens: the K-quant kernels pick their multi-token GEMM
+        #[cfg(feature = "cuda")]
+        crate::kernels::cuda::kquant_expect_multi_token(ec.mtp_speculate && speculation_supported);
         if ec.mtp_speculate && !speculation_supported {
             tracing::warn!("--mtp needs a single local CUDA device: the MTP head only drafts");
         }
@@ -320,6 +349,18 @@ impl Engine {
         topology.push(format!(
             "kv cache: {num_slots} tokens per stage, max context {max_seq_len}"
         ));
+        if num_slots < max_seq_len {
+            let hint = if ec.kv_tokens.is_some() {
+                "raise --kv-tokens or lower --max-seq-len"
+            } else {
+                "lower --max-seq-len, or free device memory: --kv-dtype q8 / turbo4, --text-only \
+                 (no vision tower), a smaller --max-prefill-tokens, fewer --state-snapshots"
+            };
+            tracing::warn!(
+                "the kv cache holds {num_slots} tokens, less than the max context {max_seq_len}: \
+                 a prompt longer than the cache cannot be served ({hint})"
+            );
+        }
         for line in &topology {
             tracing::info!("{line}");
         }
@@ -353,6 +394,7 @@ impl Engine {
             dtype: head_dtype,
             mtp_speculate: ec.mtp_speculate && mtp.is_some() && speculation_supported,
             mtp_max_drafts: ec.mtp_drafts.clamp(1, MTP_MAX_DRAFTS),
+            mtp_min_prob: ec.mtp_min_prob,
             mtp,
             spare_states,
             mtp_oracle: None,
@@ -409,7 +451,13 @@ impl Engine {
         let tower = self.vision.as_ref().context("this server has no vision tower")?;
         let n = img.grid.0 * img.grid.1 * img.grid.2;
         let pixels = Tensor::from_slice(&img.pixels, (n, img.pixels.len() / n.max(1)), &tower.device)?;
-        Ok(tower.forward(&pixels, img.grid)?.to_device(&self.head.device)?.to_dtype(self.dtype)?)
+        let t0 = std::time::Instant::now();
+        let out = tower.forward(&pixels, img.grid)?.to_device(&self.head.device)?.to_dtype(self.dtype)?;
+        // (the copy back makes the timing include the tower's queued work)
+        let tokens = out.dim(0)?;
+        out.narrow(0, 0, 1)?.to_dtype(candle_core::DType::F32)?.to_vec2::<f32>()?;
+        tracing::info!("image encoded: {tokens} tokens ({:?} patches) in {:.0} ms", img.grid, t0.elapsed().as_secs_f64() * 1e3);
+        Ok(out)
     }
 
     /// Start reading the PLE table rows `tokens` (following `prev`, model token ids) will need, in
@@ -436,15 +484,50 @@ impl Engine {
     /// Greedy MTP drafts for `rows`: runs the head over every token of the step (`hidden` from
     /// `forward_hidden`, or a previous draft step's streams; `next[i]` the token after token `i`)
     /// and returns, per row, its guess for the token after `next[row]`, and the head's streams
-    /// for those rows (the input of a further draft step).
-    pub fn mtp_draft(&self, meta: &BatchMeta, hidden: &Tensor, next: &[u32], rows: &[u32]) -> Result<(Vec<u32>, Tensor)> {
+    /// for those rows (the input of a further draft step). `chained`: `hidden` is such an output.
+    pub fn mtp_draft(&self, meta: &BatchMeta, hidden: &Tensor, next: &[u32], rows: &[u32], chained: bool) -> Result<(Vec<u32>, Tensor)> {
+        let (ids, _, multi) = self.mtp_draft_scored(meta, hidden, next, rows, chained, false)?;
+        Ok((ids, multi))
+    }
+
+    /// [`Engine::mtp_draft`], also returning each draft's probability when `scored`.
+    pub fn mtp_draft_scored(
+        &self,
+        meta: &BatchMeta,
+        hidden: &Tensor,
+        next: &[u32],
+        rows: &[u32],
+        chained: bool,
+        scored: bool,
+    ) -> Result<(Vec<u32>, Vec<f32>, Tensor)> {
         let m = self.mtp.as_ref().context("no MTP head")?;
         let emb = self.head.embed_single(next)?;
-        let (mixed, multi) = m.forward(meta, hidden, &emb, rows)?;
+        let (mixed, multi) = m.forward(meta, hidden, &emb, rows, chained)?;
         if rows.is_empty() {
-            return Ok((vec![], multi));
+            return Ok((vec![], vec![], multi));
         }
-        Ok((self.head.project(&mixed)?.argmax(1)?.to_vec1::<u32>()?, multi))
+        let logits = self.head.project(&mixed)?;
+        #[cfg(feature = "cuda")]
+        if logits.device().is_cuda() {
+            if let Ok(picks) = crate::kernels::cuda::logit_pick(&logits) {
+                let (ids, probs) = picks.into_iter().unzip();
+                return Ok((ids, probs, multi));
+            }
+        }
+        let ids = logits.argmax(1)?.to_vec1::<u32>()?;
+        let probs = if scored {
+            // p(argmax) = 1 / sum(exp(logit - max))
+            let max = logits.max_keepdim(1)?;
+            logits.broadcast_sub(&max)?.exp()?.sum(1)?.recip()?.to_vec1::<f32>()?
+        } else {
+            vec![]
+        };
+        Ok((ids, probs, multi))
+    }
+
+    /// Probability below which a chain of more than two drafts stops (`--mtp-min-prob`).
+    pub fn mtp_min_prob(&self) -> f32 {
+        self.mtp_min_prob
     }
 
     /// Only the MTP head's KV for the step's tokens (`mtp_draft`'s inputs, no draft).

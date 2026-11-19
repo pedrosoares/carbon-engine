@@ -45,6 +45,9 @@ pub struct Usage {
 
 #[derive(Debug)]
 pub enum Event {
+    /// Log-probabilities of the token the next `Token` event carries (requests with
+    /// `SamplingParams::logprobs`).
+    Logprobs(crate::sampling::TokenLogprobs),
     Token(u32),
     Done { reason: FinishReason, usage: Usage },
     Error(String),
@@ -301,6 +304,10 @@ struct Req {
     /// Radix node locked by this request and the number of leading slots owned by the tree.
     node: NodeId,
     tree_owned: usize,
+    /// Slots below `tree_owned` that are still this request's: it computed their KV itself
+    /// while the tree already held those tokens in other slots (`cache_prompt`). Its slot
+    /// table keeps using them, and they are freed when it ends.
+    dup_slots: Vec<u32>,
     cache_hit: usize,
     max_new: usize,
     params: SamplingParams,
@@ -310,6 +317,9 @@ struct Req {
     state_slot: u32,
     /// Length of `tokens` just after a sampled anchor token, until that state is cached.
     anchor_len: Option<usize>,
+    /// Log-probabilities of the rows sampled for this request in the current step, in row
+    /// order (`params.logprobs`).
+    logprob_rows: std::collections::VecDeque<crate::sampling::TokenLogprobs>,
 }
 
 impl Req {
@@ -659,6 +669,7 @@ impl Scheduler {
             state_slot,
             anchor_len: None,
             mtp_drafts: vec![],
+            logprob_rows: Default::default(),
             mtp_next_slot: None,
             mrope: crate::images::MropePositions::new(&sub.images),
             images: sub.images.iter().map(|span| ReqImage { span: span.clone(), features: None }).collect(),
@@ -668,6 +679,7 @@ impl Scheduler {
             tokens: sub.prompt,
             prompt_len,
             tree_owned: matched.len(),
+            dup_slots: vec![],
             cache_hit: matched.len(),
             slots: matched,
             node,
@@ -724,6 +736,12 @@ impl Scheduler {
                 let boundary = r.prompt_len - 1;
                 if self.hybrid && self.prefix_cache && r.slots.len() < boundary {
                     chunk = chunk.min(boundary - r.slots.len());
+                    // and at the end of an image: a later prompt with the same image and a
+                    // different question then resumes after it instead of encoding it again
+                    let done = r.slots.len();
+                    if let Some(end) = r.images.iter().map(|im| im.span.start + im.span.len).filter(|&e| e > done).min() {
+                        chunk = chunk.min(end - done);
+                    }
                 }
                 budget -= chunk;
                 chosen.push((i, chunk));
@@ -809,6 +827,12 @@ impl Scheduler {
                     self.cache_prompt(i, true);
                 } else if samplers.contains(&i) {
                     self.cache_prompt(i, false);
+                } else if self.hybrid && r.in_prefill() {
+                    // a long prompt, between chunks: keep a reuse point here too, so a later
+                    // prompt that shares the beginning and ends differently resumes from the
+                    // last chunk boundary inside the shared part instead of from the start
+                    // (the oldest snapshots make room when the slots run out)
+                    self.cache_prompt(i, true);
                 }
             }
             self.reap();
@@ -840,12 +864,21 @@ impl Scheduler {
             .iter()
             .map(|&i| {
                 let r = &self.running[i];
-                let want = if r.wants_two_drafts() { 2 } else { 1 };
+                // chains of more than two drafts were already cut by confidence when drafted
+                let want = if self.engine.mtp_drafts() > 2 {
+                    usize::MAX
+                } else if r.wants_two_drafts() {
+                    2
+                } else {
+                    1
+                };
                 r.mtp_drafts.len().min(want).min((r.max_new - r.generated()).saturating_sub(1))
             })
             .min()
             .unwrap()
-            .min(self.engine.mtp_drafts());
+            .min(self.engine.mtp_drafts())
+            // the decode kernels take 8 rows per step
+            .min((8 / cnt).saturating_sub(1));
         let k = n + 1;
         if n == 0
             || idxs.iter().any(|&i| self.running[i].params.has_penalties())
@@ -930,6 +963,7 @@ impl Scheduler {
                     let r = self.running.swap_remove(i);
                     let _ = r.tx.send(Event::Error(msg.clone()));
                     self.alloc.free(&r.slots[r.tree_owned..]);
+                    self.alloc.free(&r.dup_slots);
                     self.radix.unlock(r.node);
                     if self.hybrid {
                         self.free_states.push(r.state_slot);
@@ -967,6 +1001,9 @@ impl Scheduler {
                 let t = row(j);
                 let r = &mut self.running[i];
                 r.tokens.push(t);
+                if let Some(lp) = r.logprob_rows.pop_front() {
+                    let _ = r.tx.send(Event::Logprobs(lp));
+                }
                 let _ = r.tx.send(Event::Token(t));
                 e += 1;
                 let stop = !r.params.ignore_eos
@@ -1016,10 +1053,17 @@ impl Scheduler {
     }
 
     /// New drafts for `idxs` after a step: the head over the step's rows (`next` = each row's
-    /// successor), drafting from `rows`; then, with `--mtp-drafts 2`, one more draft step at the
-    /// next position from the head's own streams (its KV in the request's `mtp_next_slot`).
+    /// successor), drafting from `rows`; then further draft steps from the head's own output,
+    /// one position on each time. With `--mtp-drafts 2` there is one further step, taken while
+    /// two drafts pay (`wants_two_drafts`); with more, the chain goes on while every request's
+    /// last draft has at least `--mtp-min-prob`. The head's KV for the first drafted position
+    /// lives in the request's `mtp_next_slot` (the verify step reuses it); later positions use
+    /// slots freed again here, since the head rewrites its KV for the tokens that get verified.
     fn mtp_redraft(&mut self, meta: &BatchMeta, hidden: &Tensor, next: &[u32], rows: &[u32], idxs: &[usize]) -> Result<()> {
-        let (first, multi) = self.engine.mtp_draft(meta, hidden, next, rows)?;
+        let max = self.engine.mtp_drafts();
+        let chain = max > 2;
+        let p_min = self.engine.mtp_min_prob();
+        let (first, mut probs, mut multi) = self.engine.mtp_draft_scored(meta, hidden, next, rows, false, chain)?;
         for (q, &i) in idxs.iter().enumerate() {
             let r = &mut self.running[i];
             r.mtp_drafts = vec![match &self.engine.mtp_oracle {
@@ -1027,59 +1071,86 @@ impl Scheduler {
                 None => first[q],
             }];
         }
-        if self.engine.mtp_drafts() < 2
-            || !self.engine.mtp_speculates()
-            || idxs.is_empty()
-            || !idxs.iter().all(|&i| self.running[i].wants_two_drafts())
-        {
+        if max < 2 || !self.engine.mtp_speculates() || idxs.is_empty() {
             return Ok(());
         }
-        // every request needs its next position's slot for the head's KV there
-        let missing = idxs.iter().filter(|&&i| self.running[i].mtp_next_slot.is_none()).count();
-        let Some(mut extra) = self.alloc_slots(missing) else {
-            return Ok(());
-        };
-        let mut meta2 = BatchMeta {
-            is_decode: true,
-            ..Default::default()
-        };
-        let mut toks2 = Vec::with_capacity(idxs.len());
-        for &i in idxs {
-            let r = &mut self.running[i];
-            let slot = *r.mtp_next_slot.get_or_insert_with(|| extra.pop().unwrap());
-            let pos = r.slots.len();
-            let mut slots = r.slots.clone();
-            slots.push(slot);
-            meta2.positions.push(pos as u32);
-            meta2.out_loc.push(slot);
-            meta2.seqs.push(SeqMeta {
-                seq_id: r.id,
-                q_len: 1,
-                kv_len: pos + 1,
-                state_slot: r.state_slot,
-                slots: Arc::new(slots),
-                prev_tokens: vec![],
-                token_state_slots: vec![],
-            });
-            toks2.push(r.mtp_drafts[0]);
-        }
-        meta2.tokens = toks2.clone();
-        self.attach_mrope(&mut meta2, idxs);
-        let rows2: Vec<u32> = (0..idxs.len() as u32).collect();
-        let (second, _) = self.engine.mtp_draft(&meta2, &multi, &toks2, &rows2)?;
-        for (q, &i) in idxs.iter().enumerate() {
-            let r = &mut self.running[i];
-            let d = match &self.engine.mtp_oracle {
-                Some(f) => {
-                    let mut t = r.tokens.clone();
-                    t.push(r.mtp_drafts[0]);
-                    f(&t)
-                }
-                None => second[q],
+        // a verify step takes 8 rows
+        let max = max.min((8 / idxs.len()).saturating_sub(1));
+        let mut temp: Vec<Vec<u32>> = vec![vec![]; idxs.len()];
+        let mut result = Ok(());
+        for step in 1..max {
+            let go = if chain {
+                self.engine.mtp_oracle.is_some() || probs.iter().all(|&p| p >= p_min)
+            } else {
+                idxs.iter().all(|&i| self.running[i].wants_two_drafts())
             };
-            r.mtp_drafts.push(d);
+            if !go {
+                break;
+            }
+            // this step's input token (the last draft) sits at position pos + step - 1
+            let need = idxs
+                .iter()
+                .filter(|&&i| step > 1 || self.running[i].mtp_next_slot.is_none())
+                .count();
+            let Some(mut extra) = self.alloc_slots(need) else {
+                break;
+            };
+            let mut meta2 = BatchMeta {
+                is_decode: true,
+                ..Default::default()
+            };
+            let mut toks2 = Vec::with_capacity(idxs.len());
+            for (q, &i) in idxs.iter().enumerate() {
+                let r = &mut self.running[i];
+                let first_slot = *r.mtp_next_slot.get_or_insert_with(|| extra.pop().unwrap());
+                if step > 1 {
+                    temp[q].push(extra.pop().unwrap());
+                }
+                let pos = r.slots.len() + step - 1;
+                let mut slots = r.slots.clone();
+                slots.push(first_slot);
+                slots.extend(&temp[q]);
+                meta2.positions.push(pos as u32);
+                meta2.out_loc.push(*slots.last().unwrap());
+                meta2.seqs.push(SeqMeta {
+                    seq_id: r.id,
+                    q_len: 1,
+                    kv_len: pos + 1,
+                    state_slot: r.state_slot,
+                    slots: Arc::new(slots),
+                    prev_tokens: vec![],
+                    token_state_slots: vec![],
+                });
+                toks2.push(*r.mtp_drafts.last().unwrap());
+            }
+            meta2.tokens = toks2.clone();
+            self.attach_mrope(&mut meta2, idxs);
+            let rows2: Vec<u32> = (0..idxs.len() as u32).collect();
+            let (ids, p, m) = match self.engine.mtp_draft_scored(&meta2, &multi, &toks2, &rows2, true, chain) {
+                Ok(x) => x,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            (probs, multi) = (p, m);
+            for (q, &i) in idxs.iter().enumerate() {
+                let r = &mut self.running[i];
+                let d = match &self.engine.mtp_oracle {
+                    Some(f) => {
+                        let mut t = r.tokens.clone();
+                        t.extend(&r.mtp_drafts);
+                        f(&t)
+                    }
+                    None => ids[q],
+                };
+                r.mtp_drafts.push(d);
+            }
         }
-        Ok(())
+        for t in &temp {
+            self.alloc.free(t);
+        }
+        result
     }
 
     fn decode_step(&mut self) {
@@ -1197,6 +1268,22 @@ impl Scheduler {
     }
 
     fn sample_rows(&mut self, logits: &Tensor, samplers: &[usize]) -> Result<Vec<u32>> {
+        let toks = self.pick_rows(logits, samplers)?;
+        // rows of an earlier step that were not emitted (rejected drafts) are stale
+        for &i in samplers {
+            self.running[i].logprob_rows.clear();
+        }
+        for (row, (&i, &tok)) in samplers.iter().zip(&toks).enumerate() {
+            let n = self.running[i].params.logprobs;
+            if n > 0 {
+                let l = logits.get(row)?.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
+                self.running[i].logprob_rows.push_back(crate::sampling::top_logprobs(&l, tok, n));
+            }
+        }
+        Ok(toks)
+    }
+
+    fn pick_rows(&mut self, logits: &Tensor, samplers: &[usize]) -> Result<Vec<u32>> {
         if samplers.is_empty() {
             return Ok(vec![]);
         }
@@ -1205,6 +1292,12 @@ impl Scheduler {
             let p = &self.running[i].params;
             p.is_greedy() && !host_only(p)
         }) {
+            #[cfg(feature = "cuda")]
+            if logits.device().is_cuda() {
+                if let Ok(picks) = crate::kernels::cuda::logit_pick(logits) {
+                    return Ok(picks.into_iter().map(|(id, _)| id).collect());
+                }
+            }
             return Ok(logits.argmax(1)?.to_vec1::<u32>()?);
         }
         #[cfg(feature = "cuda")]
@@ -1333,6 +1426,9 @@ impl Scheduler {
                         r.anchor_len = Some(r.tokens.len());
                     }
                     self.stats.total_generated_tokens += 1;
+                    if let Some(lp) = r.logprob_rows.pop_front() {
+                        let _ = r.tx.send(Event::Logprobs(lp));
+                    }
                     let _ = r.tx.send(Event::Token(tok));
                 }
                 true
@@ -1353,6 +1449,7 @@ impl Scheduler {
                     let _ = r.tx.send(Event::Error(msg.clone()));
                     // KV contents of a failed forward are not trusted: free without caching
                     self.alloc.free(&r.slots[r.tree_owned..]);
+                    self.alloc.free(&r.dup_slots);
                     if let Some(s) = r.mtp_next_slot {
                         self.alloc.free(&[s]);
                     }
@@ -1376,13 +1473,19 @@ impl Scheduler {
         let r = &self.running[i];
         let key = &r.tokens[..r.slots.len()];
         let (_, existing) = self.radix.match_prefix(key);
-        if existing.len() != r.tree_owned {
+        if existing.len() < r.tree_owned {
             return;
         }
+        // The tree may hold more of these tokens than the request reused: a hybrid model resumes
+        // only at a snapshot, so a prompt that shares a few leading tokens (the chat template's
+        // header) with an earlier one recomputed them. The tree keeps its slots for that part and
+        // takes the request's from there on; the request keeps reading its own copies.
+        let dup = r.slots[r.tree_owned..existing.len().min(r.slots.len())].to_vec();
         self.radix.insert(key, &r.slots);
         let (node, _) = self.radix.match_prefix(key);
         self.radix.lock(node);
         let r = &mut self.running[i];
+        r.dup_slots.extend(dup);
         let old = std::mem::replace(&mut r.node, node);
         r.tree_owned = r.slots.len();
         let live = r.state_slot;
@@ -1401,6 +1504,7 @@ impl Scheduler {
             .free_snaps
             .pop()
             .or_else(|| self.radix.evict_snapshot())
+            .or_else(|| self.radix.take_ancestor_snapshot(node))
         else {
             return;
         };
@@ -1448,6 +1552,7 @@ impl Scheduler {
         if let Some(s) = r.mtp_next_slot {
             self.alloc.free(&[s]);
         }
+        self.alloc.free(&r.dup_slots);
         if self.prefix_cache {
             let n = r.slots.len();
             let cached = self.radix.insert(&r.tokens[..n], &r.slots);

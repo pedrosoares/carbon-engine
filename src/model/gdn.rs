@@ -8,11 +8,11 @@
 //! algorithm, decode the per-token recurrence; both follow the HF reference exactly.
 
 use super::attention::DeviceBatch;
-use super::layers::{load_row_parallel, Placement};
+use super::layers::{load_row_parallel, Placement, QLinear};
 use crate::config::{LinearAttnConfig, ModelConfig};
 use crate::weights::WeightSource;
 use anyhow::{bail, Result};
-use candle_core::{DType, Device, Module, Tensor, D};
+use candle_core::{DType, Device, Tensor, D};
 use candle_nn::Linear;
 
 const CHUNK: usize = 64;
@@ -37,11 +37,11 @@ pub struct LinearState {
 }
 
 pub struct GatedDeltaNet {
-    in_qkv: Linear,
-    in_z: Linear,
-    in_b: Linear,
-    in_a: Linear,
-    out: Linear,
+    in_qkv: QLinear,
+    in_z: QLinear,
+    in_b: QLinear,
+    in_a: QLinear,
+    out: QLinear,
     /// Conv taps, one `[1, 1, conv_dim]` row per kernel position.
     conv_taps: Vec<Tensor>,
     /// The same taps stacked `[kernel, conv_dim]` for carbon's fused decode kernels.
@@ -53,6 +53,8 @@ pub struct GatedDeltaNet {
     eps: f64,
     /// Output gate `sigmoid(z)` instead of `silu(z)` (Qwen3.8).
     gate_sigmoid: bool,
+    /// Value head `h` reads key head `h % hk` (GGUF layout) instead of `h / (hv / hk)`.
+    v_tiled: bool,
     hk: usize,
     hv: usize,
     dk: usize,
@@ -129,6 +131,9 @@ impl GatedDeltaNet {
         p: &Placement,
     ) -> Result<Self> {
         let lc = cfg.linear_attn.as_ref().expect("linear attention config");
+        if lc.v_tiled && p.world > 1 {
+            bail!("tensor parallelism is not supported for GGUF checkpoints (tiled linear-attention heads)");
+        }
         if !lc.num_k_heads.is_multiple_of(p.world) || !lc.num_v_heads.is_multiple_of(p.world) {
             bail!(
                 "tensor-parallel size {} must divide linear-attention heads ({} k, {} v)",
@@ -142,22 +147,40 @@ impl GatedDeltaNet {
             lc.num_v_heads * lc.v_head_dim,
         );
         let qkv_segments = [kd, kd, vd];
-        let w = load_segments(
-            src,
-            &format!("{prefix}.in_proj_qkv.weight"),
-            &qkv_segments,
-            p,
-        )?;
-        let in_qkv = Linear::new(w, None);
+        // GGUF K-quant projections stay packed (single rank only)
+        let packed = |n: &str| -> Result<Option<QLinear>> {
+            let name = format!("{prefix}.{n}.weight");
+            Ok(if p.world == 1 && src.is_kquant(&name) {
+                Some(QLinear::load(src, &format!("{prefix}.{n}"), true, p)?)
+            } else {
+                None
+            })
+        };
+        let in_qkv = match packed("in_proj_qkv")? {
+            Some(q) => q,
+            None => QLinear::Dense(Linear::new(
+                load_segments(src, &format!("{prefix}.in_proj_qkv.weight"), &qkv_segments, p)?,
+                None,
+            )),
+        };
         let lin = |n: &str, seg: usize| -> Result<Linear> {
             Ok(Linear::new(
                 load_segments(src, &format!("{prefix}.{n}.weight"), &[seg], p)?,
                 None,
             ))
         };
-        let in_z = lin("in_proj_z", vd)?;
-        let in_b = lin("in_proj_b", lc.num_v_heads)?;
-        let in_a = lin("in_proj_a", lc.num_v_heads)?;
+        let in_z = match packed("in_proj_z")? {
+            Some(q) => q,
+            None => QLinear::Dense(lin("in_proj_z", vd)?),
+        };
+        let in_b = match packed("in_proj_b")? {
+            Some(q) => q,
+            None => QLinear::Dense(lin("in_proj_b", lc.num_v_heads)?),
+        };
+        let in_a = match packed("in_proj_a")? {
+            Some(q) => q,
+            None => QLinear::Dense(lin("in_proj_a", lc.num_v_heads)?),
+        };
         let conv = load_segments(src, &format!("{prefix}.conv1d.weight"), &qkv_segments, p)?;
         let c_local = conv.dim(0)?;
         let conv = conv.reshape((c_local, lc.conv_kernel))?;
@@ -182,7 +205,10 @@ impl GatedDeltaNet {
             in_z,
             in_b,
             in_a,
-            out: load_row_parallel(src, &format!("{prefix}.out_proj"), p)?,
+            out: match packed("out_proj")? {
+                Some(q) => q,
+                None => QLinear::Dense(load_row_parallel(src, &format!("{prefix}.out_proj"), p)?),
+            },
             #[cfg(feature = "cuda")]
             taps_stacked: conv.t()?.contiguous()?,
             conv_taps,
@@ -191,6 +217,7 @@ impl GatedDeltaNet {
             norm_w: src.get(&format!("{prefix}.norm.weight"), &p.device, p.dtype)?,
             eps: cfg.rms_norm_eps,
             gate_sigmoid: cfg.gdn_gate_sigmoid,
+            v_tiled: lc.v_tiled,
             hk: lc.num_k_heads / p.world,
             hv: lc.num_v_heads / p.world,
             dk: lc.k_head_dim,
@@ -230,12 +257,20 @@ impl GatedDeltaNet {
 
     /// `x: [T, hidden]` -> `[T, hidden]` (partial sum under tensor parallelism).
     pub fn forward(&self, x: &Tensor, b: &DeviceBatch, st: &LinearState) -> Result<Tensor> {
-        let qkv = self.in_qkv.forward(x)?;
-        let z = self.in_z.forward(x)?;
-        let braw = self.in_b.forward(x)?;
-        let araw = self.in_a.forward(x)?;
+        let mut proj = QLinear::forward_many(&[&self.in_qkv, &self.in_z, &self.in_b, &self.in_a], x)?;
+        let araw = proj.pop().expect("a");
+        let braw = proj.pop().expect("b");
+        let z = proj.pop().expect("z");
+        let qkv = proj.pop().expect("qkv");
 
-        // multi-token decode: the fused step once per token position, in order
+        // multi-token decode: one launch walks each sequence's tokens in order (the state stays
+        // in registers between them and every token leaves it in its own slot)
+        if let Some((slots, links)) = &b.chain {
+            if let Some(y) = self.decode_fused(&qkv, &z, &braw, &araw, slots, &Some(links.clone()), st) {
+                return Ok(self.out.forward(&y)?);
+            }
+        }
+        // otherwise the fused step once per token position
         let multi = b.per_substep(&[&qkv, &z, &braw, &araw], |r, sub| {
             if let Some(prev) = &sub.prev_idx {
                 st.copy_rows(prev, &sub.state_idx)?;
@@ -251,6 +286,9 @@ impl GatedDeltaNet {
                 return Ok(self.out.forward(&y)?);
             }
             let y = self.decode_generic(&qkv, &z, &braw, &araw, &b.state_idx, &b.starts, st)?;
+            return Ok(self.out.forward(&y)?);
+        }
+        if let Some(y) = self.prefill_fused(&qkv, &z, &braw, &araw, b, st)? {
             return Ok(self.out.forward(&y)?);
         }
         let (beta, g) = self.beta_g(&braw, &araw)?;
@@ -313,6 +351,69 @@ impl GatedDeltaNet {
         self.gated_norm(&core, z)
     }
 
+    /// This layer's weights and state pools as carbon's CUDA kernels take them.
+    #[cfg(feature = "cuda")]
+    fn cuda_layer<'a>(&'a self, st: &'a LinearState) -> crate::kernels::cuda::GdnLayer<'a> {
+        crate::kernels::cuda::GdnLayer {
+            taps: &self.taps_stacked,
+            dt_bias: &self.dt_bias,
+            a_neg: &self.a_neg,
+            norm_w: &self.norm_w,
+            conv_pool: &st.conv,
+            ssm_pool: &st.ssm,
+            hk: self.hk,
+            hv: self.hv,
+            dk: self.dk,
+            dv: self.dv,
+            eps: self.eps as f32,
+            gate_sigmoid: self.gate_sigmoid,
+            v_tiled: self.v_tiled,
+        }
+    }
+
+    /// Multi-token chunks on carbon's fused prefill kernels, one sequence after the other, the
+    /// state pools updated in place. `None` when unavailable (nothing has been touched then).
+    #[cfg(feature = "cuda")]
+    fn prefill_fused(
+        &self,
+        qkv: &Tensor,
+        z: &Tensor,
+        braw: &Tensor,
+        araw: &Tensor,
+        b: &DeviceBatch,
+        st: &LinearState,
+    ) -> Result<Option<Tensor>> {
+        use crate::kernels::cuda;
+        if !qkv.device().is_cuda()
+            || !cuda::gdn_prefill_supported(self.hk, self.hv, self.dk, self.dv)
+            || self.kernel > 9
+            || !fused_gdn_enabled()
+        {
+            return Ok(None);
+        }
+        let layer = self.cuda_layer(st);
+        let mut outs = Vec::with_capacity(b.seqs.len());
+        for (i, s) in b.seqs.iter().enumerate() {
+            let r = |x: &Tensor| x.narrow(0, s.q_start, s.q_len);
+            let slot = b.state_idx.narrow(0, i, 1)?;
+            outs.push(cuda::gdn_prefill(&layer, &r(qkv)?, &r(z)?, &r(braw)?, &r(araw)?, &slot, b.starts[i])?);
+        }
+        Ok(Some(if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 0)? }))
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn prefill_fused(
+        &self,
+        _: &Tensor,
+        _: &Tensor,
+        _: &Tensor,
+        _: &Tensor,
+        _: &DeviceBatch,
+        _: &LinearState,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
     /// Decode step in carbon's two CUDA kernels (conv, then delta rule + gated norm), updating
     /// the state pools in place. `None` when unavailable; the caller then uses the generic path.
     #[cfg(feature = "cuda")]
@@ -335,20 +436,7 @@ impl GatedDeltaNet {
         {
             return None;
         }
-        let layer = cuda::GdnLayer {
-            taps: &self.taps_stacked,
-            dt_bias: &self.dt_bias,
-            a_neg: &self.a_neg,
-            norm_w: &self.norm_w,
-            conv_pool: &st.conv,
-            ssm_pool: &st.ssm,
-            hk: self.hk,
-            hv: self.hv,
-            dk: self.dk,
-            dv: self.dv,
-            eps: self.eps as f32,
-            gate_sigmoid: self.gate_sigmoid,
-        };
+        let layer = self.cuda_layer(st);
         match cuda::gdn_decode(&layer, qkv, z, braw, araw, state_idx, fresh) {
             Ok(y) => Some(y),
             Err(e) => {
@@ -434,8 +522,12 @@ impl GatedDeltaNet {
         let (kd, r) = (self.hk * self.dk, self.hv / self.hk);
         let x = x.to_dtype(DType::F32)?;
         let expand = |y: Tensor| -> Result<Tensor> {
-            let y = l2norm(&y.reshape((b, t, self.hk, 1, self.dk))?)?;
-            Ok(y.broadcast_as((b, t, self.hk, r, self.dk))?
+            let y = if self.v_tiled {
+                l2norm(&y.reshape((b, t, 1, self.hk, self.dk))?)?.broadcast_as((b, t, r, self.hk, self.dk))?
+            } else {
+                l2norm(&y.reshape((b, t, self.hk, 1, self.dk))?)?.broadcast_as((b, t, self.hk, r, self.dk))?
+            };
+            Ok(y
                 .reshape((b, t, self.hv, self.dk))?
                 .transpose(1, 2)?
                 .contiguous()?)
@@ -682,11 +774,11 @@ pub fn fused_decode_selftest(device: &Device, dtype: DType) -> Result<(f32, f32)
     let conv = r(&[c, kernel], 0.5)?;
     let lin = || -> Result<Linear> { Ok(Linear::new(r(&[1, 1], 1.0)?, None)) };
     let layer = GatedDeltaNet {
-        in_qkv: lin()?,
-        in_z: lin()?,
-        in_b: lin()?,
-        in_a: lin()?,
-        out: lin()?,
+        in_qkv: QLinear::Dense(lin()?),
+        in_z: QLinear::Dense(lin()?),
+        in_b: QLinear::Dense(lin()?),
+        in_a: QLinear::Dense(lin()?),
+        out: QLinear::Dense(lin()?),
         conv_taps: (0..kernel)
             .map(|j| Ok(conv.narrow(1, j, 1)?.reshape((1, 1, c))?.contiguous()?))
             .collect::<Result<Vec<_>>>()?,
@@ -696,6 +788,7 @@ pub fn fused_decode_selftest(device: &Device, dtype: DType) -> Result<(f32, f32)
         norm_w: r(&[dv], 1.0)?,
         eps: 1e-6,
         gate_sigmoid: false,
+        v_tiled: false,
         hk,
         hv,
         dk,
@@ -708,6 +801,7 @@ pub fn fused_decode_selftest(device: &Device, dtype: DType) -> Result<(f32, f32)
         k_head_dim: dk,
         v_head_dim: dv,
         conv_kernel: kernel,
+        v_tiled: false,
     };
     let a = GatedDeltaNet::new_state(&lc, 1, slots, dtype, device)?;
     a.conv
@@ -749,6 +843,81 @@ pub fn fused_decode_selftest(device: &Device, dtype: DType) -> Result<(f32, f32)
         worst_s = worst_s
             .max(rel(&b.ssm, &a.ssm)?)
             .max(rel(&b.conv, &a.conv)?);
+    }
+    Ok((worst_y, worst_s))
+}
+
+/// Run the generic and the fused CUDA prefill side by side on a random layer: three chunks of
+/// one sequence (the first from a zero state, the last shorter than the conv kernel), for both
+/// value-head layouts. Returns the worst relative error of the outputs and of the states.
+#[cfg(feature = "cuda")]
+pub fn fused_prefill_selftest(device: &Device, dtype: DType) -> Result<(f32, f32)> {
+    let (hk, hv, dk, dv, kernel, slots) = (2usize, 4usize, 128usize, 64usize, 4usize, 3usize);
+    let c = 2 * hk * dk + hv * dv;
+    let r = |shape: &[usize], s: f64| -> Result<Tensor> {
+        Ok((Tensor::randn(0f32, 1.0, shape, device)? * s)?.to_dtype(dtype)?)
+    };
+    let rel = |x: &Tensor, y: &Tensor| -> Result<f32> {
+        let x = x.to_dtype(DType::F32)?;
+        let y = y.to_dtype(DType::F32)?;
+        let d = (&x - &y)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        let e = d / (y.abs()?.max_all()?.to_scalar::<f32>()? + 1e-6);
+        Ok(if e.is_nan() { f32::INFINITY } else { e })
+    };
+    let (mut worst_y, mut worst_s) = (0f32, 0f32);
+    for v_tiled in [false, true] {
+        let conv = r(&[c, kernel], 0.5)?;
+        let lin = || -> Result<Linear> { Ok(Linear::new(r(&[1, 1], 1.0)?, None)) };
+        let layer = GatedDeltaNet {
+            in_qkv: QLinear::Dense(lin()?),
+            in_z: QLinear::Dense(lin()?),
+            in_b: QLinear::Dense(lin()?),
+            in_a: QLinear::Dense(lin()?),
+            out: QLinear::Dense(lin()?),
+            conv_taps: (0..kernel)
+                .map(|j| Ok(conv.narrow(1, j, 1)?.reshape((1, 1, c))?.contiguous()?))
+                .collect::<Result<Vec<_>>>()?,
+            taps_stacked: conv.t()?.contiguous()?,
+            dt_bias: Tensor::randn(0f32, 1.0, hv, device)?,
+            a_neg: Tensor::randn(0f32, 0.5, hv, device)?.exp()?.neg()?,
+            norm_w: r(&[dv], 1.0)?,
+            eps: 1e-6,
+            gate_sigmoid: v_tiled,
+            v_tiled,
+            hk,
+            hv,
+            dk,
+            dv,
+            kernel,
+        };
+        let lc = LinearAttnConfig {
+            num_k_heads: hk,
+            num_v_heads: hv,
+            k_head_dim: dk,
+            v_head_dim: dv,
+            conv_kernel: kernel,
+            v_tiled,
+        };
+        // stale state in the slot: a sequence that starts must ignore it
+        let a = GatedDeltaNet::new_state(&lc, 1, slots, dtype, device)?;
+        a.conv.slice_set(&r(&[slots, (kernel - 1) * c], 1.0)?, 0, 0)?;
+        a.ssm.slice_set(&Tensor::randn(0f32, 0.1, (slots, hv * dk * dv), device)?, 0, 0)?;
+        let b = LinearState {
+            conv: a.conv.copy()?,
+            ssm: a.ssm.copy()?,
+        };
+        let idx = Tensor::new(&[1u32], device)?;
+        for (i, t) in [45usize, 70, 2].into_iter().enumerate() {
+            let (qkv, z, braw, araw) =
+                (r(&[t, c], 1.0)?, r(&[t, hv * dv], 1.0)?, r(&[t, hv], 1.0)?, r(&[t, hv], 1.0)?);
+            let (beta, g) = layer.beta_g(&braw, &araw)?;
+            let core = layer.seq_forward(&qkv, &beta, &g, &idx, i == 0, &a)?;
+            let want = layer.gated_norm(&core, &z)?;
+            let got =
+                crate::kernels::cuda::gdn_prefill(&layer.cuda_layer(&b), &qkv, &z, &braw, &araw, &idx, i == 0)?;
+            worst_y = worst_y.max(rel(&got, &want)?);
+            worst_s = worst_s.max(rel(&b.ssm, &a.ssm)?).max(rel(&b.conv, &a.conv)?);
+        }
     }
     Ok((worst_y, worst_s))
 }

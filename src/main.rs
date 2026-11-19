@@ -191,13 +191,29 @@ struct EngineArgs {
     /// verified in the next step; output is unchanged (exact for greedy and for sampling).
     #[arg(long)]
     mtp: bool,
-    /// Drafts per verify step with `--mtp` (1-2).
+    /// Most drafts per verify step with `--mtp` (1-7). Up to 2, the second draft is taken while
+    /// its measured acceptance pays; above 2, the head keeps drafting while its last draft's
+    /// probability is at least `--mtp-min-prob`.
     #[arg(long, default_value_t = 2)]
     mtp_drafts: usize,
+    /// KV cache format on CUDA devices: `model` (the activation dtype), `q8` (int8 with a scale
+    /// per vector: half the memory and attention traffic), `turbo4` (TurboQuant: randomly
+    /// rotated vectors at 4 bits per value, a quarter of the memory) or `rotor4` (RotorQuant:
+    /// the same with 3D block rotations; `planar4` / `iso4` use 2D / 4D blocks). The packed
+    /// formats need a single local GPU, sm_80+; all are lossy.
+    #[arg(long, default_value = "model")]
+    kv_dtype: String,
+    /// Confidence a draft needs for the head to draft one more (`--mtp-drafts` above 2).
+    #[arg(long, default_value_t = 0.6)]
+    mtp_min_prob: f32,
     /// Do not load the checkpoint's vision tower: no image input, its VRAM (~0.9 GB for
     /// Qwen3.6 / 3.8) goes to the KV and expert caches.
     #[arg(long)]
     text_only: bool,
+    /// GGUF models: the projector file with the vision tower (`mmproj-*.gguf`). Default: the
+    /// only `mmproj*.gguf` next to the model file; `none` for no image input.
+    #[arg(long, env = "CARBON_MMPROJ")]
+    mmproj: Option<String>,
 }
 
 impl EngineArgs {
@@ -209,6 +225,10 @@ impl EngineArgs {
     }
 
     fn engine_config(&self) -> Result<EngineConfig> {
+        // the GGUF loader finds the projector through the environment
+        if let Some(m) = &self.mmproj {
+            std::env::set_var("CARBON_MMPROJ", m);
+        }
         let layer_split = if self.layer_split.trim().is_empty() {
             vec![]
         } else {
@@ -246,6 +266,10 @@ impl EngineArgs {
             mtp: self.mtp_shadow,
             mtp_speculate: self.mtp,
             mtp_drafts: self.mtp_drafts,
+            mtp_min_prob: self.mtp_min_prob,
+            max_prefill_tokens: self.max_prefill_tokens.max(16),
+            kv_format: carbon_engine::kvcache::KvFormat::parse(&self.kv_dtype)
+                .ok_or_else(|| anyhow::anyhow!("unknown --kv-dtype '{}' (model | q8 | turbo4 | rotor4 | planar4 | iso4)", self.kv_dtype))?,
             text_only: self.text_only,
         })
     }
@@ -1005,6 +1029,7 @@ fn generate(mut a: GenerateArgs) -> Result<()> {
         let mut out = std::io::stdout();
         while let Some(ev) = rx.recv().await {
             match ev {
+                Event::Logprobs(_) => {}
                 Event::Token(t) => {
                     first.get_or_insert_with(|| t0.elapsed());
                     if let Some(d) = detok.step(&tok, t) {

@@ -102,6 +102,16 @@ pub trait WeightSource: Send + Sync {
         }))
     }
 
+    /// The packed K-quant blocks of `name` (GGUF Q4_K / Q6_K), if it is stored that way.
+    fn load_kquant(&self, _name: &str) -> Result<Option<crate::gguf::KQuant>> {
+        Ok(None)
+    }
+
+    /// `name` is stored as K-quant blocks (cheap: no data is read).
+    fn is_kquant(&self, _name: &str) -> bool {
+        false
+    }
+
     /// Load, cast and move a tensor.
     fn get(&self, name: &str, device: &Device, dtype: DType) -> Result<Tensor> {
         let t = self.load_cpu(name)?;

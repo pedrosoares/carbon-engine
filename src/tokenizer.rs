@@ -146,6 +146,18 @@ fn py_json(v: &Value, indent: Option<usize>, depth: usize, out: &mut String) {
 
 impl TokenizerBundle {
     pub fn load(dir: &Path, template_override: Option<&Path>) -> Result<Self> {
+        if let Some(file) = crate::gguf::find(dir) {
+            let g = crate::gguf::Gguf::open(&file)?;
+            let tokenizer: Tokenizer = serde_json::from_value(g.tokenizer_json()?)
+                .map_err(|e| anyhow!("building the tokenizer of {}: {e}", file.display()))?;
+            let template = match template_override {
+                Some(p) => Some(
+                    std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?,
+                ),
+                None => g.chat_template(),
+            };
+            return Self::new(tokenizer, template, g.special_token("bos"), g.special_token("eos"));
+        }
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| anyhow!("loading {}: {e}", dir.join("tokenizer.json").display()))?;
         let cfg: Value = std::fs::read_to_string(dir.join("tokenizer_config.json"))

@@ -12,6 +12,7 @@ pub mod daemon;
 pub mod device;
 pub mod dummy;
 pub mod engine;
+pub mod gguf;
 pub mod hub;
 pub mod images;
 pub mod kernels;

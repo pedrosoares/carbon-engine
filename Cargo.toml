@@ -11,6 +11,22 @@ default-run = "carbon"
 name = "carbon"
 path = "src/main.rs"
 
+[[example]]
+name = "kqbench"
+required-features = ["cuda"]
+
+[[example]]
+name = "l2bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "gdnbench"
+required-features = ["cuda"]
+
+[[example]]
+name = "attnbench"
+required-features = ["cuda"]
+
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
