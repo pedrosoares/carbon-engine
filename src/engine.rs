@@ -174,11 +174,22 @@ impl Engine {
         if ec.devices.is_empty() {
             bail!("at least one local device is required (it hosts the embedding and LM head)");
         }
+        // a context-extending rope scheme (YaRN) is asked for to serve the longer context, so it
+        // sets the default instead of the 32k cap
+        let extended = cfg.rope_scaling.as_ref().and_then(|r| r.extended_context());
         let max_seq_len = if ec.max_seq_len > 0 {
             ec.max_seq_len
+        } else if let Some(n) = extended {
+            n
         } else {
             cfg.max_position_embeddings.min(32768)
         };
+        if let Some(r) = &cfg.rope_scaling {
+            tracing::info!("rope scaling: {}", r.describe());
+            if let Some(n) = extended.filter(|&n| max_seq_len > n) {
+                tracing::warn!("--max-seq-len {max_seq_len} is past the scaled rope context {n}");
+            }
+        }
         let live_states = ec.max_running.max(1);
         let snapshots = if cfg.is_hybrid() {
             ec.state_snapshots.unwrap_or(live_states)

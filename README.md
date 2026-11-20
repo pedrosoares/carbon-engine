@@ -294,7 +294,8 @@ The 128k and 250k columns are the same prompt on both engines, each on a freshly
 server (an earlier 148 s for LM Studio at 250k had reused a cached 128k prefix).
 
 A later prompt that shares the beginning starts in 1.7 s at 32k, 2.2 s at 128k and 4.3 s at
-250k. Without `--max-seq-len` the context is capped at 32,768 tokens.
+250k. Without `--max-seq-len` the context is capped at 32,768 tokens, or set to the scaled
+length when YaRN is on (`--yarn`, or a checkpoint or GGUF that ships YaRN rope scaling).
 
 ## Architecture
 
@@ -380,7 +381,11 @@ carbon serve --model Qwen/Qwen3-30B-A3B-FP8 --devices cuda:0
 # the model's layout with random weights (benchmarks without the checkpoint)
 carbon serve --model Qwen/Qwen3-30B-A3B --dummy-weight
 
-# config overrides, e.g. YaRN for 128k context
+# YaRN: stretch a 32k-trained model to 128k (the default --max-seq-len becomes 32768 x 4)
+carbon serve --model ~/models/Qwen3-8B --yarn 4 --yarn-original-ctx 32768
+
+# the same through config overrides (vLLM semantics); rope_scaling layers over the
+# checkpoint's rope_parameters, so theta / partial rope / mRoPE sections are kept
 carbon serve --model ~/models/Qwen3-8B --max-seq-len 131072 \
   --hf-overrides '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}'
 
@@ -552,7 +557,7 @@ Sampling: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`,
 
 ```
 carbon serve      --model DIR|ORG/NAME [--model-source huggingface|modelscope] [--dummy-weight]
-                  [--hf-overrides JSON] [--devices ..] [--tp-size N] [--rpc-worker HOST:PORT]... [--layer-split ..]
+                  [--hf-overrides JSON] [--yarn FACTOR [--yarn-original-ctx N]] [--devices ..] [--tp-size N] [--rpc-worker HOST:PORT]... [--layer-split ..]
                   [--dtype auto|bf16|f16|f32] [--kv-tokens N] [--memory-ratio 0.9] [--max-seq-len N]
                   [--moe-strategy ..] [--moe-cache-size N] [--moe-hybrid-max-fetch N]
                   [--max-running-requests 16] [--max-prefill-tokens 4096] [--host] [--port 1919]
