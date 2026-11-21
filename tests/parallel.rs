@@ -414,14 +414,28 @@ fn rejects_oversized_requests() {
     rt.block_on(async {
         let (_, mut rx) = handle.submit(vec![1; 100], SamplingParams::default());
         assert!(matches!(rx.recv().await.unwrap(), Event::Error(_)));
+        // an output budget past the cache is cut to fit it (prompt + output - 1 = 64 slots)
         let (_, mut rx) = handle.submit(
             vec![1; 10],
             SamplingParams {
                 max_tokens: 1000,
+                ignore_eos: true,
                 ..Default::default()
             },
         );
-        assert!(matches!(rx.recv().await.unwrap(), Event::Error(_)));
+        let mut n = 0;
+        loop {
+            match rx.recv().await.unwrap() {
+                Event::Token(_) => n += 1,
+                Event::Done { reason, usage } => {
+                    assert_eq!((n, usage.completion_tokens), (55, 55));
+                    assert!(matches!(reason, carbon_engine::scheduler::FinishReason::Length), "{reason:?}");
+                    break;
+                }
+                Event::Error(e) => panic!("{e}"),
+                Event::Logprobs(_) => {}
+            }
+        }
         let (_, mut rx) = handle.submit(vec![9999], SamplingParams::default());
         assert!(matches!(rx.recv().await.unwrap(), Event::Error(_)));
     });

@@ -23,8 +23,8 @@ pub async fn models(State(s): State<SharedState>) -> Json<Value> {
             "object": "model",
             "created": now_secs(),
             "owned_by": "carbon-engine",
-            "max_model_len": s.engine.info.max_seq_len,
-            "context_length": s.engine.info.max_seq_len,
+            "max_model_len": s.engine.info.context(),
+            "context_length": s.engine.info.context(),
             "supported_reasoning_efforts": s.thinking.efforts.effective(),
             "default_reasoning_effort": s.thinking.efforts.default,
         }]

@@ -20,11 +20,15 @@ struct Server {
 }
 
 fn start() -> Server {
+    start_with_kv("qwen3", 8192)
+}
+
+fn start_with_kv(arch: &str, kv_tokens: usize) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let model = dir.path().join("m");
-    write_tiny_model(&model, &TinySpec::new("qwen3")).unwrap();
+    write_tiny_model(&model, &TinySpec::new(arch)).unwrap();
     let mut ec = EngineConfig::new(&model);
-    ec.kv_tokens = Some(8192);
+    ec.kv_tokens = Some(kv_tokens);
     let engine = Engine::load(&ec).unwrap();
     let eos = engine.cfg.eos_token_ids.clone();
     let handle = scheduler::spawn(
@@ -67,11 +71,11 @@ fn start() -> Server {
 }
 
 fn post(s: &Server, path: &str, body: Value) -> Value {
-    ureq::post(&format!("{}{path}", s.base))
-        .send_json(body)
-        .unwrap()
-        .into_json()
-        .unwrap()
+    match ureq::post(&format!("{}{path}", s.base)).send_json(body) {
+        Ok(r) => r.into_json().unwrap(),
+        Err(ureq::Error::Status(code, r)) => panic!("{path}: HTTP {code}: {}", r.into_string().unwrap_or_default()),
+        Err(e) => panic!("{path}: {e}"),
+    }
 }
 
 fn sse(s: &Server, path: &str, body: Value) -> Vec<(Option<String>, String)> {
@@ -292,6 +296,46 @@ fn get(s: &Server, path: &str) -> Value {
         .unwrap()
         .into_json()
         .unwrap()
+}
+
+/// A request whose prompt + max_tokens overflows the cache is cut short instead of failing,
+/// also when it reuses a cached prefix; returns (prompt, completion) tokens per run.
+fn fill_the_cache(s: &Server, runs: usize) -> Vec<(u64, u64)> {
+    let prompt = "one two three four five six seven eight nine ten ".repeat(3);
+    let req = json!({"model": "tiny", "prompt": prompt, "max_tokens": 1000, "ignore_eos": true});
+    (0..runs)
+        .map(|_| {
+            let r = post(s, "/v1/completions", req.clone());
+            assert_eq!(r["choices"][0]["finish_reason"], "length", "{r}");
+            let u = &r["usage"];
+            (u["prompt_tokens"].as_u64().unwrap(), u["completion_tokens"].as_u64().unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn output_budget_fits_the_kv_cache() {
+    // a 256-token cache under a 4096-token max_seq_len: clients are told 256
+    let s = start_with_kv("qwen3", 256);
+    assert_eq!(get(&s, "/v1/models")["data"][0]["max_model_len"], 256);
+    assert_eq!(get(&s, "/v1/stats")["model"]["ctx"], 256);
+    // prompt + output fill the cache (the last output token needs no slot). The second run
+    // reuses the first one's cached prompt but recomputes its last token, whose copy in the
+    // tree stays pinned too: one slot less (it used to overrun the reservation and panic)
+    let runs = fill_the_cache(&s, 3);
+    assert!(runs[0].0 > 32 && runs[0].0 < 200, "prompt of {} tokens", runs[0].0);
+    let totals: Vec<u64> = runs.iter().map(|(p, c)| p + c).collect();
+    assert_eq!(totals, [257, 256, 256]);
+}
+
+#[test]
+fn output_budget_fits_the_kv_cache_hybrid() {
+    // hybrid model: prefix reuse resumes at recurrent-state snapshots, so more of the prompt
+    // is recomputed while the tree holds it too
+    let s = start_with_kv("qwen3_5_moe", 256);
+    let runs = fill_the_cache(&s, 3);
+    assert_eq!(runs[0].0 + runs[0].1, 257);
+    assert!(runs[1..].iter().all(|(p, c)| p + c <= 257 && p + c > 200), "{runs:?}");
 }
 
 #[test]
