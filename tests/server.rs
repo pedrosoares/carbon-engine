@@ -319,13 +319,13 @@ fn output_budget_fits_the_kv_cache() {
     let s = start_with_kv("qwen3", 256);
     assert_eq!(get(&s, "/v1/models")["data"][0]["max_model_len"], 256);
     assert_eq!(get(&s, "/v1/stats")["model"]["ctx"], 256);
-    // prompt + output fill the cache (the last output token needs no slot). The second run
-    // reuses the first one's cached prompt but recomputes its last token, whose copy in the
-    // tree stays pinned too: one slot less (it used to overrun the reservation and panic)
+    // prompt + output fill the cache (the last output token needs no slot). Later runs reuse
+    // the cached prompt but recompute its last token: the tree adopts the new slot instead of
+    // pinning both copies (which overran the reservation and panicked the scheduler)
     let runs = fill_the_cache(&s, 3);
     assert!(runs[0].0 > 32 && runs[0].0 < 200, "prompt of {} tokens", runs[0].0);
     let totals: Vec<u64> = runs.iter().map(|(p, c)| p + c).collect();
-    assert_eq!(totals, [257, 256, 256]);
+    assert_eq!(totals, [257, 257, 257]);
 }
 
 #[test]
@@ -334,8 +334,8 @@ fn output_budget_fits_the_kv_cache_hybrid() {
     // is recomputed while the tree holds it too
     let s = start_with_kv("qwen3_5_moe", 256);
     let runs = fill_the_cache(&s, 3);
-    assert_eq!(runs[0].0 + runs[0].1, 257);
-    assert!(runs[1..].iter().all(|(p, c)| p + c <= 257 && p + c > 200), "{runs:?}");
+    let totals: Vec<u64> = runs.iter().map(|(p, c)| p + c).collect();
+    assert_eq!(totals, [257, 257, 257], "{runs:?}");
 }
 
 #[test]

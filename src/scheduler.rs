@@ -317,10 +317,6 @@ struct Req {
     /// while the tree already held those tokens in other slots (`cache_prompt`). Its slot
     /// table keeps using them, and they are freed when it ends.
     dup_slots: Vec<u32>,
-    /// Until the prompt is cached: tokens past the reused prefix that the tree also holds.
-    /// The request recomputes them into its own slots, and caching the prompt then pins the
-    /// tree's copies too (`dup_slots`), so their slots are reserved from admission on.
-    dup_reserve: usize,
     cache_hit: usize,
     max_new: usize,
     params: SamplingParams,
@@ -357,7 +353,7 @@ impl Req {
     fn remaining_kv(&self) -> usize {
         // a slot held for the next position (MTP) is already allocated
         let held = self.slots.len() + usize::from(self.mtp_next_slot.is_some());
-        (self.total_kv() + self.dup_reserve).saturating_sub(held)
+        self.total_kv().saturating_sub(held)
     }
     fn usage(&self) -> Usage {
         Usage {
@@ -641,23 +637,16 @@ impl Scheduler {
                 }
             }
         }
-        // tokens past the reused prefix that the tree holds as well (the last prompt token, and
-        // for hybrid models everything after the snapshot): computed again into new slots
-        let dup_reserve = if self.prefix_cache {
-            self.radix.match_prefix(&sub.prompt).1.len().saturating_sub(matched.len())
-        } else {
-            0
-        };
         // the whole output budget is reserved up front, so it is cut to what the cache holds
-        // next to the prompt (`prompt + max_new - 1` slots, plus the duplicates): the reply
-        // then ends at that limit (finish reason `length`) instead of the request failing
+        // next to the prompt (`prompt + max_new - 1` slots): the reply then ends at that limit
+        // (finish reason `length`) instead of the request failing
         let max_new = sub
             .params
             .max_tokens
             .max(1)
             .min(self.engine.max_seq_len - prompt_len)
-            .min((capacity + 1).saturating_sub(prompt_len + dup_reserve).max(1));
-        let need = prompt_len + max_new - 1 - matched.len() + dup_reserve;
+            .min(capacity + 1 - prompt_len);
+        let need = prompt_len + max_new - 1 - matched.len();
         self.radix.lock(node);
         let free = self.alloc.available() + self.radix.evictable_size();
         if free < self.reserved() + need {
@@ -705,7 +694,6 @@ impl Scheduler {
             prompt_len,
             tree_owned: matched.len(),
             dup_slots: vec![],
-            dup_reserve,
             cache_hit: matched.len(),
             slots: matched,
             node,
@@ -1504,10 +1492,6 @@ impl Scheduler {
         if !self.prefix_cache {
             return;
         }
-        // the whole prompt is in: whatever duplicates remain are pinned below (or never will be)
-        if self.running[i].slots.len() >= self.running[i].prompt_len {
-            self.running[i].dup_reserve = 0;
-        }
         let r = &self.running[i];
         let key = &r.tokens[..r.slots.len()];
         let (_, existing) = self.radix.match_prefix(key);
@@ -1515,16 +1499,20 @@ impl Scheduler {
             return;
         }
         // The tree may hold more of these tokens than the request reused: a hybrid model resumes
-        // only at a snapshot, so a prompt that shares a few leading tokens (the chat template's
-        // header) with an earlier one recomputed them. The tree keeps its slots for that part and
-        // takes the request's from there on; the request keeps reading its own copies.
-        let dup = r.slots[r.tree_owned..existing.len().min(r.slots.len())].to_vec();
+        // only at a snapshot (and every request recomputes its last prompt token), so the
+        // request computed KV the tree already had. Where no other request holds those nodes,
+        // the tree takes the request's slots and frees its own; otherwise it keeps its slots
+        // and the request keeps reading its own copies until it ends (`dup_slots`).
+        let dup_end = existing.len().min(r.slots.len());
+        let (released, kept) = self.radix.adopt(&key[..dup_end], &r.slots[..dup_end], r.tree_owned);
+        let dup: Vec<u32> = kept.iter().map(|&p| r.slots[p]).collect();
+        self.alloc.free(&released);
+        let r = &self.running[i];
+        let key = &r.tokens[..r.slots.len()];
         self.radix.insert(key, &r.slots);
         let (node, _) = self.radix.match_prefix(key);
         self.radix.lock(node);
         let r = &mut self.running[i];
-        // between prefill chunks (hybrid): the duplicates so far are pinned now
-        r.dup_reserve = r.dup_reserve.saturating_sub(dup.len());
         r.dup_slots.extend(dup);
         let old = std::mem::replace(&mut r.node, node);
         r.tree_owned = r.slots.len();

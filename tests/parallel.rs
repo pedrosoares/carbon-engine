@@ -441,6 +441,54 @@ fn rejects_oversized_requests() {
     });
 }
 
+/// An agent's next turn re-sends the previous prompt and answer: a hybrid model resumes at the
+/// prompt's snapshot and recomputes the answer the tree already caches. A turn that nearly
+/// fills the cache must still be admitted (it was refused: the duplicates were reserved on top
+/// of the prompt) and run without overrunning the reservation.
+#[test]
+fn agent_turn_near_capacity_reuses_cached_answer() {
+    let (_d, model) = tiny("qwen3_5_moe");
+    let mut ec = config(&model, &["cpu"], 1);
+    ec.kv_tokens = Some(256);
+    let engine = Engine::load(&ec).unwrap();
+    let handle = scheduler::spawn(
+        engine,
+        SchedulerConfig { max_running: 2, max_prefill_tokens: 512, eos_token_ids: vec![], anchor_token: None },
+    )
+    .unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let run = |prompt: Vec<u32>, max_tokens: usize| {
+            let (_, mut rx) = handle.submit(prompt, SamplingParams { max_tokens, ignore_eos: true, ..Default::default() });
+            async move {
+                let mut toks = vec![];
+                loop {
+                    match rx.recv().await.unwrap() {
+                        Event::Token(t) => toks.push(t),
+                        Event::Done { usage, .. } => return (toks, usage),
+                        Event::Error(e) => panic!("{e}"),
+                        Event::Logprobs(_) => {}
+                    }
+                }
+            }
+        };
+        let first: Vec<u32> = (0..60).map(|i| (i * 7 + 3) % 250).collect();
+        let (answer, _) = run(first.clone(), 80).await;
+        // turn 2: prompt + answer + a new message, 250 of the cache's 256 tokens
+        let mut second = first.clone();
+        second.extend(&answer);
+        second.extend((0..250 - second.len() as u32).map(|i| (i * 11 + 5) % 250));
+        let (out, usage) = run(second.clone(), 1000).await;
+        assert!(usage.cached_tokens > 0, "turn 2 reuses the first prompt");
+        assert_eq!(second.len() + out.len(), 257, "turn 2 fills the cache");
+        // and again on top of turn 2
+        let mut third = second;
+        third.truncate(240);
+        let (out, _) = run(third, 1000).await;
+        assert_eq!(240 + out.len(), 257);
+    });
+}
+
 #[test]
 fn live_cache_rebuild() {
     let (_d, model) = tiny("qwen3_moe");

@@ -144,6 +144,46 @@ impl RadixCache {
         (node, slots)
     }
 
+    /// Hand the cached path `key` over to `value` from position `from` on, wherever no request
+    /// holds the node (`ref_count == 0`): the tree takes those slots and returns the ones it
+    /// held, for the caller to free. Positions on held nodes keep the tree's slots; their
+    /// indices are returned second (the caller keeps its own copies of those).
+    ///
+    /// For a request that recomputed tokens the tree already had: keeping both copies would
+    /// pin the tree's ones once the request locks the path, costing slots its KV reservation
+    /// did not count (held nodes were not evictable, so keeping those costs nothing new).
+    pub fn adopt(&mut self, key: &[u32], value: &[u32], from: usize) -> (Vec<u32>, Vec<usize>) {
+        assert_eq!(key.len(), value.len());
+        let (mut released, mut kept) = (vec![], vec![]);
+        let mut node = ROOT;
+        let mut pos = 0;
+        while pos < key.len() {
+            let Some(&child) = self.nodes[node].children.get(&key[pos]) else {
+                break;
+            };
+            let m = common_prefix(&self.nodes[child].key, &key[pos..]);
+            let free = self.nodes[child].ref_count == 0;
+            for j in from.saturating_sub(pos)..m {
+                let (old, new) = (self.nodes[child].value[j], value[pos + j]);
+                if old == new {
+                    continue;
+                }
+                if free {
+                    self.nodes[child].value[j] = new;
+                    released.push(old);
+                } else {
+                    kept.push(pos + j);
+                }
+            }
+            if m < self.nodes[child].key.len() {
+                break;
+            }
+            node = child;
+            pos += m;
+        }
+        (released, kept)
+    }
+
     /// Insert `key -> value`. Returns how many leading tokens were already cached; the caller
     /// owns (and should free) the duplicate slots `value[already_cached_by_caller..returned]`.
     pub fn insert(&mut self, key: &[u32], value: &[u32]) -> usize {
@@ -360,6 +400,24 @@ impl RadixCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adopt_takes_unheld_slots() {
+        let mut r = RadixCache::new();
+        r.insert(&[1, 2, 3, 4, 5, 6], &[10, 20, 30, 40, 50, 60]);
+        // another request holds [1, 2, 3]
+        let (held, _) = r.match_prefix(&[1, 2, 3]);
+        r.lock(held);
+        // a request that reused [1] recomputed [2..6] into slots 21..61
+        let (released, kept) = r.adopt(&[1, 2, 3, 4, 5, 6], &[10, 21, 31, 41, 51, 61], 1);
+        assert_eq!(kept, vec![1, 2], "held nodes keep their slots");
+        assert_eq!(released, vec![40, 50, 60]);
+        assert_eq!(r.match_prefix(&[1, 2, 3, 4, 5, 6]).1, vec![10, 20, 30, 41, 51, 61]);
+        assert_eq!(r.cached_tokens(), 6, "the counts are unchanged");
+        // a key that ends inside a node only touches its matched part
+        let (released, kept) = r.adopt(&[1, 2, 3, 4, 5], &[10, 20, 30, 42, 52], 3);
+        assert_eq!((released, kept), (vec![41, 51], vec![]));
+    }
 
     #[test]
     fn insert_match_split() {
