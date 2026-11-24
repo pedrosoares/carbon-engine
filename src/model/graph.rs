@@ -97,6 +97,9 @@ mod imp {
             for t in &c.ple {
                 add(t, &b.state_idx)?;
             }
+            for t in &c.convs {
+                add(t, &b.state_idx)?;
+            }
             Ok(Self(v))
         }
 
@@ -183,6 +186,8 @@ mod imp {
                     (match &l.mixer {
                         Mixer::Attn(a, _) => a.fused_decode_ready(),
                         Mixer::Linear(g, _) => g.fused_decode_ready(),
+                        // candle ops on device-side slot tables and fresh flags
+                        Mixer::Conv(..) => true,
                     }) && match &l.ffn {
                         Ffn::Dense(_) => true,
                         Ffn::Moe(m) => m.fused_ready(),

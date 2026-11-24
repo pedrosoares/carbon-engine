@@ -13,6 +13,7 @@ pub mod hyper;
 pub mod layers;
 pub mod moe;
 pub mod mtp;
+pub mod shortconv;
 pub mod vision;
 
 use crate::batch::BatchMeta;
@@ -42,6 +43,8 @@ pub enum Mixer {
     Attn(Attention, usize),
     /// Gated DeltaNet; the index selects this layer's recurrent-state pool.
     Linear(GatedDeltaNet, usize),
+    /// LFM2 short conv; the index selects this layer's conv-state pool.
+    Conv(shortconv::ShortConv, usize),
 }
 
 /// How a layer reads and writes the residual stream.
@@ -70,6 +73,8 @@ struct Caches {
     states: Vec<LinearState>,
     /// PLE conv inputs `[slots, len, hc*hidden]` per PLE layer (Qwen3.8).
     ple: Vec<Tensor>,
+    /// Short-conv inputs `[slots, (kernel-1)*hidden]` per short-conv layer (LFM2).
+    convs: Vec<Tensor>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -99,6 +104,7 @@ pub struct LayerStack {
     n_attn: usize,
     n_linear: usize,
     n_ple: usize,
+    n_conv: usize,
     /// Indexer key width of QSA layers (Qwen3.8), 0 otherwise.
     index_dim: usize,
     pub placement: Placement,
@@ -141,7 +147,12 @@ fn state_bytes_per_slot(cfg: &ModelConfig, range: &Range<usize>, p: &Placement) 
         let layers = q.ple_layers.iter().filter(|l| range.contains(l)).count();
         layers * len * width * p.dtype.size_in_bytes()
     });
-    n_linear * gdn + ple
+    let n_conv = range
+        .clone()
+        .filter(|&l| cfg.layer_types[l] == LayerKind::ShortConv)
+        .count();
+    let conv = (cfg.short_conv_kernel.max(1) - 1) * cfg.hidden_size / p.world * p.dtype.size_in_bytes();
+    n_linear * gdn + ple + n_conv * conv
 }
 
 impl LayerStack {
@@ -242,7 +253,8 @@ impl LayerStack {
             vec![]
         };
         let mut layers = Vec::with_capacity(range.len());
-        let (mut n_attn, mut n_linear, mut n_ple) = (0, 0, 0);
+        let (mut n_attn, mut n_linear, mut n_ple, mut n_conv) = (0, 0, 0, 0);
+        let names = cfg.names();
         for l in range.clone() {
             let prefix = cfg.layer_prefix(l);
             let ffn = if cfg.layer_is_moe(l) {
@@ -261,8 +273,8 @@ impl LayerStack {
             } else {
                 Ffn::Dense(Mlp::load(
                     src,
-                    &format!("{prefix}.mlp"),
-                    ["gate_proj", "up_proj", "down_proj"],
+                    &format!("{prefix}.{}", names.mlp),
+                    names.mlp_proj,
                     &cfg.hidden_act,
                     &p,
                 )?)
@@ -280,6 +292,13 @@ impl LayerStack {
                     Mixer::Linear(
                         GatedDeltaNet::load(src, &cfg, &format!("{prefix}.linear_attn"), &p)?,
                         n_linear - 1,
+                    )
+                }
+                LayerKind::ShortConv => {
+                    n_conv += 1;
+                    Mixer::Conv(
+                        shortconv::ShortConv::load(src, &cfg, &format!("{prefix}.conv"), &p)?,
+                        n_conv - 1,
                     )
                 }
             };
@@ -301,13 +320,13 @@ impl LayerStack {
                 None => Residual::Plain {
                     input_ln: RmsNorm::load_model(
                         src,
-                        &format!("{prefix}.input_layernorm.weight"),
+                        &format!("{prefix}.{}.weight", names.input_ln),
                         &cfg,
                         &p,
                     )?,
                     post_ln: RmsNorm::load_model(
                         src,
-                        &format!("{prefix}.post_attention_layernorm.weight"),
+                        &format!("{prefix}.{}.weight", names.post_ln),
                         &cfg,
                         &p,
                     )?,
@@ -379,6 +398,7 @@ impl LayerStack {
             n_attn,
             n_linear,
             n_ple,
+            n_conv,
             index_dim,
             placement: p,
             comm,
@@ -464,6 +484,15 @@ impl LayerStack {
             for _ in 0..self.n_ple {
                 c.ple.push(Tensor::zeros((num_states.max(1), len, width), p.dtype, &p.device)?);
             }
+        }
+        for _ in 0..self.n_conv {
+            c.convs.push(shortconv::ShortConv::new_state(
+                &self.cfg,
+                p.world,
+                num_states.max(1),
+                p.dtype,
+                &p.device,
+            )?);
         }
         if let Some(lc) = &self.cfg.linear_attn {
             for _ in 0..self.n_linear {
@@ -570,6 +599,13 @@ impl LayerStack {
         for st in &c.states {
             st.copy_slot(src, dst)?;
         }
+        if !c.convs.is_empty() {
+            let dev = c.convs[0].device();
+            let (s, d) = (Tensor::new(&[src], dev)?, Tensor::new(&[dst], dev)?);
+            for pool in &c.convs {
+                shortconv::copy_rows(pool, &s, &d)?;
+            }
+        }
         for t in &c.ple {
             let (n, len, w) = t.dims3()?;
             let flat = t.reshape((n, len * w))?;
@@ -581,11 +617,13 @@ impl LayerStack {
     }
 
     pub fn state_slots(&self) -> usize {
-        self.caches
-            .read()
+        let c = self.caches.read();
+        c
             .states
             .first()
-            .map(|s| s.ssm.dim(0).unwrap_or(0))
+            .map(|s| &s.ssm)
+            .or(c.convs.first())
+            .map(|t| t.dim(0).unwrap_or(0))
             .unwrap_or(0)
     }
 
@@ -596,7 +634,11 @@ impl LayerStack {
             return Ok(x);
         }
         let c = self.caches.read();
-        if c.kv.len() != self.n_attn || c.states.len() != self.n_linear || c.ple.len() != self.n_ple {
+        if c.kv.len() != self.n_attn
+            || c.states.len() != self.n_linear
+            || c.ple.len() != self.n_ple
+            || c.convs.len() != self.n_conv
+        {
             bail!("KV cache not allocated for layers {:?}", self.range);
         }
         let mut b = DeviceBatch::build(meta, &self.rotary, self.kv_width, &p.device)?;
@@ -624,6 +666,7 @@ impl LayerStack {
             let a = match &layer.mixer {
                 Mixer::Attn(attn, i) => attn.forward(h, b, &c.kv[*i])?,
                 Mixer::Linear(gdn, i) => gdn.forward(h, b, &c.states[*i])?,
+                Mixer::Conv(conv, i) => conv.forward(h, b, &c.convs[*i])?,
             };
             if world > 1 {
                 self.comm.all_reduce(&a)
@@ -746,7 +789,12 @@ impl ModelHead {
                 q.hc_count,
             ),
             None => (
-                FinalNorm::Rms(RmsNorm::load_model(src, &format!("{}norm.weight", cfg.prefix), cfg, p)?),
+                FinalNorm::Rms(RmsNorm::load_model(
+                    src,
+                    &format!("{}{}.weight", cfg.prefix, cfg.names().final_norm),
+                    cfg,
+                    p,
+                )?),
                 1,
             ),
         };
@@ -810,7 +858,7 @@ mod tests {
     /// PLE conv inputs), so the expert cache and KV pool leave the right room for it.
     #[test]
     fn state_bytes_match_the_allocated_pools() {
-        for arch in ["qwen3_5_moe", "qwen4_exp"] {
+        for arch in ["qwen3_5_moe", "qwen4_exp", "lfm2"] {
             let dir = tempfile::tempdir().unwrap();
             crate::testing::write_tiny_model(dir.path(), &crate::testing::TinySpec::new(arch))
                 .unwrap();
@@ -837,7 +885,8 @@ mod tests {
             let c = stack.caches.read();
             let bytes = |t: &Tensor| t.elem_count() * t.dtype().size_in_bytes();
             let allocated: usize = c.states.iter().map(|s| bytes(&s.conv) + bytes(&s.ssm)).sum::<usize>()
-                + c.ple.iter().map(bytes).sum::<usize>();
+                + c.ple.iter().map(bytes).sum::<usize>()
+                + c.convs.iter().map(bytes).sum::<usize>();
             assert!(allocated > 0, "{arch}");
             assert_eq!(allocated, slots * state_bytes_per_slot(&cfg, &range, &p), "{arch}");
         }

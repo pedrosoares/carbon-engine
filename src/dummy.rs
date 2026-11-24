@@ -103,15 +103,16 @@ fn weight_shapes(cfg: &ModelConfig) -> BTreeMap<String, (Vec<usize>, Init)> {
     };
     let pre = &cfg.prefix;
     add(format!("{pre}embed_tokens.weight"), vec![cfg.vocab_size, h], Init::Proj);
-    add(format!("{pre}norm.weight"), vec![h], norm);
+    let names = cfg.names();
+    add(format!("{pre}{}.weight", names.final_norm), vec![h], norm);
     if !cfg.tie_word_embeddings {
         add("lm_head.weight".into(), vec![cfg.vocab_size, h], Init::Proj);
     }
     let (nh, kvh, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     for l in 0..cfg.num_layers {
         let p = cfg.layer_prefix(l);
-        add(format!("{p}.input_layernorm.weight"), vec![h], norm);
-        add(format!("{p}.post_attention_layernorm.weight"), vec![h], norm);
+        add(format!("{p}.{}.weight", names.input_ln), vec![h], norm);
+        add(format!("{p}.{}.weight", names.post_ln), vec![h], norm);
         match cfg.layer_types[l] {
             LayerKind::Full => {
                 let a = format!("{p}.self_attn");
@@ -119,15 +120,15 @@ fn weight_shapes(cfg: &ModelConfig) -> BTreeMap<String, (Vec<usize>, Init)> {
                 add(format!("{a}.q_proj.weight"), vec![q_rows, h], Init::Proj);
                 add(format!("{a}.k_proj.weight"), vec![kvh * hd, h], Init::Proj);
                 add(format!("{a}.v_proj.weight"), vec![kvh * hd, h], Init::Proj);
-                add(format!("{a}.o_proj.weight"), vec![h, nh * hd], Init::Proj);
+                add(format!("{a}.{}.weight", names.o_proj), vec![h, nh * hd], Init::Proj);
                 if cfg.attention_bias {
                     add(format!("{a}.q_proj.bias"), vec![q_rows], Init::Small);
                     add(format!("{a}.k_proj.bias"), vec![kvh * hd], Init::Small);
                     add(format!("{a}.v_proj.bias"), vec![kvh * hd], Init::Small);
                 }
                 if cfg.qk_norm {
-                    add(format!("{a}.q_norm.weight"), vec![hd], norm);
-                    add(format!("{a}.k_norm.weight"), vec![hd], norm);
+                    add(format!("{a}.{}.weight", names.q_norm), vec![hd], norm);
+                    add(format!("{a}.{}.weight", names.k_norm), vec![hd], norm);
                 }
             }
             LayerKind::Linear => {
@@ -147,6 +148,12 @@ fn weight_shapes(cfg: &ModelConfig) -> BTreeMap<String, (Vec<usize>, Init)> {
                 add(format!("{a}.A_log"), vec![lc.num_v_heads], Init::Small);
                 add(format!("{a}.norm.weight"), vec![lc.v_head_dim], Init::Ones);
                 add(format!("{a}.out_proj.weight"), vec![h, vd], Init::Proj);
+            }
+            LayerKind::ShortConv => {
+                let a = format!("{p}.conv");
+                add(format!("{a}.in_proj.weight"), vec![3 * h, h], Init::Proj);
+                add(format!("{a}.conv.weight"), vec![h, 1, cfg.short_conv_kernel], Init::Proj);
+                add(format!("{a}.out_proj.weight"), vec![h, h], Init::Proj);
             }
         }
         if cfg.layer_is_moe(l) {
@@ -174,9 +181,10 @@ fn weight_shapes(cfg: &ModelConfig) -> BTreeMap<String, (Vec<usize>, Init)> {
             }
         } else {
             let i = cfg.intermediate_size;
-            add(format!("{p}.mlp.gate_proj.weight"), vec![i, h], Init::Proj);
-            add(format!("{p}.mlp.up_proj.weight"), vec![i, h], Init::Proj);
-            add(format!("{p}.mlp.down_proj.weight"), vec![h, i], Init::Proj);
+            let (m, [gate, up, down]) = (names.mlp, names.mlp_proj);
+            add(format!("{p}.{m}.{gate}.weight"), vec![i, h], Init::Proj);
+            add(format!("{p}.{m}.{up}.weight"), vec![i, h], Init::Proj);
+            add(format!("{p}.{m}.{down}.weight"), vec![h, i], Init::Proj);
         }
     }
     m

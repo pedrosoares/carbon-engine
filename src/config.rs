@@ -23,6 +23,8 @@ pub enum Arch {
     /// Qwen3.5 / Qwen3.6 (dense or MoE): hybrid Gated-DeltaNet + gated full attention,
     /// partial rope, zero-centred RMSNorm, sigmoid-gated shared expert
     Qwen35,
+    /// Liquid LFM2 / LFM2.5: gated short-conv layers + GQA attention with per-head q/k norm
+    Lfm2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +33,23 @@ pub enum LayerKind {
     Full,
     /// Gated DeltaNet linear attention with a per-sequence recurrent state.
     Linear,
+    /// LFM2 gated short convolution: a per-sequence state of the last `kernel - 1` inputs.
+    ShortConv,
+}
+
+/// Tensor names of the decoder pieces whose names differ between families (relative to a
+/// layer prefix, except `final_norm` which follows the decoder prefix).
+#[derive(Clone, Copy, Debug)]
+pub struct TensorNames {
+    pub input_ln: &'static str,
+    pub post_ln: &'static str,
+    /// Dense MLP block and its `[gate, up, down]` projections.
+    pub mlp: &'static str,
+    pub mlp_proj: [&'static str; 3],
+    pub o_proj: &'static str,
+    pub q_norm: &'static str,
+    pub k_norm: &'static str,
+    pub final_norm: &'static str,
 }
 
 /// Gated DeltaNet (linear attention) dimensions.
@@ -228,6 +247,9 @@ pub struct ModelConfig {
     /// axes the same index, so it only matters with image tokens.
     #[serde(default)]
     pub mrope_section: Option<[usize; 3]>,
+    /// Kernel width of the LFM2 short-conv layers (`conv_L_cache`), 0 when there are none.
+    #[serde(default)]
+    pub short_conv_kernel: usize,
 }
 
 /// The Qwen3.5 / 3.6 / 3.8 vision tower (a ViT with a 2x2 patch merger).
@@ -276,6 +298,23 @@ impl VisionConfig {
     pub fn patch_dim(&self) -> usize {
         self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
     }
+}
+
+/// LFM2's SwiGLU width: `block_auto_adjust_ff_dim` shrinks the configured width to 2/3, scales
+/// it by `block_ffn_dim_multiplier` and rounds up to `block_multiple_of` (HF `Lfm2MLP`).
+fn lfm2_ff_dim(v: &Value) -> Result<usize> {
+    let ff = get_usize(v, "intermediate_size")
+        .or_else(|| get_usize(v, "block_ff_dim"))
+        .context("lfm2 config needs intermediate_size")?;
+    if !v.get("block_auto_adjust_ff_dim").and_then(|x| x.as_bool()).unwrap_or(false) {
+        return Ok(ff);
+    }
+    let mut ff = 2 * ff / 3;
+    if let Some(m) = get_f64(v, "block_ffn_dim_multiplier") {
+        ff = (m * ff as f64) as usize;
+    }
+    let multiple = get_usize(v, "block_multiple_of").unwrap_or(256).max(1);
+    Ok(ff.div_ceil(multiple) * multiple)
 }
 
 fn get_usize(v: &Value, key: &str) -> Option<usize> {
@@ -497,10 +536,13 @@ impl ModelConfig {
             "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_5" | "qwen3_5_text" => Arch::Qwen35,
             // Qwen3.8-Flash-Next: the Qwen3.5 stack plus `qwen38` (parsed below)
             "qwen4_exp" | "qwen4_exp_text" => Arch::Qwen35,
-            other => bail!("unsupported model_type '{other}' (supported: llama, mistral, qwen2, qwen3, qwen3_moe, mixtral, qwen3_5, qwen3_5_moe, qwen4_exp)"),
+            "lfm2" => Arch::Lfm2,
+            other => bail!("unsupported model_type '{other}' (supported: llama, mistral, qwen2, qwen3, qwen3_moe, mixtral, qwen3_5, qwen3_5_moe, qwen4_exp, lfm2)"),
         };
         let hidden_size = get_usize(v, "hidden_size").context("hidden_size")?;
-        let num_heads = get_usize(v, "num_attention_heads").context("num_attention_heads")?;
+        let num_heads = get_usize(v, "num_attention_heads")
+            .or_else(|| get_usize(v, "num_heads"))
+            .context("num_attention_heads")?;
         let num_kv_heads = get_usize(v, "num_key_value_heads").unwrap_or(num_heads);
         let head_dim = get_usize(v, "head_dim").unwrap_or(hidden_size / num_heads);
         // `rope_parameters` (transformers v5) holds theta / partial rotary / mRoPE sections and
@@ -641,6 +683,7 @@ impl ModelConfig {
                     // qwen4_exp: full attention restricted by the QSA indexer
                     Some("full_attention") | Some("attention") | Some("indexed_attention")
                     | Some("qwen_sparse_attention") => Ok(LayerKind::Full),
+                    Some("conv") if arch == Arch::Lfm2 => Ok(LayerKind::ShortConv),
                     other => bail!("unsupported layer type {other:?}"),
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -654,6 +697,20 @@ impl ModelConfig {
                             LayerKind::Linear
                         }
                     })
+                    .collect()
+            }
+            None if arch == Arch::Lfm2 => {
+                // older LFM2 configs list the attention layers instead
+                let full: Vec<usize> = v
+                    .get("full_attn_idxs")
+                    .and_then(|x| x.as_array())
+                    .context("lfm2 config needs layer_types or full_attn_idxs")?
+                    .iter()
+                    .filter_map(|x| x.as_u64())
+                    .map(|x| x as usize)
+                    .collect();
+                (0..num_layers)
+                    .map(|i| if full.contains(&i) { LayerKind::Full } else { LayerKind::ShortConv })
                     .collect()
             }
             None => vec![LayerKind::Full; num_layers],
@@ -693,26 +750,33 @@ impl ModelConfig {
             arch,
             model_type,
             hidden_size,
-            intermediate_size: get_usize(v, "intermediate_size").unwrap_or(4 * hidden_size),
+            intermediate_size: if arch == Arch::Lfm2 {
+                lfm2_ff_dim(v)?
+            } else {
+                get_usize(v, "intermediate_size").unwrap_or(4 * hidden_size)
+            },
             num_layers,
             num_heads,
             num_kv_heads,
             head_dim,
             vocab_size: get_usize(v, "vocab_size").context("vocab_size")?,
-            rms_norm_eps: get_f64(v, "rms_norm_eps").unwrap_or(1e-6),
+            rms_norm_eps: get_f64(v, "rms_norm_eps")
+                .or_else(|| get_f64(v, "norm_eps"))
+                .unwrap_or(1e-6),
             rope_theta,
             rope_scaling,
             max_position_embeddings: get_usize(v, "max_position_embeddings").unwrap_or(4096),
             tie_word_embeddings: v
                 .get("tie_word_embeddings")
                 .or_else(|| root.get("tie_word_embeddings"))
+                .or_else(|| v.get("tie_embedding"))
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
             attention_bias: v
                 .get("attention_bias")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(arch == Arch::Qwen2),
-            qk_norm: matches!(arch, Arch::Qwen3 | Arch::Qwen3Moe | Arch::Qwen35),
+            qk_norm: matches!(arch, Arch::Qwen3 | Arch::Qwen3Moe | Arch::Qwen35 | Arch::Lfm2),
             hidden_act: v
                 .get("hidden_act")
                 .and_then(|x| x.as_str())
@@ -734,7 +798,19 @@ impl ModelConfig {
                     let s: Vec<usize> = a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect();
                     (s.len() == 3).then(|| [s[0], s[1], s[2]])
                 }),
+            short_conv_kernel: if arch == Arch::Lfm2 { get_usize(v, "conv_L_cache").unwrap_or(3) } else { 0 },
         };
+        if cfg.layer_types.contains(&LayerKind::ShortConv) {
+            if cfg.short_conv_kernel < 2 {
+                bail!("lfm2 conv_L_cache must be at least 2, got {}", cfg.short_conv_kernel);
+            }
+            if v.get("conv_bias").and_then(|x| x.as_bool()) == Some(true) {
+                bail!("lfm2 short-conv layers with conv_bias are not supported");
+            }
+            if cfg.moe.is_some() {
+                bail!("lfm2 with routed experts (lfm2_moe) is not supported");
+            }
+        }
         if let Some(q) = &cfg.qwen38 {
             if let Some(&l) = q.ple_layers.iter().find(|&&l| cfg.layer_types[l] != LayerKind::Linear) {
                 bail!("qwen4_exp PLE must sit on a linear_attention layer, layer {l} is not one");
@@ -761,8 +837,35 @@ impl ModelConfig {
         2 * num_layers * self.num_kv_heads * self.head_dim * dtype_size
     }
 
+    /// Some layers keep a per-sequence recurrent state (GDN or short conv) instead of KV.
     pub fn is_hybrid(&self) -> bool {
-        self.layer_types.contains(&LayerKind::Linear)
+        self.layer_types.iter().any(|k| matches!(k, LayerKind::Linear | LayerKind::ShortConv))
+    }
+
+    pub fn names(&self) -> TensorNames {
+        if self.arch == Arch::Lfm2 {
+            TensorNames {
+                input_ln: "operator_norm",
+                post_ln: "ffn_norm",
+                mlp: "feed_forward",
+                mlp_proj: ["w1", "w3", "w2"],
+                o_proj: "out_proj",
+                q_norm: "q_layernorm",
+                k_norm: "k_layernorm",
+                final_norm: "embedding_norm",
+            }
+        } else {
+            TensorNames {
+                input_ln: "input_layernorm",
+                post_ln: "post_attention_layernorm",
+                mlp: "mlp",
+                mlp_proj: ["gate_proj", "up_proj", "down_proj"],
+                o_proj: "o_proj",
+                q_norm: "q_norm",
+                k_norm: "k_norm",
+                final_norm: "norm",
+            }
+        }
     }
 
     /// Name of decoder layer `l`'s tensors, e.g. `model.layers.3`.

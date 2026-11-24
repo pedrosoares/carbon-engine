@@ -601,6 +601,37 @@ fn qwen38_topologies_match_single_device() {
 }
 
 #[test]
+fn lfm2_topologies_match_single_device() {
+    // short-conv layers: a conv-state slot per request, segments sharded under tensor parallelism
+    check_topologies("lfm2");
+}
+
+#[test]
+fn lfm2_chunked_prefill_carries_conv_state() {
+    let (_d, model) = tiny("lfm2");
+    let ps = prompts();
+    let baseline = tokens(run(&config(&model, &["cpu"], 1), &ps, 10, 4096));
+    // chunks shorter than the conv kernel too: the state spans several chunks
+    for budget in [7, 3, 2] {
+        assert_eq!(
+            tokens(run(&config(&model, &["cpu"], 1), &ps, 10, budget)),
+            baseline,
+            "prefill budget {budget}"
+        );
+    }
+}
+
+#[test]
+fn lfm2_more_requests_than_state_slots() {
+    more_requests_than_state_slots("lfm2");
+}
+
+#[test]
+fn lfm2_prefix_snapshots_reuse_state_exactly() {
+    prefix_snapshots_reuse_state_exactly("lfm2");
+}
+
+#[test]
 fn qwen35_hybrid_moe_strategies_and_chunking() {
     hybrid_moe_strategies_and_chunking("qwen3_5_moe");
 }
@@ -897,7 +928,7 @@ fn cuda_graphs_match_eager() {
     let mut models: Vec<(String, tempfile::TempDir, PathBuf)> = vec![];
     // qwen4_exp: hyper-connections, PLE embeddings gathered before the graph, QSA selection on
     // the device (the 150-token prompt passes the 16-token budget)
-    for arch in ["llama", "qwen3_moe", "qwen3_5_moe", "qwen4_exp"] {
+    for arch in ["llama", "qwen3_moe", "qwen3_5_moe", "qwen4_exp", "lfm2"] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(arch);
         write_tiny_model(&path, &spec(arch)).unwrap();
@@ -932,7 +963,7 @@ fn cuda_graphs_match_eager() {
 /// prefill does. head_dim 32 so the fused attention kernels apply.
 #[test]
 fn multi_token_steps_match_prefill() {
-    for arch in ["llama", "qwen3_5_moe", "qwen4_exp"] {
+    for arch in ["llama", "qwen3_5_moe", "qwen4_exp", "lfm2"] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(arch);
         let mut spec = TinySpec::new(arch);

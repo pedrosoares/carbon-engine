@@ -63,7 +63,7 @@ pub struct GatedDeltaNet {
 }
 
 /// Load `name` and keep this rank's share of each consecutive segment along dim 0.
-fn load_segments(
+pub(crate) fn load_segments(
     src: &dyn WeightSource,
     name: &str,
     segments: &[usize],

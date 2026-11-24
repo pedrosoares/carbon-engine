@@ -212,7 +212,7 @@ impl TokenizerBundle {
         env.add_filter("tojson", py_tojson);
         env.add_template_owned(
             "chat",
-            template.unwrap_or_else(|| CHATML_TEMPLATE.to_string()),
+            strip_generation_tags(&template.unwrap_or_else(|| CHATML_TEMPLATE.to_string())),
         )
         .map_err(|e| anyhow!("invalid chat template: {e}"))?;
         Ok(Self {
@@ -395,9 +395,41 @@ impl StopChecker {
     }
 }
 
+/// transformers' `{% generation %}` ... `{% endgeneration %}` only marks assistant tokens for
+/// training masks (LFM2.5 templates use it): render it as `{% if true %}` ... `{% endif %}`,
+/// keeping the whitespace control of each tag.
+fn strip_generation_tags(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{%") {
+        let Some(len) = rest[open..].find("%}") else { break };
+        let tag = &rest[open + 2..open + len];
+        let inner = tag.trim_start_matches(['-', '+']).trim_end_matches(['-', '+']).trim();
+        let (lead, trail) = (&tag[..tag.len() - tag.trim_start_matches(['-', '+']).len()], &tag[tag.trim_end_matches(['-', '+']).len()..]);
+        out.push_str(&rest[..open]);
+        match inner {
+            "generation" => out.push_str(&format!("{{%{lead} if true {trail}%}}")),
+            "endgeneration" => out.push_str(&format!("{{%{lead} endif {trail}%}}")),
+            _ => out.push_str(&rest[open..open + len + 2]),
+        }
+        rest = &rest[open + len + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_tags_render_as_plain_blocks() {
+        let t = "a {%- generation -%} b {% endgeneration %}{{ x }}{%+ generation %}c{% endgeneration -%}";
+        assert_eq!(
+            strip_generation_tags(t),
+            "a {%- if true -%} b {% endif %}{{ x }}{%+ if true %}c{% endif -%}"
+        );
+    }
     use std::str::FromStr;
 
     #[test]

@@ -39,8 +39,8 @@ few runtime choices.
 | MoE placement | resident, offload (global LRU expert cache), CPU, hybrid CPU-GPU split, picked from a bandwidth benchmark | the same four strategies, picked from `carbon bench bw` |
 | Offloaded experts | expert cache on the GPU fed from pinned host memory, CUDA-graph compatible | a device slot cache fed from pinned host memory by a GPU kernel at PCIe speed, routing and caching on the GPU, CUDA-graph compatible |
 | Elastic memory | VRAM moved between KV and experts at runtime | `POST /v1/cache/rebuild`, `carbon ctl cache --kv N --moe N` |
-| Quantized weights | FP8, NVFP4, MXFP4, GGUF Q4_0, BF16 | FP8 (block and per-tensor), NVFP4 (ModelOpt and compressed-tensors), GGUF Q4_K / Q6_K (dense Qwen3.5-family), BF16/F16/F32 |
-| Hybrid attention models | Gated DeltaNet (Qwen3.5/3.6/3.8) | Gated DeltaNet (Qwen3.5/3.6/3.8), fused decode and prefill kernels |
+| Quantized weights | FP8, NVFP4, MXFP4, GGUF Q4_0, BF16 | FP8 (block and per-tensor), NVFP4 (ModelOpt and compressed-tensors), GGUF Q4_K / Q6_K (dense Qwen3.5-family), GGUF Q8_0 (LFM2), BF16/F16/F32 |
+| Hybrid attention models | Gated DeltaNet (Qwen3.5/3.6/3.8) | Gated DeltaNet (Qwen3.5/3.6/3.8), fused decode and prefill kernels; LFM2 / LFM2.5 gated short convolutions |
 | CUDA graphs | decode steps | decode steps, including offloaded experts and multi-token (MTP verify) steps |
 | CLI | `ft serve / ctl / bench` | `carbon serve / generate / ctl / bench bw / devices / worker / launch / shell` |
 
@@ -51,7 +51,7 @@ few runtime choices.
 | GPUs per server | one (`--gpu`) | any number, in pipeline and/or tensor-parallel groups |
 | Machines | one | several, over RPC (`carbon worker`) |
 | Speculative decoding | none | MTP drafts for Qwen3.8-Flash-Next (`--mtp`), verified in one multi-token step |
-| Models | Llama, Qwen2/3, Qwen3-MoE, Qwen3.5/3.6/3.8, DeepSeek-V4, GLM, gpt-oss, Gemma-4, MiniMax, ... | Llama/Mistral, Qwen2/2.5, Qwen3, Qwen3-MoE, Mixtral, Qwen3.5/3.6 (dense + MoE), Qwen3.8-Flash-Next |
+| Models | Llama, Qwen2/3, Qwen3-MoE, Qwen3.5/3.6/3.8, DeepSeek-V4, GLM, gpt-oss, Gemma-4, MiniMax, ... | Llama/Mistral, Qwen2/2.5, Qwen3, Qwen3-MoE, Mixtral, Qwen3.5/3.6 (dense + MoE), Qwen3.8-Flash-Next, LFM2 / LFM2.5 (dense) |
 | Image input | Qwen3.6/3.8, Qwen3-VL, Gemma-4, GLM, ... | Qwen3.5/3.6/3.8 (their vision tower); no video |
 | Fast-load weight format | FTW | the checkpoint format of `carbon checkpoint` |
 | Prefill with offloaded experts | whole layers streamed, double-buffered behind compute | through the slot cache: a layer's missing experts are copied in batches on a side stream while its resident ones compute, then grouped tensor-core NVFP4 expert GEMMs |
@@ -296,6 +296,42 @@ server (an earlier 148 s for LM Studio at 250k had reused a cached 128k prefix).
 A later prompt that shares the beginning starts in 1.7 s at 32k, 2.2 s at 128k and 4.3 s at
 250k. Without `--max-seq-len` the context is capped at 32,768 tokens, or set to the scaled
 length when YaRN is on (`--yarn`, or a checkpoint or GGUF that ships YaRN rope scaling).
+
+## Running LFM2.5-350M (Liquid AI)
+
+```bash
+# the GGUF file (Q8_0) ...
+carbon serve --model ~/models/LFM2.5-350M-Q8_0.gguf --devices cuda:0 --cuda-graphs --max-seq-len 32768
+# ... or the HF checkpoint (bf16 safetensors), downloaded into the hub cache
+carbon serve --model LiquidAI/LFM2.5-350M --devices cuda:0 --cuda-graphs
+# CPU only
+carbon generate --model ~/models/LFM2.5-350M-Q8_0.gguf --devices cpu --chat --prompt "Hello!"
+```
+
+LFM2 (`model_type: lfm2`, GGUF architecture `lfm2`) is a hybrid of gated short convolutions
+and grouped-query attention: at 350M, 16 layers (10 conv + 6 attention with 16 query / 8 KV
+heads and per-head q/k RMSNorm), hidden size 1024, SwiGLU width 4608, tied embeddings. A conv
+layer splits `in_proj(x)` into gates `b`, `c` and values `x`, runs a causal depthwise conv
+(kernel 3) over `b * x` and gates the result with `c` (`src/model/shortconv.rs`). Each request
+keeps the last two conv inputs per conv layer (20 KiB in bf16) as its recurrent state, in the
+same state slots, prefix snapshots and CUDA graphs as the Gated DeltaNet models; KV costs
+12 KiB per token (6 attention layers).
+
+- GGUF: tensors F32 / F16 / BF16 / Q8_0 (Q8_0 is decoded to the compute dtype at load: the
+  model is 0.7 GiB in bf16). K-quant LFM2 files have not been tried. The tokenizer is rebuilt
+  from the file's metadata and matches Liquid's `tokenizer.json` and llama.cpp token for token.
+- HF: configs with `block_auto_adjust_ff_dim` get the SwiGLU width HF derives (6656 -> 4608);
+  the `{% generation %}` tags of the LFM2.5 chat templates are accepted.
+- Not supported: LFM2-MoE (`lfm2_moe`), sliding-window variants, the vision / audio models.
+- Checked against an independent f32 NumPy forward pass of the GGUF
+  (`scripts/lfm2_reference.py`): with `--dtype f32` prefill and 32 greedy decode steps agree to
+  1e-5 in log-probability on CPU and CUDA (the HF checkpoint against the same pass on its own
+  bf16 weights: 6e-5); in bf16 to about 0.1. Against llama.cpp on the same
+  file (whose CPU path also quantizes activations to 8 bits) the teacher-forced greedy token
+  agrees on 78 of 80 positions, the misses being near-ties.
+
+RTX 5090, one stream, 400-token greedy answer: 731 tok/s, 874 tok/s with `--cuda-graphs`; eight
+concurrent streams about 2,800 tok/s (3,400 with graphs) in aggregate.
 
 ## Architecture
 
@@ -628,6 +664,7 @@ hardware yet, so treat it as unvalidated until you run the suite on your GPUs.
 
 - Image input for Qwen3-VL; video input
 - MXFP4 weights; GGUF for more architectures and K-quants, other `mmproj` projector types
+- LFM2: fused short-conv decode kernel, packed Q8_0 projections, LFM2-MoE
 - Prefill: fuse Qwen3.8's hyper-connection elementwise ops (~0.6 s of a 4096-token chunk)
 - MTP speculative decoding across several local GPUs
 - Micro-batched pipeline execution (overlap stages for different sequences)
