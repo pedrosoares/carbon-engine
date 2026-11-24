@@ -705,7 +705,7 @@ async fn stats(State(s): State<SharedState>) -> Result<Json<Value>, ApiError> {
         "instance_id": s.instance_id,
         "model": {
             "id": s.model_name,
-            "ctx": info.max_seq_len,
+            "ctx": info.context(),
             "attn": info.attn,
             "moe": info.moe,
             "input_modalities": if info.image_processor.is_some() { json!(["text", "image"]) } else { json!(["text"]) },

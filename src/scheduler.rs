@@ -187,6 +187,15 @@ pub struct EngineInfo {
     pub image_token_id: Option<u32>,
 }
 
+impl EngineInfo {
+    /// The longest conversation that can be served: `max_seq_len`, or less when the KV cache
+    /// holds fewer tokens. Reported to clients as the model's context window, so agents
+    /// compact before the cache, not only the rope table, runs out.
+    pub fn context(&self) -> usize {
+        self.max_seq_len.min(self.kv_tokens)
+    }
+}
+
 /// Cloneable handle used by the HTTP server to talk to the scheduler thread.
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -594,11 +603,15 @@ impl Scheduler {
             return false;
         };
         let prompt_len = sub.prompt.len();
-        let max_new = sub
-            .params
-            .max_tokens
-            .max(1)
-            .min(self.engine.max_seq_len - prompt_len);
+        let capacity = self.alloc.capacity();
+        if prompt_len > capacity {
+            // on_cmd checked this; a live KV resize can have shrunk the cache since
+            let sub = self.waiting.pop_front().unwrap();
+            let _ = sub.tx.send(Event::Error(format!(
+                "prompt has {prompt_len} tokens but the KV cache holds only {capacity}"
+            )));
+            return true;
+        }
         if self.hybrid && self.free_states.is_empty() {
             return false;
         }
@@ -624,15 +637,16 @@ impl Scheduler {
                 }
             }
         }
+        // the whole output budget is reserved up front, so it is cut to what the cache holds
+        // next to the prompt (`prompt + max_new - 1` slots): the reply then ends at that limit
+        // (finish reason `length`) instead of the request failing
+        let max_new = sub
+            .params
+            .max_tokens
+            .max(1)
+            .min(self.engine.max_seq_len - prompt_len)
+            .min(capacity + 1 - prompt_len);
         let need = prompt_len + max_new - 1 - matched.len();
-        if need > self.alloc.capacity() {
-            let sub = self.waiting.pop_front().unwrap();
-            let _ = sub.tx.send(Event::Error(format!(
-                "request needs {need} KV tokens but the cache holds {}; lower max_tokens",
-                self.alloc.capacity()
-            )));
-            return true;
-        }
         self.radix.lock(node);
         let free = self.alloc.available() + self.radix.evictable_size();
         if free < self.reserved() + need {
@@ -707,11 +721,19 @@ impl Scheduler {
                 self.decode_step();
             }
         } else if !self.waiting.is_empty() && self.running.is_empty() {
-            // nothing runs and the head request does not fit: it never will
+            // nothing runs and the head request could not be admitted: it never will (admission
+            // sizes budgets to the cache, so this means free slots or state slots went missing)
             let sub = self.waiting.pop_front().unwrap();
-            let _ = sub
-                .tx
-                .send(Event::Error("request does not fit in the KV cache".into()));
+            let msg = format!(
+                "request could not be admitted: prompt {} tokens, KV cache {} (free {}, evictable {}), free state slots {}",
+                sub.prompt.len(),
+                self.alloc.capacity(),
+                self.alloc.available(),
+                self.radix.evictable_size(),
+                self.free_states.len()
+            );
+            tracing::error!("{msg}");
+            let _ = sub.tx.send(Event::Error(msg));
         }
     }
 
@@ -1477,10 +1499,16 @@ impl Scheduler {
             return;
         }
         // The tree may hold more of these tokens than the request reused: a hybrid model resumes
-        // only at a snapshot, so a prompt that shares a few leading tokens (the chat template's
-        // header) with an earlier one recomputed them. The tree keeps its slots for that part and
-        // takes the request's from there on; the request keeps reading its own copies.
-        let dup = r.slots[r.tree_owned..existing.len().min(r.slots.len())].to_vec();
+        // only at a snapshot (and every request recomputes its last prompt token), so the
+        // request computed KV the tree already had. Where no other request holds those nodes,
+        // the tree takes the request's slots and frees its own; otherwise it keeps its slots
+        // and the request keeps reading its own copies until it ends (`dup_slots`).
+        let dup_end = existing.len().min(r.slots.len());
+        let (released, kept) = self.radix.adopt(&key[..dup_end], &r.slots[..dup_end], r.tree_owned);
+        let dup: Vec<u32> = kept.iter().map(|&p| r.slots[p]).collect();
+        self.alloc.free(&released);
+        let r = &self.running[i];
+        let key = &r.tokens[..r.slots.len()];
         self.radix.insert(key, &r.slots);
         let (node, _) = self.radix.match_prefix(key);
         self.radix.lock(node);

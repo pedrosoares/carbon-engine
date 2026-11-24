@@ -434,7 +434,10 @@ carbon serve --model /models/M --devices cpu --rpc-worker hostA:7070 --rpc-worke
 * KV capacity is negotiated: every stage reports how many tokens fit, the minimum wins
   (override with `--kv-tokens`). On a GPU the room left for activations follows
   `--max-prefill-tokens`: chunks beyond about 16k tokens take pool tokens and do not prefill
-  faster, so keep the default. Startup warns when the pool is smaller than `--max-seq-len`.
+  faster, so keep the default. Startup warns when the pool is smaller than `--max-seq-len`;
+  clients are then told the pool size as the context (`/v1/models` `max_model_len`, which
+  `carbon launch` passes to agents), and a request's whole output budget is reserved up front,
+  cut to what fits next to its prompt (the reply ends with finish reason `length`).
 * Per decode step each worker hop carries one hidden-state row per sequence plus newly
   allocated slot ids (a few KB), so the link latency, not bandwidth, bounds decode speed.
 * **Security:** the protocol is unencrypted. Use `--token` / `--rpc-token` (or
