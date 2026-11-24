@@ -113,6 +113,16 @@ struct EngineArgs {
     /// '{"rope_scaling": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768}}'.
     #[arg(long)]
     hf_overrides: Option<String>,
+    /// Extend the context with YaRN rope scaling by this factor (e.g. 4 turns a 32k model into
+    /// a 128k one). The default --max-seq-len becomes original context x factor. Best used only
+    /// when long prompts are expected: it slightly lowers short-context quality.
+    #[arg(long, value_name = "FACTOR")]
+    yarn: Option<f64>,
+    /// Context the model was trained at, which --yarn stretches. Default: the checkpoint's
+    /// `max_position_embeddings` (GGUF: `context_length`). Set it when that is not the trained
+    /// length, e.g. 32768 for Qwen3, whose config says 40960.
+    #[arg(long, value_name = "TOKENS", requires = "yarn")]
+    yarn_original_ctx: Option<usize>,
     /// Random weights shaped from config.json (benchmarking / smoke tests without a checkpoint).
     #[arg(long)]
     dummy_weight: bool,
@@ -224,6 +234,35 @@ impl EngineArgs {
         Ok(())
     }
 
+    /// `--hf-overrides`, with `--yarn` folded in as a `rope_scaling` entry.
+    fn hf_overrides(&self) -> Result<Option<serde_json::Value>> {
+        let mut o: Option<serde_json::Value> = self
+            .hf_overrides
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .context("--hf-overrides is not valid JSON")?;
+        let Some(factor) = self.yarn else {
+            return Ok(o);
+        };
+        if !(factor.is_finite() && factor > 1.0) {
+            bail!("--yarn {factor}: the factor must be greater than 1");
+        }
+        let mut scaling = serde_json::json!({"rope_type": "yarn", "factor": factor});
+        if let Some(n) = self.yarn_original_ctx {
+            scaling["original_max_position_embeddings"] = n.into();
+        }
+        let o = o.get_or_insert_with(|| serde_json::json!({}));
+        let Some(map) = o.as_object_mut() else {
+            bail!("--hf-overrides must be a JSON object");
+        };
+        if map.contains_key("rope_scaling") {
+            bail!("--yarn and an --hf-overrides 'rope_scaling' both set the rope scaling; use one");
+        }
+        map.insert("rope_scaling".into(), scaling);
+        Ok(Some(o.clone()))
+    }
+
     fn engine_config(&self) -> Result<EngineConfig> {
         // the GGUF loader finds the projector through the environment
         if let Some(m) = &self.mmproj {
@@ -256,12 +295,7 @@ impl EngineArgs {
             max_running: self.max_running_requests.max(1),
             state_snapshots: self.state_snapshots,
             cuda_graphs: self.cuda_graphs,
-            hf_overrides: self
-                .hf_overrides
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()
-                .context("--hf-overrides is not valid JSON")?,
+            hf_overrides: self.hf_overrides()?,
             dummy_weights: self.dummy_weight,
             mtp: self.mtp_shadow,
             mtp_speculate: self.mtp,

@@ -113,6 +113,34 @@ pub fn yarn_mscale(scale: f64, mscale: f64) -> f64 {
     }
 }
 
+impl RopeScaling {
+    /// Context the scheme stretches the rope to (`original * factor`), for schemes that name
+    /// their original training length.
+    pub fn extended_context(&self) -> Option<usize> {
+        match self {
+            RopeScaling::Linear { .. } => None,
+            RopeScaling::Llama3 { factor, original_max_position, .. }
+            | RopeScaling::Yarn { factor, original_max_position, .. } => {
+                Some((*original_max_position as f64 * factor).round() as usize)
+            }
+        }
+    }
+
+    /// One-line description for the start-up log.
+    pub fn describe(&self) -> String {
+        match self {
+            RopeScaling::Linear { factor } => format!("linear x{factor}"),
+            RopeScaling::Llama3 { factor, original_max_position, .. } => {
+                format!("llama3 x{factor} ({original_max_position} -> {})", self.extended_context().unwrap_or(0))
+            }
+            RopeScaling::Yarn { factor, original_max_position, beta_fast, beta_slow, attention_factor } => format!(
+                "yarn x{factor} ({original_max_position} -> {}), beta {beta_fast}/{beta_slow}, attention factor {attention_factor:.4}",
+                self.extended_context().unwrap_or(0)
+            ),
+        }
+    }
+}
+
 /// Qwen3.8-Flash-Next (`qwen4_exp`) on top of the Qwen3.5 layer stack: hyper-connections
 /// (`hc_count` residual streams), PLE n-gram embeddings on some linear layers and QSA sparse
 /// attention (an indexer selects `index_budget` tokens in blocks of `index_ratio`).
@@ -271,7 +299,9 @@ fn token_ids(v: Option<&Value>) -> Vec<u32> {
 }
 
 /// vLLM `--hf-overrides` semantics: nested config sections (`*_config` objects) merge key by
-/// key, every other value is replaced whole.
+/// key, every other value is replaced whole. `rope_parameters` merges too: it carries the
+/// model's own theta / partial rotary / mRoPE sections next to the scaling scheme, so an
+/// override that only names a scheme (YaRN) keeps them.
 pub fn apply_overrides(config: &mut Value, overrides: &Value) -> Result<()> {
     let Some(o) = overrides.as_object() else {
         bail!("--hf-overrides must be a JSON object");
@@ -281,7 +311,11 @@ pub fn apply_overrides(config: &mut Value, overrides: &Value) -> Result<()> {
     };
     for (k, v) in o {
         match c.get_mut(k) {
-            Some(section) if k.ends_with("_config") && section.is_object() && v.is_object() => {
+            Some(section)
+                if (k.ends_with("_config") || k == "rope_parameters")
+                    && section.is_object()
+                    && v.is_object() =>
+            {
                 apply_overrides(section, v)?
             }
             _ => {
@@ -469,10 +503,29 @@ impl ModelConfig {
         let num_heads = get_usize(v, "num_attention_heads").context("num_attention_heads")?;
         let num_kv_heads = get_usize(v, "num_key_value_heads").unwrap_or(num_heads);
         let head_dim = get_usize(v, "head_dim").unwrap_or(hidden_size / num_heads);
-        let rope_params = v
-            .get("rope_scaling")
-            .or_else(|| v.get("rope_parameters"))
-            .filter(|x| !x.is_null());
+        // `rope_parameters` (transformers v5) holds theta / partial rotary / mRoPE sections and
+        // maybe the scaling scheme; a `rope_scaling` dict (older configs, or an `--hf-overrides`
+        // such as YaRN) layers its keys on top instead of replacing the base parameters. With a
+        // multimodal wrapper, top-level dicts (where overrides land) layer over text_config's.
+        let mut levels = vec![v];
+        if !std::ptr::eq(v, root) {
+            levels.push(root);
+        }
+        let mut rope_merged: Option<serde_json::Map<String, Value>> = None;
+        for key in ["rope_parameters", "rope_scaling"] {
+            for level in &levels {
+                if let Some(Value::Object(d)) = level.get(key) {
+                    let m = rope_merged.get_or_insert_with(Default::default);
+                    m.extend(d.iter().map(|(k, x)| (k.clone(), x.clone())));
+                    // older configs spell the scheme `type`
+                    if let (Some(t), false) = (d.get("type"), d.contains_key("rope_type")) {
+                        m.insert("rope_type".into(), t.clone());
+                    }
+                }
+            }
+        }
+        let rope_merged = rope_merged.map(Value::Object);
+        let rope_params = rope_merged.as_ref();
         let rope_theta = get_f64(v, "rope_theta")
             .or_else(|| rope_params.and_then(|r| get_f64(r, "rope_theta")))
             .unwrap_or(10000.0);
@@ -801,6 +854,72 @@ mod tests {
         let fp8 = serde_json::json!({"quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}});
         assert!(check_quantization(&fp8, &d).is_ok());
         assert!(check_quantization(&serde_json::json!({}), &d).is_ok());
+    }
+
+    fn qwen35_wrapped() -> Value {
+        serde_json::json!({
+            "model_type": "qwen3_5", "max_position_embeddings": 262144,
+            "text_config": {
+                "model_type": "qwen3_5_text", "hidden_size": 256, "num_attention_heads": 4,
+                "num_key_value_heads": 2, "head_dim": 64, "num_hidden_layers": 4, "vocab_size": 100,
+                "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32, "linear_conv_kernel_dim": 4, "full_attention_interval": 4,
+                "eos_token_id": 1, "max_position_embeddings": 262144,
+                "rope_parameters": {"rope_type": "default", "rope_theta": 10000000.0,
+                                    "partial_rotary_factor": 0.25, "mrope_section": [3, 3, 2]}
+            }
+        })
+    }
+
+    fn assert_yarn_on_base(c: &ModelConfig, original: usize) {
+        // the scheme comes from the override, theta / partial rope / mRoPE from the checkpoint
+        assert_eq!(c.rope_theta, 1e7);
+        assert_eq!(c.rotary_dim, 16);
+        assert_eq!(c.mrope_section, Some([3, 3, 2]));
+        let Some(RopeScaling::Yarn { factor, original_max_position, beta_fast, beta_slow, attention_factor }) =
+            c.rope_scaling.clone()
+        else {
+            panic!("expected yarn, got {:?}", c.rope_scaling);
+        };
+        assert_eq!((factor, original_max_position, beta_fast, beta_slow), (4.0, original, 32.0, 1.0));
+        assert!((attention_factor - (0.1 * 4f64.ln() + 1.0)).abs() < 1e-12);
+        assert_eq!(c.rope_scaling.as_ref().unwrap().extended_context(), Some(4 * original));
+    }
+
+    #[test]
+    fn yarn_rope_scaling_override_keeps_base_rope() {
+        // --yarn / the README recipe: a top-level rope_scaling over a wrapped rope_parameters
+        let mut v = qwen35_wrapped();
+        apply_overrides(&mut v, &serde_json::json!({"rope_scaling": {"rope_type": "yarn", "factor": 4.0,
+            "original_max_position_embeddings": 32768}})).unwrap();
+        assert_yarn_on_base(&ModelConfig::from_hf(&v).unwrap(), 32768);
+
+        // the original context defaults to max_position_embeddings; legacy `type` spelling
+        let mut v = qwen35_wrapped();
+        apply_overrides(&mut v, &serde_json::json!({"rope_scaling": {"type": "yarn", "factor": 4.0}})).unwrap();
+        assert_yarn_on_base(&ModelConfig::from_hf(&v).unwrap(), 262144);
+    }
+
+    #[test]
+    fn yarn_rope_parameters_override_merges() {
+        // an unwrapped config (GGUF's), overriding rope_parameters itself
+        let mut v = qwen35_wrapped()["text_config"].clone();
+        apply_overrides(&mut v, &serde_json::json!({"rope_parameters": {"rope_type": "yarn", "factor": 4.0,
+            "original_max_position_embeddings": 65536}})).unwrap();
+        assert_yarn_on_base(&ModelConfig::from_hf(&v).unwrap(), 65536);
+    }
+
+    #[test]
+    fn yarn_mscale_pair() {
+        // DeepSeek style: mscale / mscale_all_dim; equal values cancel the temperature
+        let v = serde_json::json!({
+            "model_type": "llama", "hidden_size": 64, "num_attention_heads": 4, "num_hidden_layers": 1,
+            "vocab_size": 10, "max_position_embeddings": 163840,
+            "rope_scaling": {"type": "yarn", "factor": 40.0, "original_max_position_embeddings": 4096,
+                             "mscale": 1.0, "mscale_all_dim": 1.0, "beta_fast": 32, "beta_slow": 1}
+        });
+        let c = ModelConfig::from_hf(&v).unwrap();
+        assert!(matches!(c.rope_scaling, Some(RopeScaling::Yarn { attention_factor, .. }) if attention_factor == 1.0));
     }
 
     #[test]

@@ -252,6 +252,33 @@ pub fn find_mmproj(model: &Path) -> Option<PathBuf> {
     (files.len() == 1).then(|| files.remove(0))
 }
 
+/// The HF rope scaling entries (`rope_type`, `factor`, ...) of a GGUF's `<arch>.rope.scaling.*`
+/// keys (llama.cpp's names), or None when it has no scaling. `key` looks up `<arch>.<k>`.
+fn rope_scaling<'a>(key: impl Fn(&str) -> Option<&'a Meta>) -> Option<Value> {
+    let f = |k: &str| key(&format!("rope.scaling.{k}")).and_then(Meta::as_f64);
+    let kind = key("rope.scaling.type").and_then(Meta::as_str)?;
+    let factor = f("factor").filter(|&x| x > 0.0 && x != 1.0)?;
+    let mut out = json!({"rope_type": kind, "factor": factor});
+    match kind {
+        "linear" => {}
+        "yarn" => {
+            if let Some(n) = key("rope.scaling.original_context_length").and_then(Meta::as_u64) {
+                out["original_max_position_embeddings"] = n.into();
+            }
+            for (gguf, hf) in [("yarn_beta_fast", "beta_fast"), ("yarn_beta_slow", "beta_slow")] {
+                if let Some(x) = f(gguf) {
+                    out[hf] = x.into();
+                }
+            }
+        }
+        other => {
+            tracing::warn!("GGUF rope scaling type '{other}' is not supported, using unscaled rope");
+            return None;
+        }
+    }
+    Some(out)
+}
+
 /// The HF `config.json` of model file `file`, with the `vision_config` of its projector file
 /// when there is one.
 pub fn model_config(file: &Path) -> Result<Value> {
@@ -458,6 +485,14 @@ impl Gguf {
                 eos.push(id);
             }
         }
+        let mut rope = json!({
+            "rope_theta": self.key("rope.freq_base").and_then(Meta::as_f64).unwrap_or(1e7),
+            "partial_rotary_factor": rot as f64 / head_dim as f64,
+            "mrope_section": sections,
+        });
+        if let Some(Value::Object(scaling)) = rope_scaling(|k| self.key(k)) {
+            rope.as_object_mut().unwrap().extend(scaling);
+        }
         Ok(json!({
             "model_type": "qwen3_5_text",
             "hidden_size": hidden,
@@ -470,11 +505,7 @@ impl Gguf {
             "rms_norm_eps": self.key("attention.layer_norm_rms_epsilon").and_then(Meta::as_f64).unwrap_or(1e-6),
             "max_position_embeddings": self.usize_key("context_length")?,
             "full_attention_interval": self.usize_key("full_attention_interval").unwrap_or(4),
-            "rope_parameters": {
-                "rope_theta": self.key("rope.freq_base").and_then(Meta::as_f64).unwrap_or(1e7),
-                "partial_rotary_factor": rot as f64 / head_dim as f64,
-                "mrope_section": sections,
-            },
+            "rope_parameters": rope,
             "linear_num_key_heads": k_heads,
             "linear_num_value_heads": v_heads,
             "linear_key_head_dim": state,
@@ -966,6 +997,24 @@ pub fn quantize_q6k(w: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rope_scaling_from_gguf_keys() {
+        let meta: HashMap<String, Meta> = [
+            ("rope.scaling.type", Meta::S("yarn".into())),
+            ("rope.scaling.factor", Meta::F(4.0)),
+            ("rope.scaling.original_context_length", Meta::U(32768)),
+            ("rope.scaling.yarn_beta_fast", Meta::F(32.0)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let r = rope_scaling(|k| meta.get(k)).unwrap();
+        assert_eq!(r, json!({"rope_type": "yarn", "factor": 4.0,
+                             "original_max_position_embeddings": 32768, "beta_fast": 32.0}));
+        let none: HashMap<String, Meta> = [("rope.scaling.type".to_string(), Meta::S("none".into()))].into();
+        assert!(rope_scaling(|k| none.get(k)).is_none());
+    }
 
     fn weights(n: usize) -> Vec<f32> {
         // deterministic, zero-mean, varying scale per sub-block
