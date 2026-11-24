@@ -4,12 +4,13 @@
 //! GGUF checkpoints (llama.cpp's format): the file's metadata becomes an HF-style config and
 //! tokenizer, its tensors are served under the HF names the model loaders ask for.
 //!
-//! Supported: architecture `qwen35` (dense Qwen3.5 / 3.6 / 3.8), tensors stored F32 / F16 /
-//! BF16 / Q4_K / Q6_K. K-quant projections stay packed (`WeightSource::load_kquant`) and are
-//! decoded per GEMM by the kernels; `load_raw` decodes any tensor to f32 on the CPU.
+//! Supported: architectures `qwen35` (dense Qwen3.5 / 3.6 / 3.8) and `lfm2` (LFM2 / LFM2.5),
+//! tensors stored F32 / F16 / BF16 / Q8_0 / Q4_K / Q6_K. K-quant projections stay packed
+//! (`WeightSource::load_kquant`) and are decoded per GEMM by the kernels; `load_raw` decodes any
+//! tensor to f32 on the CPU (Q8_0 projections are served that way, as dense weights).
 //!
-//! The converter (`conversion/qwen.py` in llama.cpp) rewrites a few tensors; `load_raw` undoes
-//! what it can so the loaders see HF values:
+//! The `qwen35` converter (`conversion/qwen.py` in llama.cpp) rewrites a few tensors; `load_raw`
+//! undoes what it can so the loaders see HF values (`lfm2` tensors are stored as in HF):
 //!
 //! - RMSNorm weights are stored as `1 + w` (all but the Gated DeltaNet norm): 1 is subtracted.
 //! - `A_log` is stored as `-exp(A_log)`: the log of its negation is returned.
@@ -35,6 +36,10 @@ pub const Q4K_BLOCK: usize = 144;
 /// Bytes of a Q6_K super-block in the file: 128 low-nibble bytes, 64 bytes of high bit pairs,
 /// 16 i8 scales, f16 `d`.
 const Q6K_FILE_BLOCK: usize = 210;
+/// Weights per Q8_0 block.
+const QK8_0: usize = 32;
+/// Bytes of a Q8_0 block: f16 `d`, 32 i8 codes.
+const Q8_0_BLOCK: usize = 34;
 /// Bytes of a Q6_K super-block in memory: the file's block padded to a multiple of 16, so the
 /// kernels read aligned words.
 pub const Q6K_BLOCK: usize = 224;
@@ -44,8 +49,19 @@ pub enum GgmlType {
     F32,
     F16,
     Bf16,
+    Q8_0,
     Q4K,
     Q6K,
+}
+
+/// GGUF architectures this loader serves.
+const ARCHS: &str = "qwen35, lfm2";
+
+fn check_arch(arch: &str) -> Result<()> {
+    if !matches!(arch, "qwen35" | "lfm2") {
+        bail!("GGUF architecture '{arch}' is not supported (supported: {ARCHS})");
+    }
+    Ok(())
 }
 
 impl GgmlType {
@@ -54,6 +70,7 @@ impl GgmlType {
             0 => Self::F32,
             1 => Self::F16,
             30 => Self::Bf16,
+            8 => Self::Q8_0,
             12 => Self::Q4K,
             14 => Self::Q6K,
             _ => return None,
@@ -65,6 +82,7 @@ impl GgmlType {
         match self {
             Self::F32 => 4 * n,
             Self::F16 | Self::Bf16 => 2 * n,
+            Self::Q8_0 => n / QK8_0 * Q8_0_BLOCK,
             Self::Q4K => n / QK_K * Q4K_BLOCK,
             Self::Q6K => n / QK_K * Q6K_FILE_BLOCK,
         }
@@ -389,7 +407,7 @@ impl Gguf {
         let mut tensors = HashMap::with_capacity(nt);
         for (name, shape, ty, off) in infos {
             let ty = GgmlType::from_id(ty).with_context(|| {
-                format!("tensor '{name}' has GGML type {ty}: only F32, F16, BF16, Q4_K and Q6_K are supported")
+                format!("tensor '{name}' has GGML type {ty}: only F32, F16, BF16, Q8_0, Q4_K and Q6_K are supported")
             })?;
             let info = TensorInfo { shape, ty, offset: base + off };
             if info.offset + ty.bytes(info.elems()) > map.len() {
@@ -426,8 +444,9 @@ impl Gguf {
 
     /// The model's configuration as an HF `config.json`.
     pub fn hf_config(&self) -> Result<Value> {
-        if self.arch() != "qwen35" {
-            bail!("GGUF architecture '{}' is not supported (supported: qwen35)", self.arch());
+        check_arch(self.arch())?;
+        if self.arch() == "lfm2" {
+            return self.lfm2_config();
         }
         let hidden = self.usize_key("embedding_length")?;
         let heads = self.usize_key("attention.head_count")?;
@@ -488,6 +507,55 @@ impl Gguf {
         }))
     }
 
+    /// LFM2: the attention layers are the ones with KV heads (`head_count_kv` per layer).
+    fn lfm2_config(&self) -> Result<Value> {
+        let layers = self.usize_key("block_count")?;
+        let heads = self.usize_key("attention.head_count")?;
+        let kv: Vec<u64> = match self.key("attention.head_count_kv") {
+            Some(Meta::A(a)) => a.iter().filter_map(Meta::as_u64).collect(),
+            Some(m) => vec![m.as_u64().unwrap_or(heads as u64); layers],
+            None => vec![heads as u64; layers],
+        };
+        if kv.len() != layers {
+            bail!("GGUF head_count_kv has {} entries for {layers} layers", kv.len());
+        }
+        let kv_heads = kv.iter().copied().max().unwrap_or(0);
+        if kv.iter().any(|&k| k != 0 && k != kv_heads) {
+            bail!("lfm2 attention layers with different KV head counts are not supported");
+        }
+        if self.key("attention.sliding_window").and_then(Meta::as_u64).unwrap_or(0) > 0 {
+            bail!("lfm2 with sliding-window attention is not supported");
+        }
+        if self.key("expert_count").and_then(Meta::as_u64).unwrap_or(0) > 0 {
+            bail!("lfm2 with routed experts (lfm2moe) is not supported");
+        }
+        let types: Vec<&str> = kv.iter().map(|&k| if k == 0 { "conv" } else { "full_attention" }).collect();
+        let tok = |k: &str| self.meta.get(&format!("tokenizer.ggml.{k}")).and_then(Meta::as_u64);
+        let vocab = self
+            .meta
+            .get("tokenizer.ggml.tokens")
+            .and_then(Meta::as_array)
+            .map(|a| a.len())
+            .context("GGUF has no vocabulary")?;
+        Ok(json!({
+            "model_type": "lfm2",
+            "hidden_size": self.usize_key("embedding_length")?,
+            "intermediate_size": self.usize_key("feed_forward_length")?,
+            "num_hidden_layers": layers,
+            "num_attention_heads": heads,
+            "num_key_value_heads": kv_heads,
+            "vocab_size": vocab,
+            "norm_eps": self.key("attention.layer_norm_rms_epsilon").and_then(Meta::as_f64).unwrap_or(1e-5),
+            "max_position_embeddings": self.usize_key("context_length")?,
+            "rope_theta": self.key("rope.freq_base").and_then(Meta::as_f64).unwrap_or(1e6),
+            "conv_L_cache": self.usize_key("shortconv.l_cache")?,
+            "layer_types": types,
+            "tie_word_embeddings": !self.tensors.contains_key("output.weight"),
+            "eos_token_id": tok("eos_token_id"),
+            "bos_token_id": tok("bos_token_id"),
+        }))
+    }
+
     fn token_id(&self, token: &str) -> Option<u64> {
         self.meta
             .get("tokenizer.ggml.tokens")?
@@ -529,17 +597,20 @@ impl Gguf {
         if model != "gpt2" {
             bail!("GGUF tokenizer model '{model}' is not supported (supported: gpt2 byte-level BPE)");
         }
-        // llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN35 / QWEN2, as in the checkpoints' tokenizer.json
-        let regex = match pre {
-            "qwen35" => r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-            "qwen2" => r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-            other => bail!("GGUF pre-tokenizer '{other}' is not supported (supported: qwen35, qwen2)"),
+        // llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN35 / QWEN2 / LLAMA3, as in the checkpoints'
+        // tokenizer.json (LFM2's has no normalizer)
+        let (regex, nfc) = match pre {
+            "qwen35" => (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+", true),
+            "qwen2" => (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+", true),
+            "lfm2" => (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+", false),
+            other => bail!("GGUF pre-tokenizer '{other}' is not supported (supported: qwen35, qwen2, lfm2)"),
         };
         let tokens = self
             .meta
             .get("tokenizer.ggml.tokens")
             .and_then(Meta::as_array)
             .context("tokenizer.ggml.tokens")?;
+        let tok_id = |t: &Option<String>| t.as_deref().and_then(|t| self.token_id(t));
         let types = self.meta.get("tokenizer.ggml.token_type").and_then(Meta::as_array);
         let mut vocab = serde_json::Map::with_capacity(tokens.len());
         let mut added = Vec::new();
@@ -547,12 +618,17 @@ impl Gguf {
             let t = t.as_str().context("token is not a string")?;
             // 1 normal, 3 control, 4 user defined, 5 unused
             let ty = types.and_then(|a| a.get(i)).and_then(Meta::as_u64).unwrap_or(1);
-            if ty == 1 {
-                vocab.insert(t.to_string(), json!(i));
-            } else {
+            // added tokens stay in the BPE vocabulary too: merges may produce them (LFM2 marks
+            // a few plain words, e.g. `python`, as control tokens)
+            vocab.insert(t.to_string(), json!(i));
+            if ty != 1 {
+                // llama.cpp marks every added token of some vocabularies control (LFM2's
+                // `<think>` too): only `<|...|>` markers and unused slots are special, so
+                // reasoning tags and words stay in the decoded text
+                let special = ty == 5 || ty == 3 && t.starts_with("<|") && t.ends_with("|>");
                 added.push(json!({
                     "id": i, "content": t, "single_word": false, "lstrip": false, "rstrip": false,
-                    "normalized": false, "special": ty != 4,
+                    "normalized": false, "special": special,
                 }));
             }
         }
@@ -565,17 +641,35 @@ impl Gguf {
             .filter_map(|m| m.as_str().map(|s| json!(s)))
             .collect();
         let byte_level = json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false});
+        // `add_bos_token` (LFM2): plain prompts start with BOS, as llama.cpp tokenizes them
+        let bos = self
+            .meta
+            .get("tokenizer.ggml.add_bos_token")
+            .is_some_and(|b| matches!(b, Meta::B(true)))
+            .then(|| self.special_token("bos"))
+            .flatten();
+        let post_processor = match (&bos, tok_id(&bos)) {
+            (Some(b), Some(id)) => json!({"type": "Sequence", "processors": [
+                byte_level,
+                {"type": "TemplateProcessing",
+                 "single": [{"SpecialToken": {"id": b, "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}],
+                 "pair": [{"SpecialToken": {"id": b, "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}},
+                          {"SpecialToken": {"id": b, "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 0}}],
+                 "special_tokens": {b: {"id": b, "ids": [id], "tokens": [b]}}},
+            ]}),
+            _ => byte_level.clone(),
+        };
         Ok(json!({
             "version": "1.0",
             "truncation": null,
             "padding": null,
             "added_tokens": added,
-            "normalizer": {"type": "NFC"},
+            "normalizer": if nfc { json!({"type": "NFC"}) } else { Value::Null },
             "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
                 {"type": "Split", "pattern": {"Regex": regex}, "behavior": "Isolated", "invert": false},
                 byte_level,
             ]},
-            "post_processor": byte_level,
+            "post_processor": post_processor,
             "decoder": byte_level,
             "model": {
                 "type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": "",
@@ -584,6 +678,36 @@ impl Gguf {
             },
         }))
     }
+}
+
+/// The HF name of LFM2 GGUF tensor `name`.
+fn hf_name_lfm2(name: &str) -> Option<String> {
+    match name {
+        "token_embd.weight" => return Some("model.embed_tokens.weight".into()),
+        "token_embd_norm.weight" => return Some("model.embedding_norm.weight".into()),
+        "output.weight" => return Some("lm_head.weight".into()),
+        _ => {}
+    }
+    let (idx, tail) = name.strip_prefix("blk.")?.split_once('.')?;
+    let idx: usize = idx.parse().ok()?;
+    let sub = match tail {
+        "attn_norm.weight" => "operator_norm.weight",
+        "ffn_norm.weight" => "ffn_norm.weight",
+        "attn_q.weight" => "self_attn.q_proj.weight",
+        "attn_k.weight" => "self_attn.k_proj.weight",
+        "attn_v.weight" => "self_attn.v_proj.weight",
+        "attn_output.weight" => "self_attn.out_proj.weight",
+        "attn_q_norm.weight" => "self_attn.q_layernorm.weight",
+        "attn_k_norm.weight" => "self_attn.k_layernorm.weight",
+        "ffn_gate.weight" => "feed_forward.w1.weight",
+        "ffn_up.weight" => "feed_forward.w3.weight",
+        "ffn_down.weight" => "feed_forward.w2.weight",
+        "shortconv.in_proj.weight" => "conv.in_proj.weight",
+        "shortconv.conv.weight" => "conv.conv.weight",
+        "shortconv.out_proj.weight" => "conv.out_proj.weight",
+        _ => return None,
+    };
+    Some(format!("model.layers.{idx}.{sub}"))
 }
 
 /// The HF name of GGUF tensor `name` (architecture `qwen35`); blocks from `layers` on are the
@@ -706,6 +830,16 @@ fn dequant_rows(kind: KKind, data: &[u8], rows: usize, cols: usize, stride: usiz
     out
 }
 
+/// Decode Q8_0 blocks (`src.len() / 34` of them) into `dst`.
+fn dequant_q8_0(src: &[u8], dst: &mut [f32]) {
+    dst.par_chunks_mut(QK8_0).zip(src.par_chunks(Q8_0_BLOCK)).for_each(|(out, blk)| {
+        let d = f16_at(blk, 0);
+        for (o, &q) in out.iter_mut().zip(&blk[2..]) {
+            *o = d * (q as i8) as f32;
+        }
+    });
+}
+
 /// Q6_K blocks as stored in a file, padded to the in-memory block size.
 fn pad_q6k(file: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; file.len() / Q6K_FILE_BLOCK * Q6K_BLOCK];
@@ -718,6 +852,8 @@ fn pad_q6k(file: &[u8]) -> Vec<u8> {
 /// A GGUF file's tensors under their HF names.
 pub struct GgufSource {
     gguf: Gguf,
+    /// `qwen35`: the converter's norm / A_log rewrites are undone on load.
+    qwen35: bool,
     /// HF name -> GGUF name
     names: HashMap<String, String>,
     /// The projector file and its HF name -> GGUF name map (`model.visual.*`).
@@ -727,13 +863,13 @@ pub struct GgufSource {
 impl GgufSource {
     pub fn open(path: &Path) -> Result<Self> {
         let gguf = Gguf::open(path)?;
-        if gguf.arch() != "qwen35" {
-            bail!("GGUF architecture '{}' is not supported (supported: qwen35)", gguf.arch());
-        }
+        check_arch(gguf.arch())?;
+        let qwen35 = gguf.arch() == "qwen35";
         let layers = gguf.usize_key("block_count")? - gguf.nextn_layers();
         let mut names = HashMap::with_capacity(gguf.tensors.len());
         for name in gguf.tensors.keys() {
-            match hf_name(name, layers) {
+            let hf = if qwen35 { hf_name(name, layers) } else { hf_name_lfm2(name) };
+            match hf {
                 Some(hf) => {
                     names.insert(hf, name.clone());
                 }
@@ -757,7 +893,7 @@ impl GgufSource {
             }
             None => None,
         };
-        Ok(Self { gguf, names, vision })
+        Ok(Self { gguf, qwen35, names, vision })
     }
 
     /// A projector tensor (`model.visual.*`) as stored; the patch embedding's temporal slices
@@ -800,7 +936,7 @@ fn plain_f32(bytes: &[u8], ty: GgmlType) -> Result<Vec<f32>> {
         GgmlType::F32 => bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
         GgmlType::F16 => bytes.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
         GgmlType::Bf16 => bytes.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
-        GgmlType::Q4K | GgmlType::Q6K => bail!("quantized projector tensors are not supported"),
+        GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q6K => bail!("quantized projector tensors are not supported"),
     })
 }
 
@@ -816,6 +952,14 @@ impl WeightSource for GgufSource {
             GgmlType::F32 => bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
             GgmlType::F16 => bytes.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
             GgmlType::Bf16 => bytes.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+            GgmlType::Q8_0 => {
+                if n % QK8_0 != 0 {
+                    bail!("Q8_0 tensor '{name}' has {n} elements, not a multiple of {QK8_0}");
+                }
+                let mut out = vec![0f32; n];
+                dequant_q8_0(bytes, &mut out);
+                out
+            }
             GgmlType::Q4K | GgmlType::Q6K => {
                 let cols = *info.shape.last().context("scalar K-quant tensor")?;
                 if cols % QK_K != 0 {
@@ -828,9 +972,9 @@ impl WeightSource for GgufSource {
             }
         };
         // undo the converter's rewrites (see the module docs)
-        if name.ends_with("norm.weight") && !name.ends_with("linear_attn.norm.weight") {
+        if self.qwen35 && name.ends_with("norm.weight") && !name.ends_with("linear_attn.norm.weight") {
             data.iter_mut().for_each(|x| *x -= 1.0);
-        } else if name.ends_with(".A_log") {
+        } else if self.qwen35 && name.ends_with(".A_log") {
             data.iter_mut().for_each(|x| *x = (-*x).ln());
         }
         Ok(Tensor::from_vec(data, info.shape.as_slice(), &Device::Cpu)?)

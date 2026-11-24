@@ -797,13 +797,14 @@ impl Attention {
                 Ok(None)
             }
         };
+        let names = cfg.names();
         Ok(Self {
             q: load_column_q(src, &format!("{prefix}.q_proj"), p)?,
             k: load_column_q(src, &format!("{prefix}.k_proj"), p)?,
             v: load_column_q(src, &format!("{prefix}.v_proj"), p)?,
-            o: load_row_q(src, &format!("{prefix}.o_proj"), p)?,
-            q_norm: norm("q_norm")?,
-            k_norm: norm("k_norm")?,
+            o: load_row_q(src, &format!("{prefix}.{}", names.o_proj), p)?,
+            q_norm: norm(names.q_norm)?,
+            k_norm: norm(names.k_norm)?,
             heads: cfg.num_heads / p.world,
             kv_heads: cfg.num_kv_heads / p.world,
             head_dim: cfg.head_dim,

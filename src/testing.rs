@@ -175,6 +175,9 @@ pub fn write_tiny_model(dir: &Path, spec: &TinySpec) -> Result<()> {
     if spec.arch == "qwen3_5_moe" || spec.arch == "qwen4_exp" {
         return write_tiny_qwen35(dir, spec);
     }
+    if spec.arch == "lfm2" {
+        return write_tiny_lfm2(dir, spec);
+    }
     let (model_type, arch_name) = match spec.arch.as_str() {
         "llama" => ("llama", "LlamaForCausalLM"),
         "qwen2" => ("qwen2", "Qwen2ForCausalLM"),
@@ -182,7 +185,7 @@ pub fn write_tiny_model(dir: &Path, spec: &TinySpec) -> Result<()> {
         "qwen3_moe" => ("qwen3_moe", "Qwen3MoeForCausalLM"),
         "mixtral" => ("mixtral", "MixtralForCausalLM"),
         a => {
-            bail!("unknown tiny-model arch '{a}' (llama|qwen2|qwen3|qwen3_moe|mixtral|qwen3_5_moe|qwen4_exp)")
+            bail!("unknown tiny-model arch '{a}' (llama|qwen2|qwen3|qwen3_moe|mixtral|qwen3_5_moe|qwen4_exp|lfm2)")
         }
     };
     let (h, nh, kvh, hd, inter) = (
@@ -354,6 +357,72 @@ fn write_tokenizer_files(dir: &Path) -> Result<()> {
 /// names, alternating Gated-DeltaNet / gated full attention, routed + shared experts.
 /// `qwen4_exp` (Qwen3.8-Flash-Next) adds hyper-connections (3 streams), PLE on layers 0 and 2
 /// and a QSA indexer with a 16-token budget in blocks of 4.
+/// LFM2: short-conv layers with attention every third layer, HF tensor names, auto-adjusted
+/// SwiGLU width (`intermediate` * 3/2 configured, so the MLP is `intermediate` wide), tied head.
+fn write_tiny_lfm2(dir: &Path, spec: &TinySpec) -> Result<()> {
+    // LFM2 configs carry no head_dim (it is hidden / heads): the heads follow from spec.head_dim
+    let (h, hd) = (spec.hidden, spec.head_dim);
+    let nh = h / hd;
+    let kvh = spec.kv_heads.min(nh);
+    let (inter, kernel) = (spec.intermediate, 3usize);
+    let layer_types: Vec<&str> = (0..spec.layers)
+        .map(|i| if i % 3 == 1 { "full_attention" } else { "conv" })
+        .collect();
+    let config = json!({
+        "architectures": ["Lfm2ForCausalLM"], "model_type": "lfm2", "hidden_size": h,
+        "num_hidden_layers": spec.layers, "num_attention_heads": nh, "num_key_value_heads": kvh,
+        "vocab_size": TINY_VOCAB, "max_position_embeddings": 4096, "norm_eps": 1e-5,
+        "rope_theta": 1000000.0, "conv_L_cache": kernel, "conv_bias": false,
+        "block_auto_adjust_ff_dim": true, "block_ffn_dim_multiplier": 1.0, "block_multiple_of": 32,
+        "intermediate_size": inter * 3 / 2, "layer_types": layer_types, "tie_embedding": true,
+        "bos_token_id": 256, "eos_token_id": IM_END, "torch_dtype": "float32",
+    });
+    std::fs::write(dir.join("config.json"), serde_json::to_string_pretty(&config)?)?;
+    std::fs::write(
+        dir.join("generation_config.json"),
+        serde_json::to_string_pretty(&json!({"eos_token_id": [IM_END, 256], "do_sample": false}))?,
+    )?;
+    std::fs::write(dir.join("tokenizer.json"), serde_json::to_string(&tokenizer_json())?)?;
+    std::fs::write(
+        dir.join("tokenizer_config.json"),
+        serde_json::to_string_pretty(&json!({
+            "chat_template": CHAT_TEMPLATE, "eos_token": "<|im_end|>", "bos_token": null,
+            "model_max_length": 4096, "tokenizer_class": "PreTrainedTokenizerFast"
+        }))?,
+    )?;
+    let mut g = Gen {
+        rng: StdRng::seed_from_u64(spec.seed),
+        map: HashMap::new(),
+        dtype: spec.dtype,
+    };
+    let s_in = |n: usize| 1.0 / (n as f32).sqrt();
+    g.rand("model.embed_tokens.weight", &[TINY_VOCAB, h], 1.0)?;
+    g.norm("model.embedding_norm.weight", h)?;
+    for (l, kind) in layer_types.iter().enumerate() {
+        let p = format!("model.layers.{l}");
+        g.norm(&format!("{p}.operator_norm.weight"), h)?;
+        g.norm(&format!("{p}.ffn_norm.weight"), h)?;
+        if *kind == "conv" {
+            g.rand(&format!("{p}.conv.in_proj.weight"), &[3 * h, h], s_in(h) * 2.0)?;
+            g.rand(&format!("{p}.conv.conv.weight"), &[h, 1, kernel], 0.5)?;
+            g.rand(&format!("{p}.conv.out_proj.weight"), &[h, h], s_in(h) * 2.0)?;
+        } else {
+            let a = format!("{p}.self_attn");
+            g.rand(&format!("{a}.q_proj.weight"), &[nh * hd, h], s_in(h))?;
+            g.rand(&format!("{a}.k_proj.weight"), &[kvh * hd, h], s_in(h))?;
+            g.rand(&format!("{a}.v_proj.weight"), &[kvh * hd, h], s_in(h))?;
+            g.rand(&format!("{a}.out_proj.weight"), &[h, nh * hd], s_in(nh * hd))?;
+            g.norm(&format!("{a}.q_layernorm.weight"), hd)?;
+            g.norm(&format!("{a}.k_layernorm.weight"), hd)?;
+        }
+        g.rand(&format!("{p}.feed_forward.w1.weight"), &[inter, h], s_in(h))?;
+        g.rand(&format!("{p}.feed_forward.w3.weight"), &[inter, h], s_in(h))?;
+        g.rand(&format!("{p}.feed_forward.w2.weight"), &[h, inter], s_in(inter))?;
+    }
+    candle_core::safetensors::save(&g.map, dir.join("model.safetensors"))?;
+    Ok(())
+}
+
 fn write_tiny_qwen35(dir: &Path, spec: &TinySpec) -> Result<()> {
     let q38 = spec.arch == "qwen4_exp";
     let (h, nh, kvh, hd) = (spec.hidden, spec.heads, spec.kv_heads, spec.head_dim);
