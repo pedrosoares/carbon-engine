@@ -1452,7 +1452,7 @@ fn moe_ptx() -> CResult<&'static str> {
 }
 
 /// Raw device address of a contiguous CUDA tensor's first element.
-fn raw_ptr(t: &Tensor) -> CResult<u64> {
+pub(crate) fn raw_ptr(t: &Tensor) -> CResult<u64> {
     use candle_core::cuda_backend::cudarc::driver::DevicePtr;
     let (s, l) = t.storage_and_layout();
     let candle_core::Storage::Cuda(c) = &*s else {

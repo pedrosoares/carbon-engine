@@ -314,6 +314,11 @@ impl LayerKv {
         })
     }
 
+    /// Pools allocated by the caller (models with their own attention kernels).
+    pub fn new_raw(k: Tensor, v: Tensor, dtype: DType, fmt: KvFormat) -> Self {
+        Self { k, v, dtype, fmt, rot: None, sim: None, idx: None }
+    }
+
     /// Whether the pools hold packed vectors (not readable as activations).
     pub fn packed(&self) -> bool {
         self.fmt != KvFormat::Model

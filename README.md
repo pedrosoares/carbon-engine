@@ -39,7 +39,7 @@ few runtime choices.
 | MoE placement | resident, offload (global LRU expert cache), CPU, hybrid CPU-GPU split, picked from a bandwidth benchmark | the same four strategies, picked from `carbon bench bw` |
 | Offloaded experts | expert cache on the GPU fed from pinned host memory, CUDA-graph compatible | a device slot cache fed from pinned host memory by a GPU kernel at PCIe speed, routing and caching on the GPU, CUDA-graph compatible |
 | Elastic memory | VRAM moved between KV and experts at runtime | `POST /v1/cache/rebuild`, `carbon ctl cache --kv N --moe N` |
-| Quantized weights | FP8, NVFP4, MXFP4, GGUF Q4_0, BF16 | FP8 (block and per-tensor), NVFP4 (ModelOpt and compressed-tensors), GGUF Q4_K / Q6_K (dense Qwen3.5-family), GGUF Q8_0 (LFM2), BF16/F16/F32 |
+| Quantized weights | FP8, NVFP4, MXFP4, GGUF Q4_0, BF16 | FP8 (block and per-tensor), NVFP4 (ModelOpt and compressed-tensors), GGUF Q4_K / Q6_K (dense Qwen3.5-family), GGUF Q8_0 (LFM2), GGUF NVFP4 + Q8_0 (Inkling 2), BF16/F16/F32 |
 | Hybrid attention models | Gated DeltaNet (Qwen3.5/3.6/3.8) | Gated DeltaNet (Qwen3.5/3.6/3.8), fused decode and prefill kernels; LFM2 / LFM2.5 gated short convolutions |
 | CUDA graphs | decode steps | decode steps, including offloaded experts and multi-token (MTP verify) steps |
 | CLI | `ft serve / ctl / bench` | `carbon serve / generate / ctl / bench bw / devices / worker / launch / shell` |
@@ -51,7 +51,7 @@ few runtime choices.
 | GPUs per server | one (`--gpu`) | any number, in pipeline and/or tensor-parallel groups |
 | Machines | one | several, over RPC (`carbon worker`) |
 | Speculative decoding | none | MTP drafts for Qwen3.8-Flash-Next (`--mtp`), verified in one multi-token step |
-| Models | Llama, Qwen2/3, Qwen3-MoE, Qwen3.5/3.6/3.8, DeepSeek-V4, GLM, gpt-oss, Gemma-4, MiniMax, ... | Llama/Mistral, Qwen2/2.5, Qwen3, Qwen3-MoE, Mixtral, Qwen3.5/3.6 (dense + MoE), Qwen3.8-Flash-Next, LFM2 / LFM2.5 (dense) |
+| Models | Llama, Qwen2/3, Qwen3-MoE, Qwen3.5/3.6/3.8, DeepSeek-V4, GLM, gpt-oss, Gemma-4, MiniMax, ... | Llama/Mistral, Qwen2/2.5, Qwen3, Qwen3-MoE, Mixtral, Qwen3.5/3.6 (dense + MoE), Qwen3.8-Flash-Next, LFM2 / LFM2.5 (dense), Inkling 2 Mini (looped MoE) |
 | Image input | Qwen3.6/3.8, Qwen3-VL, Gemma-4, GLM, ... | Qwen3.5/3.6/3.8 (their vision tower); no video |
 | Fast-load weight format | FTW | the checkpoint format of `carbon checkpoint` |
 | Prefill with offloaded experts | whole layers streamed, double-buffered behind compute | through the slot cache: a layer's missing experts are copied in batches on a side stream while its resident ones compute, then grouped tensor-core NVFP4 expert GEMMs |
@@ -332,6 +332,66 @@ same state slots, prefix snapshots and CUDA graphs as the Gated DeltaNet models;
 
 RTX 5090, one stream, 400-token greedy answer: 731 tok/s, 874 tok/s with `--cuda-graphs`; eight
 concurrent streams about 2,800 tok/s (3,400 with graphs) in aggregate.
+
+## Running Inkling 2 Mini (Thinking Machines, GGUF)
+
+```bash
+# the Unsloth UD-Q4_K_XL file: 562k-token context (int8 KV), CUDA graphs on by default
+carbon serve --model ~/models/Inkling-2-Mini-UD-Q4_K_XL.gguf --devices cuda:0
+# bf16 KV instead: about 290k tokens, a little closer to the reference at depth
+carbon serve --model ~/models/Inkling-2-Mini-UD-Q4_K_XL.gguf --devices cuda:0 --kv-dtype model
+```
+
+Inkling 2 Mini (GGUF architecture `inkling2_loop`, 26.4B total / 3.4B active) is a looped MoE
+transformer with its own layer stack (`src/model/inkling.rs`, kernels in
+`src/kernels/inkling.cu` and `inkling_tc.cu`), written from llama.cpp's `inkling2` graphs:
+
+- 24 layers; layers 6..18 (the core) run three times with shared weights, so a token makes 48
+  layer visits, each with its own caches. From the second pass on, each core layer mixes a
+  message from the previous pass into its inputs through tanh gain / forget controllers.
+- Block attention residuals: a layer reads the RMS-normalized outputs of earlier 6-layer blocks
+  and its own stream through an attention over the depth instead of one residual stream.
+- Attention without rope: L2-clipped queries and keys, RMS-normalized values, a learned
+  relative-position bias within 1024 tokens, a per-query sink and a sigmoid output gate; keys,
+  values and both layer outputs pass a causal conv (input-dependent taps on the full-attention
+  layers). 40 of the 48 visits use a 1024-token sliding window (per-request rings), 8 use full
+  attention over the paged KV pool (16.5 KiB per token in int8, 32 KiB in bf16).
+- MoE: 128 experts, top 8, sigmoid routing with a selection bias, SiTU-gated experts in GGUF
+  NVFP4 (Q8_0 in four layers), read in place. Dense projections stay Q8_0.
+
+Decode runs on fused kernels (int8 activations and dp4a GEMVs, one CUDA graph per decode batch
+size, `CARBON_INKLING_GRAPHS=0` turns graphs off); prefill uses tensor-core flash attention
+(`CARBON_INKLING_FLASH=0` falls back to the CUDA-core kernel). Defaults for this model: int8 KV
+(`--kv-dtype auto`), at most 4 running requests (each keeps about 170 MB of sliding-window
+and conv state; `--max-running-requests` raises it) and, without `--max-seq-len`, the longest
+context the KV cache holds. Chat: the template's `<|message_model|>` / `<|content_*|>` turn
+markers become reasoning content and tool calls on the OpenAI, Anthropic and Responses APIs.
+
+Image input: the `mmproj` file next to the model (`inkling2v`, `src/model/inkling_vision.rs`)
+is loaded automatically (`--text-only` skips it and gives its 0.6 GiB to the KV cache: 562k
+instead of 528k tokens). Images keep their size, padded to a multiple of 40 pixels (scaled down
+only past 4,096 image tokens), one token per 40 x 40 pixels: a 640 x 480 image is 192 tokens,
+encoded in 44 ms; a 4,096-token image in 3.3 s. The encoder is a 23-layer ViT (CLS token, learned
+positions resized to the image, 2D rope, layer scale), a 2x2 merge and a GELU projector; its
+rows enter the language model without the token-embedding norm, as in llama.cpp. Against an
+independent NumPy pass of the projector (`vision()` in `scripts/inkling_reference.py`) the
+image tokens agree to a cosine of 0.9998 (bf16 weights).
+
+RTX 5090, one stream, 400-token greedy answers (`scripts/bench_openai.py`):
+
+| context | carbon (int8 KV) | carbon (bf16 KV) | LM Studio (llama.cpp 2.83) |
+|---|---|---|---|
+| short | 152 tok/s | 152 tok/s | 98 tok/s |
+| 32k | 130 tok/s, prefill 5.5 s | 128 tok/s, prefill 5.5 s | |
+| 250k | 91 tok/s, prefill 74 s | 63 tok/s, prefill 73 s | |
+| 500k | 64 tok/s, prefill 221 s | does not fit | |
+| max context | 528,556 tokens (562,515 with `--text-only`) | 290,047 tokens | |
+
+Checked against an independent f32 NumPy forward pass of the GGUF
+(`scripts/inkling_reference.py`): every greedy decode step is the reference's argmax, with
+log-probabilities within 0.03 (bf16 KV) / 0.09 (int8 KV), the int8 activations of the GEMVs
+being most of it. Where carbon's and LM Studio's greedy text part, at near-ties, carbon's token
+is the reference's.
 
 ## Architecture
 

@@ -10,6 +10,10 @@ pub mod bank;
 pub mod gdn;
 pub mod graph;
 pub mod hyper;
+#[cfg(feature = "cuda")]
+pub mod inkling;
+#[cfg(feature = "cuda")]
+pub mod inkling_vision;
 pub mod layers;
 pub mod moe;
 pub mod mtp;
@@ -123,6 +127,9 @@ pub struct LayerStack {
     planned_states: usize,
     /// Captured decode steps (`--cuda-graphs`).
     graphs: graph::DecodeGraphs,
+    /// Inkling 2: the whole stack is this model's own (`inkling.rs`); `layers` is empty.
+    #[cfg(feature = "cuda")]
+    inkling: Option<Box<inkling::Body>>,
 }
 
 /// Device memory an expert slot cache leaves unassigned (allocator slack): 2% of the card.
@@ -171,6 +178,9 @@ impl LayerStack {
                 "layer range {range:?} exceeds the model's {} layers",
                 cfg.num_layers
             );
+        }
+        if cfg.inkling.is_some() {
+            return Self::load_inkling(src, cfg, range, p, comm, moe_opts);
         }
         // CPU decode is memory-bound: keep quantized projections packed and use the fused kernels
         let mut p = p;
@@ -410,10 +420,63 @@ impl LayerStack {
             state_bytes,
             planned_states: moe_opts.state_slots,
             graphs: Default::default(),
+            #[cfg(feature = "cuda")]
+            inkling: None,
         })
     }
 
+    /// Inkling 2: one stage on one CUDA device runs the looped stack.
+    fn load_inkling(
+        src: &dyn WeightSource,
+        cfg: Arc<ModelConfig>,
+        range: Range<usize>,
+        p: Placement,
+        comm: Arc<dyn Communicator>,
+        moe_opts: &MoeOptions,
+    ) -> Result<Self> {
+        if range != (0..cfg.num_layers) || p.world != 1 {
+            bail!("inkling2 runs as one stage on one device (no pipeline or tensor parallelism)");
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let body = inkling::Body::load(src, &cfg, &p.device)?;
+            let rotary = Rotary::new(&cfg, 1, &p)?;
+            Ok(Self {
+                range,
+                n_attn: body.global_slots(),
+                state_bytes: body.state_bytes(),
+                cfg,
+                layers: vec![],
+                rotary,
+                caches: RwLock::new(Caches::default()),
+                n_linear: 0,
+                n_ple: 0,
+                n_conv: 0,
+                index_dim: 0,
+                placement: p,
+                comm,
+                expert_cache: None,
+                expert_bank: None,
+                moe_strategy: None,
+                kv_width: 0,
+                expert_bytes: 0,
+                planned_states: moe_opts.state_slots,
+                graphs: Default::default(),
+                inkling: Some(Box::new(body)),
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (src, cfg, p, comm, moe_opts);
+            bail!("inkling2 needs the cuda build")
+        }
+    }
+
     pub fn kv_bytes_per_token(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        if let Some(b) = &self.inkling {
+            return b.kv_bytes_per_token();
+        }
         let p = &self.placement;
         let kvh = self.kv_width / self.cfg.head_dim.max(1);
         self.n_attn
@@ -462,6 +525,10 @@ impl LayerStack {
     /// slots per linear-attention layer. Old pools are freed first.
     pub fn alloc_kv(&self, num_slots: usize, num_states: usize) -> Result<()> {
         self.graphs.clear();
+        #[cfg(feature = "cuda")]
+        if let Some(b) = &self.inkling {
+            return b.alloc(num_slots, num_states);
+        }
         let mut c = self.caches.write();
         *c = Caches::default();
         let p = &self.placement;
@@ -585,6 +652,10 @@ impl LayerStack {
     }
 
     pub fn kv_slots(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        if let Some(b) = &self.inkling {
+            return b.kv_slots();
+        }
         self.caches
             .read()
             .kv
@@ -595,6 +666,10 @@ impl LayerStack {
 
     /// Copy recurrent state `src` -> `dst` in every linear-attention layer (prefix snapshots).
     pub fn copy_state(&self, src: u32, dst: u32) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let Some(b) = &self.inkling {
+            return b.copy_state(src, dst);
+        }
         let c = self.caches.read();
         for st in &c.states {
             st.copy_slot(src, dst)?;
@@ -617,6 +692,10 @@ impl LayerStack {
     }
 
     pub fn state_slots(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        if let Some(b) = &self.inkling {
+            return b.state_slots();
+        }
         let c = self.caches.read();
         c
             .states
@@ -628,6 +707,10 @@ impl LayerStack {
     }
 
     pub fn forward(&self, meta: &BatchMeta, hidden: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(b) = &self.inkling {
+            return b.forward(meta, hidden);
+        }
         let p = &self.placement;
         let x = hidden.to_device(&p.device)?.to_dtype(p.dtype)?;
         if self.layers.is_empty() {
@@ -753,6 +836,9 @@ enum FinalNorm {
 
 /// Token embedding, final norm and LM head (lives on the coordinator's head device).
 pub struct ModelHead {
+    /// Inkling 2: its own final norm and LM head (the embedding is `embed`, f32 on the host).
+    #[cfg(feature = "cuda")]
+    inkling: Option<inkling::Head>,
     embed: Tensor,
     norm: FinalNorm,
     /// Qwen3.8: the embedding is copied into this many residual streams.
@@ -764,6 +850,20 @@ pub struct ModelHead {
 
 impl ModelHead {
     pub fn load(src: &dyn WeightSource, cfg: &ModelConfig, p: &Placement) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if cfg.inkling.is_some() {
+            // gathered from on the host in f32 (the Q8_0 rows exactly); the stack runs in f32
+            let embed = src.load_raw("token_embd.weight")?.to_dtype(DType::F32)?;
+            return Ok(Self {
+                inkling: Some(inkling::Head::load(src, cfg, &p.device)?),
+                lm_head: layers::QLinear::Dense(Linear::new(Tensor::zeros((1, 1), p.dtype, &p.device)?, None)),
+                norm: FinalNorm::Rms(RmsNorm::load(src, "output_norm.weight", cfg.rms_norm_eps, p)?),
+                embed,
+                streams: 1,
+                device: p.device.clone(),
+                dtype: p.dtype,
+            });
+        }
         let name = format!("{}embed_tokens.weight", cfg.prefix);
         let untied = !cfg.tie_word_embeddings && src.contains("lm_head.weight");
         // an untied input embedding is only gathered from (a few rows per step): on a GPU it
@@ -799,6 +899,8 @@ impl ModelHead {
             ),
         };
         Ok(Self {
+            #[cfg(feature = "cuda")]
+            inkling: None,
             embed,
             norm,
             streams,
@@ -828,7 +930,13 @@ impl ModelHead {
     /// Token embeddings `[T, H]`, one stream (the MTP head's input).
     pub fn embed_single(&self, tokens: &[u32]) -> Result<Tensor> {
         let ids = Tensor::from_slice(tokens, tokens.len(), self.embed.device())?;
-        Ok(self.embed.index_select(&ids, 0)?.to_device(&self.device)?)
+        let e = self.embed.index_select(&ids, 0)?.to_device(&self.device)?;
+        // Inkling 2 normalizes token embeddings (not the image rows `embed_with` puts in after)
+        #[cfg(feature = "cuda")]
+        if let Some(h) = &self.inkling {
+            return h.embed_norm(&e);
+        }
+        Ok(e)
     }
 
     /// Logits in f32 for already mixed states `[R, H]` (the MTP head's output).
@@ -839,6 +947,11 @@ impl ModelHead {
 
     /// Logits in f32 for the selected rows of `hidden`.
     pub fn logits(&self, hidden: &Tensor, rows: &[u32]) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(h) = &self.inkling {
+            let idx = Tensor::from_slice(rows, rows.len(), &self.device)?;
+            return h.logits(&hidden.to_device(&self.device)?.index_select(&idx, 0)?);
+        }
         let hidden = hidden.to_device(&self.device)?.to_dtype(self.dtype)?;
         let idx = Tensor::from_slice(rows, rows.len(), &self.device)?;
         let rows = hidden.index_select(&idx, 0)?;

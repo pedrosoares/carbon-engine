@@ -25,6 +25,9 @@ pub struct ImageProcessor {
     pub merge_size: usize,
     pub mean: [f32; 3],
     pub std: [f32; 3],
+    /// Inkling 2: images keep their size, padded to a multiple of `patch * merge` (resized only
+    /// past `max_pixels`), patches listed in raster order (see `prepare_padded`).
+    pub pad: bool,
 }
 
 /// One image ready for the vision tower.
@@ -76,6 +79,7 @@ impl ImageProcessor {
             merge_size: get("merge_size").unwrap_or(vision.spatial_merge_size),
             mean: triple("image_mean"),
             std: triple("image_std"),
+            pad: vision.is_inkling(),
         }
     }
 
@@ -88,6 +92,9 @@ impl ImageProcessor {
 
     /// Prepare an RGB8 image (`rgb` row-major, `3 * w * h` bytes).
     pub fn prepare_rgb(&self, rgb: &[u8], w: usize, h: usize) -> Result<PreparedImage> {
+        if self.pad {
+            return self.prepare_padded(rgb, w, h);
+        }
         let factor = self.patch_size * self.merge_size;
         let (rh, rw) = smart_resize(h, w, factor, self.min_pixels, self.max_pixels)?;
         let resized = resize_bicubic(rgb, w, h, rw, rh);
@@ -110,6 +117,56 @@ impl ImageProcessor {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(PreparedImage { pixels, grid: (1, gh, gw), hash: fnv1a(rgb, w, h) })
+    }
+}
+
+impl ImageProcessor {
+    /// Inkling 2 (llama.cpp `mtmd_image_preprocessor_inkling2v`): the image is not resized
+    /// unless its padded area passes `max_pixels` (then it is scaled down, aspect kept, to fit);
+    /// it is padded right / bottom to a multiple of `patch * merge` with the 8-bit value -1, then
+    /// normalized as `(v - 255 mean) / (255 std)` (so the padding sits just below -1). Patches
+    /// are listed row by row, each `[C, P, P]`.
+    fn prepare_padded(&self, rgb: &[u8], w: usize, h: usize) -> Result<PreparedImage> {
+        if w == 0 || h == 0 {
+            bail!("empty image");
+        }
+        let a = self.patch_size * self.merge_size;
+        let up = |x: usize| x.div_ceil(a) * a;
+        let (mut iw, mut ih) = (w, h);
+        let scaled;
+        let src: &[u8] = if up(w) * up(h) > self.max_pixels {
+            // the largest aligned size of the same aspect within the budget
+            let s = (self.max_pixels as f64 / (w * h) as f64).sqrt();
+            iw = (((w as f64 * s) / a as f64).floor() as usize).max(1) * a;
+            ih = (((h as f64 * s) / a as f64).floor() as usize).max(1) * a;
+            while iw * ih > self.max_pixels && (iw > a || ih > a) {
+                if iw >= ih { iw -= a } else { ih -= a }
+            }
+            scaled = resize_bicubic(rgb, w, h, iw, ih);
+            &scaled
+        } else {
+            rgb
+        };
+        let (pw, ph) = (up(iw), up(ih));
+        let p = self.patch_size;
+        let (gh, gw) = (ph / p, pw / p);
+        let pixel = |x: usize, y: usize, c: usize| -> f32 {
+            let v = if x < iw && y < ih { src[(y * iw + x) * 3 + c] as f32 } else { -1.0 };
+            (v - 255.0 * self.mean[c]) / (255.0 * self.std[c])
+        };
+        let mut pixels = Vec::with_capacity(gh * gw * 3 * p * p);
+        for gy in 0..gh {
+            for gx in 0..gw {
+                for c in 0..3 {
+                    for y in 0..p {
+                        for x in 0..p {
+                            pixels.push(pixel(gx * p + x, gy * p + y, c));
                         }
                     }
                 }

@@ -49,7 +49,7 @@ fn partial_suffix(s: &str, tag: &str) -> usize {
 pub fn parse_tool_call(raw: &str) -> Option<(String, String)> {
     if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
         let name = v.get("name")?.as_str()?.to_string();
-        let args = match v.get("arguments").or_else(|| v.get("parameters")) {
+        let args = match v.get("arguments").or_else(|| v.get("parameters")).or_else(|| v.get("args")) {
             Some(Value::String(s)) => s.clone(),
             Some(other) => other.to_string(),
             None => "{}".into(),

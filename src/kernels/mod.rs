@@ -16,6 +16,8 @@ use crate::weights::E2M1;
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(feature = "cuda")]
+pub mod inkling;
 
 /// Largest batch the fused kernels handle; bigger batches dequantize once and use the GEMM.
 pub const MAX_FUSED_ROWS: usize = 16;

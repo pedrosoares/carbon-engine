@@ -16,6 +16,16 @@ pub trait WeightSource: Send + Sync {
     fn contains(&self, name: &str) -> bool;
     fn names(&self) -> Vec<String>;
 
+    /// The GGUF file behind this source, for models that read its tensors as stored.
+    fn gguf(&self) -> Option<&crate::gguf::Gguf> {
+        None
+    }
+
+    /// The projector (`mmproj`) GGUF file next to a GGUF model, when there is one.
+    fn mmproj(&self) -> Option<&crate::gguf::Gguf> {
+        None
+    }
+
     /// Row access to a stored 2-D tensor without loading it (memory-mapped sources only), for
     /// tables too large to hold (PLE). `None` when the source cannot map it.
     fn row_reader(&self, _name: &str) -> Option<Result<RowReader>> {
