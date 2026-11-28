@@ -25,6 +25,9 @@ pub enum Arch {
     Qwen35,
     /// Liquid LFM2 / LFM2.5: gated short-conv layers + GQA attention with per-head q/k norm
     Lfm2,
+    /// Thinking Machines Inkling 2 (looped MoE): its own layer stack (`model::inkling`), the
+    /// hyper-parameters in `ModelConfig::inkling`
+    Inkling2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +253,59 @@ pub struct ModelConfig {
     /// Kernel width of the LFM2 short-conv layers (`conv_L_cache`), 0 when there are none.
     #[serde(default)]
     pub short_conv_kernel: usize,
+    /// Inkling 2 (`Arch::Inkling2`): the looped stack's hyper-parameters.
+    #[serde(default)]
+    pub inkling: Option<InklingConfig>,
+}
+
+/// Inkling 2 / Inkling 2 loop (llama.cpp `inkling2`, `inkling2_loop`): see `model::inkling`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InklingConfig {
+    /// Physical decoder layers (weights).
+    pub layers: usize,
+    /// Core layers `loop_start..loop_end` run `loop_count` times (1 = no loop).
+    pub loop_start: usize,
+    pub loop_end: usize,
+    pub loop_count: usize,
+    pub gate_rank: usize,
+    /// Per physical layer: sliding-window attention (else full attention).
+    pub swa: Vec<bool>,
+    pub window: usize,
+    /// Relative-position bias: projection width and table length.
+    pub n_rel: usize,
+    pub rel_extent: usize,
+    pub qk_clip: f32,
+    pub rel_clip: f32,
+    pub log_floor: f32,
+    pub log_alpha: f32,
+    /// Block attention residuals: a new block every `block_size` layers.
+    pub block_size: usize,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub expert_ff: usize,
+    pub expert_weights_scale: f32,
+    pub situ_beta: f32,
+    pub situ_linear_beta: f32,
+    pub softcap: f32,
+    /// Rows of the embedding and LM head (the vocabulary is `vocab_size`).
+    pub vocab_padded: usize,
+    pub conv_kernel: usize,
+}
+
+impl InklingConfig {
+    /// Layer visits per token (the core repeated).
+    pub fn visits(&self) -> usize {
+        self.layers + (self.loop_count.max(1) - 1) * (self.loop_end - self.loop_start)
+    }
+
+    /// Physical layer of cache slot `il` (slots past `layers` are the extra core passes).
+    pub fn phys(&self, il: usize) -> usize {
+        if il < self.layers {
+            il
+        } else {
+            self.loop_start + (il - self.layers) % (self.loop_end - self.loop_start)
+        }
+    }
 }
 
 /// The Qwen3.5 / 3.6 / 3.8 vision tower (a ViT with a 2x2 patch merger).
@@ -270,6 +326,13 @@ pub struct VisionConfig {
     pub image_token_id: u32,
     pub vision_start_token_id: u32,
     pub vision_end_token_id: u32,
+    /// The tower: `""` the Qwen3.5 / 3.6 / 3.8 ViT, `"inkling2v"` Inkling 2's
+    /// (`model::inkling_vision`).
+    #[serde(default)]
+    pub kind: String,
+    /// Layer-norm epsilon (Inkling 2's tower).
+    #[serde(default)]
+    pub layer_norm_eps: f64,
 }
 
 impl VisionConfig {
@@ -291,7 +354,13 @@ impl VisionConfig {
             image_token_id: id("image_token_id")?,
             vision_start_token_id: id("vision_start_token_id")?,
             vision_end_token_id: id("vision_end_token_id")?,
+            kind: v.get("kind").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            layer_norm_eps: v.get("layer_norm_eps").and_then(|x| x.as_f64()).unwrap_or(1e-6),
         })
+    }
+
+    pub fn is_inkling(&self) -> bool {
+        self.kind == "inkling2v"
     }
 
     /// Patch values per patch: channels x temporal x patch x patch.
@@ -537,7 +606,8 @@ impl ModelConfig {
             // Qwen3.8-Flash-Next: the Qwen3.5 stack plus `qwen38` (parsed below)
             "qwen4_exp" | "qwen4_exp_text" => Arch::Qwen35,
             "lfm2" => Arch::Lfm2,
-            other => bail!("unsupported model_type '{other}' (supported: llama, mistral, qwen2, qwen3, qwen3_moe, mixtral, qwen3_5, qwen3_5_moe, qwen4_exp, lfm2)"),
+            "inkling2" | "inkling2_loop" => Arch::Inkling2,
+            other => bail!("unsupported model_type '{other}' (supported: llama, mistral, qwen2, qwen3, qwen3_moe, mixtral, qwen3_5, qwen3_5_moe, qwen4_exp, lfm2, inkling2)"),
         };
         let hidden_size = get_usize(v, "hidden_size").context("hidden_size")?;
         let num_heads = get_usize(v, "num_attention_heads")
@@ -799,6 +869,13 @@ impl ModelConfig {
                     (s.len() == 3).then(|| [s[0], s[1], s[2]])
                 }),
             short_conv_kernel: if arch == Arch::Lfm2 { get_usize(v, "conv_L_cache").unwrap_or(3) } else { 0 },
+            inkling: match v.get("inkling") {
+                Some(x) if arch == Arch::Inkling2 => {
+                    Some(serde_json::from_value(x.clone()).context("inkling hyper-parameters")?)
+                }
+                _ if arch == Arch::Inkling2 => bail!("an inkling2 config needs its `inkling` section"),
+                _ => None,
+            },
         };
         if cfg.layer_types.contains(&LayerKind::ShortConv) {
             if cfg.short_conv_kernel < 2 {
@@ -839,7 +916,8 @@ impl ModelConfig {
 
     /// Some layers keep a per-sequence recurrent state (GDN or short conv) instead of KV.
     pub fn is_hybrid(&self) -> bool {
-        self.layer_types.iter().any(|k| matches!(k, LayerKind::Linear | LayerKind::ShortConv))
+        self.inkling.is_some()
+            || self.layer_types.iter().any(|k| matches!(k, LayerKind::Linear | LayerKind::ShortConv))
     }
 
     pub fn names(&self) -> TensorNames {

@@ -52,13 +52,21 @@ pub enum GgmlType {
     Q8_0,
     Q4K,
     Q6K,
+    /// NVFP4 blocks of 64: four UE4M3 scales (one per 16 values) then 32 bytes of E2M1 codes
+    /// (byte `j` of a 16-value group holds values `j` and `j + 8`).
+    Nvfp4,
 }
 
+/// Weights per NVFP4 block.
+pub const QK_NVFP4: usize = 64;
+/// Bytes of an NVFP4 block.
+pub const NVFP4_BLOCK: usize = 36;
+
 /// GGUF architectures this loader serves.
-const ARCHS: &str = "qwen35, lfm2";
+const ARCHS: &str = "qwen35, lfm2, inkling2, inkling2_loop";
 
 fn check_arch(arch: &str) -> Result<()> {
-    if !matches!(arch, "qwen35" | "lfm2") {
+    if !matches!(arch, "qwen35" | "lfm2" | "inkling2" | "inkling2_loop") {
         bail!("GGUF architecture '{arch}' is not supported (supported: {ARCHS})");
     }
     Ok(())
@@ -73,6 +81,7 @@ impl GgmlType {
             8 => Self::Q8_0,
             12 => Self::Q4K,
             14 => Self::Q6K,
+            40 => Self::Nvfp4,
             _ => return None,
         })
     }
@@ -85,6 +94,7 @@ impl GgmlType {
             Self::Q8_0 => n / QK8_0 * Q8_0_BLOCK,
             Self::Q4K => n / QK_K * Q4K_BLOCK,
             Self::Q6K => n / QK_K * Q6K_FILE_BLOCK,
+            Self::Nvfp4 => n / QK_NVFP4 * NVFP4_BLOCK,
         }
     }
 }
@@ -309,7 +319,14 @@ pub fn model_config(file: &Path) -> Result<Value> {
         if vision["out_hidden_size"].as_u64() != hidden {
             bail!("projector {} outputs {} values per token, the model takes {:?}", mm.display(), vision["out_hidden_size"], hidden);
         }
-        let ids = ["<|image_pad|>", "<|vision_start|>", "<|vision_end|>"].map(|t| main.token_id(t));
+        // the image placeholder and the tokens around it: Inkling 2's template renders an image
+        // as <|content_image|><|unused_200054|><|end_message|>
+        let names = if vision["kind"] == "inkling2v" {
+            ["<|unused_200054|>", "<|content_image|>", "<|end_message|>"]
+        } else {
+            ["<|image_pad|>", "<|vision_start|>", "<|vision_end|>"]
+        };
+        let ids = names.map(|t| main.token_id(t));
         if let [Some(image), Some(start), Some(end)] = ids {
             v["vision_config"] = vision;
             v["image_token_id"] = json!(image);
@@ -361,7 +378,10 @@ fn hf_vision_name(name: &str) -> Option<String> {
 impl Gguf {
     /// A projector file's tower as an HF `vision_config` (`clip.*` metadata).
     pub fn vision_config(&self) -> Result<Value> {
-        let proj = self.meta.get("clip.projector_type").and_then(Meta::as_str).unwrap_or("");
+        let proj = self.projector_type();
+        if self.arch() == "clip" && proj == "inkling2v" {
+            return self.inkling_vision_config();
+        }
         if self.arch() != "clip" || proj != "qwen3vl_merger" {
             bail!("projector type '{proj}' (architecture '{}') is not supported (supported: qwen3vl_merger)", self.arch());
         }
@@ -386,6 +406,51 @@ impl Gguf {
             "image_mean": self.f32_list("clip.vision.image_mean"),
             "image_std": self.f32_list("clip.vision.image_std"),
         }))
+    }
+
+    /// A projector file's type (`clip.projector_type`, or `clip.vision.projector_type`).
+    pub fn projector_type(&self) -> &str {
+        self.meta
+            .get("clip.projector_type")
+            .or_else(|| self.meta.get("clip.vision.projector_type"))
+            .and_then(Meta::as_str)
+            .unwrap_or("")
+    }
+
+    /// Inkling 2's tower (`inkling2v`): a ViT with a CLS token, learned positions resized to the
+    /// image and 2D rope, then a 2x2 merge and a two-layer GELU projector.
+    fn inkling_vision_config(&self) -> Result<Value> {
+        let n = |k: &str| self.usize_key(&format!("vision.{k}"));
+        let table = self.tensors.get("v.position_embd.weight").context("no v.position_embd.weight")?;
+        for t in ["v.class_embd", "v.class_position_embd.weight", "v.pre_ln.weight", "mm.1.weight", "mm.2.weight"] {
+            if !self.tensors.contains_key(t) {
+                bail!("inkling2v projector: tensor '{t}' is missing");
+            }
+        }
+        Ok(json!({
+            "kind": "inkling2v",
+            "depth": n("block_count")?,
+            "hidden_size": n("embedding_length")?,
+            "num_heads": n("attention.head_count")?,
+            "intermediate_size": n("feed_forward_length")?,
+            "hidden_act": "gelu",
+            "in_channels": 3,
+            "patch_size": n("patch_size")?,
+            "temporal_patch_size": 1,
+            "spatial_merge_size": n("spatial_merge_size").unwrap_or(2),
+            "num_position_embeddings": table.shape[0],
+            "out_hidden_size": n("projection_dim")?,
+            "layer_norm_eps": self.meta.get("clip.vision.attention.layer_norm_epsilon").and_then(Meta::as_f64).unwrap_or(1e-5),
+            "image_mean": self.f32_list("clip.vision.image_mean"),
+            "image_std": self.f32_list("clip.vision.image_std"),
+        }))
+    }
+
+    /// An unquantized tensor as f32 on `device`, in torch dimension order.
+    pub fn f32_tensor(&self, name: &str, device: &Device) -> Result<Tensor> {
+        let info = self.tensors.get(name).with_context(|| format!("tensor '{name}' is missing"))?;
+        let data = plain_f32(self.bytes(info), info.ty).with_context(|| format!("tensor '{name}'"))?;
+        Ok(Tensor::from_vec(data, info.shape.as_slice(), &Device::Cpu)?.to_device(device)?)
     }
 
     fn f32_list(&self, key: &str) -> Vec<f64> {
@@ -434,7 +499,7 @@ impl Gguf {
         let mut tensors = HashMap::with_capacity(nt);
         for (name, shape, ty, off) in infos {
             let ty = GgmlType::from_id(ty).with_context(|| {
-                format!("tensor '{name}' has GGML type {ty}: only F32, F16, BF16, Q8_0, Q4_K and Q6_K are supported")
+                format!("tensor '{name}' has GGML type {ty}: only F32, F16, BF16, Q8_0, Q4_K, Q6_K and NVFP4 are supported")
             })?;
             let info = TensorInfo { shape, ty, offset: base + off };
             if info.offset + ty.bytes(info.elems()) > map.len() {
@@ -474,6 +539,9 @@ impl Gguf {
         check_arch(self.arch())?;
         if self.arch() == "lfm2" {
             return self.lfm2_config();
+        }
+        if self.arch().starts_with("inkling2") {
+            return self.inkling_config();
         }
         let hidden = self.usize_key("embedding_length")?;
         let heads = self.usize_key("attention.head_count")?;
@@ -587,6 +655,102 @@ impl Gguf {
         }))
     }
 
+    /// Inkling 2 (`inkling2`, `inkling2_loop`): everything but the plain sizes goes in the
+    /// `inkling` section (`config::InklingConfig`).
+    fn inkling_config(&self) -> Result<Value> {
+        let layers = self.usize_key("block_count")?;
+        let first = |k: &str| -> Result<usize> {
+            match self.key(k) {
+                Some(Meta::A(a)) => {
+                    let v: Vec<u64> = a.iter().filter_map(Meta::as_u64).collect();
+                    if v.iter().any(|&x| x != v[0]) {
+                        bail!("inkling2: per-layer '{k}' values that differ are not supported");
+                    }
+                    v.first().map(|&x| x as usize).context(k.to_string())
+                }
+                Some(m) => m.as_u64().map(|x| x as usize).context(k.to_string()),
+                None => bail!("GGUF metadata '{}.{k}' is missing", self.arch()),
+            }
+        };
+        let f = |k: &str| -> Result<f64> {
+            self.key(k).and_then(Meta::as_f64).with_context(|| format!("GGUF metadata '{}.{k}' is missing", self.arch()))
+        };
+        let swa: Vec<bool> = self
+            .key("attention.sliding_window_pattern")
+            .and_then(Meta::as_array)
+            .context("inkling2: attention.sliding_window_pattern")?
+            .iter()
+            .map(|m| matches!(m, Meta::B(true)) || m.as_u64().is_some_and(|x| x != 0))
+            .collect();
+        if swa.len() != layers {
+            bail!("inkling2: {} sliding-window flags for {layers} layers", swa.len());
+        }
+        let heads = first("attention.head_count")?;
+        let kv_heads = first("attention.head_count_kv")?;
+        let head_dim = self.usize_key("attention.key_length")?;
+        if self.usize_key("attention.value_length").unwrap_or(head_dim) != head_dim {
+            bail!("inkling2: key and value heads of different sizes are not supported");
+        }
+        let looped = self.arch() == "inkling2_loop";
+        let (start, end, count, rank) = if looped {
+            if matches!(self.key("loop.varying"), Some(Meta::B(true))) {
+                bail!("inkling2_loop: a varying loop count is not supported");
+            }
+            (self.usize_key("loop.start")?, self.usize_key("loop.end")?, self.usize_key("loop.count")?, self.usize_key("loop.gate_rank")?)
+        } else {
+            (0, 0, 1, 0)
+        };
+        let block = self.usize_key("attn_res.block_size")?;
+        if looped && (start == 0 || start >= end || end > layers || start % block != 0 || end % block != 0 || count < 2) {
+            bail!("inkling2_loop: invalid loop core {start}..{end} x{count} for {layers} layers, block {block}");
+        }
+        let vocab_padded = self.usize_key("vocab_size")?;
+        let vocab = self.usize_key("vocab_size_unpadded")?;
+        let tok = |k: &str| self.meta.get(&format!("tokenizer.ggml.{k}")).and_then(Meta::as_u64);
+        let ff = first("expert_feed_forward_length")?;
+        Ok(json!({
+            "model_type": self.arch(),
+            "hidden_size": self.usize_key("embedding_length")?,
+            // what one prefill token's MoE step holds per routed expert (gate | up)
+            "intermediate_size": 2 * ff,
+            "num_hidden_layers": layers,
+            "num_attention_heads": heads,
+            "num_key_value_heads": kv_heads,
+            "head_dim": head_dim,
+            "vocab_size": vocab,
+            "rms_norm_eps": self.key("attention.layer_norm_rms_epsilon").and_then(Meta::as_f64).unwrap_or(1e-6),
+            "max_position_embeddings": self.usize_key("context_length")?,
+            "tie_word_embeddings": false,
+            "eos_token_id": tok("eos_token_id"),
+            "bos_token_id": null,
+            "inkling": {
+                "layers": layers,
+                "loop_start": start,
+                "loop_end": end,
+                "loop_count": count,
+                "gate_rank": rank,
+                "swa": swa,
+                "window": self.usize_key("attention.sliding_window")?,
+                "n_rel": self.usize_key("attention.relative_length")?,
+                "rel_extent": self.usize_key("attention.relative_extent")?,
+                "qk_clip": f("attention.qk_clip")?,
+                "rel_clip": f("attention.relative_clip")?,
+                "log_floor": f("attention.log_scale_floor")?,
+                "log_alpha": f("attention.log_scale_alpha")?,
+                "block_size": block,
+                "num_experts": self.usize_key("expert_count")?,
+                "top_k": first("expert_used_count")?,
+                "expert_ff": ff,
+                "expert_weights_scale": self.key("expert_weights_scale").and_then(Meta::as_f64).unwrap_or(1.0),
+                "situ_beta": f("activation.situ_beta")?,
+                "situ_linear_beta": f("activation.situ_linear_beta")?,
+                "softcap": self.key("final_logit_softcapping").and_then(Meta::as_f64).unwrap_or(0.0),
+                "vocab_padded": vocab_padded,
+                "conv_kernel": self.usize_key("shortconv.l_cache")?,
+            },
+        }))
+    }
+
     fn token_id(&self, token: &str) -> Option<u64> {
         self.meta
             .get("tokenizer.ggml.tokens")?
@@ -634,8 +798,12 @@ impl Gguf {
             "qwen35" => (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+", true),
             "qwen2" => (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+", true),
             "lfm2" => (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+", false),
-            other => bail!("GGUF pre-tokenizer '{other}' is not supported (supported: qwen35, qwen2, lfm2)"),
+            // llama.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O (o200k), the regex of the HF tokenizer.json
+            "inkling2" | "gpt-4o" => (r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+", false),
+            other => bail!("GGUF pre-tokenizer '{other}' is not supported (supported: qwen35, qwen2, lfm2, inkling2, gpt-4o)"),
         };
+        // llama.cpp tokenizes `inkling2` words found whole in the vocabulary without merging
+        let ignore_merges = pre == "inkling2";
         let tokens = self
             .meta
             .get("tokenizer.ggml.tokens")
@@ -704,7 +872,7 @@ impl Gguf {
             "decoder": byte_level,
             "model": {
                 "type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": "",
-                "end_of_word_suffix": "", "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                "end_of_word_suffix": "", "fuse_unk": false, "byte_fallback": false, "ignore_merges": ignore_merges,
                 "vocab": vocab, "merges": merges,
             },
         }))
@@ -862,7 +1030,35 @@ fn dequant_rows(kind: KKind, data: &[u8], rows: usize, cols: usize, stride: usiz
 }
 
 /// Decode Q8_0 blocks (`src.len() / 34` of them) into `dst`.
-fn dequant_q8_0(src: &[u8], dst: &mut [f32]) {
+/// UE4M3 scale byte -> f32 (llama.cpp `ggml_ue4m3_to_fp32` without its 0.5, which goes with the
+/// doubled E2M1 table): plain E4M3 with the sign bit clear, 0x7F (NaN) read as 0.
+pub fn ue4m3(b: u8) -> f32 {
+    if b == 0 || b == 0x7F {
+        return 0.0;
+    }
+    let (e, m) = ((b >> 3) & 15, b & 7);
+    if e == 0 {
+        m as f32 * (2f32).powi(-9)
+    } else {
+        (1.0 + m as f32 / 8.0) * (2f32).powi(e as i32 - 7)
+    }
+}
+
+/// GGUF NVFP4 blocks -> f32 (per-tensor scales are applied by the caller).
+pub fn dequant_nvfp4(src: &[u8], dst: &mut [f32]) {
+    for (b, out) in src.chunks_exact(NVFP4_BLOCK).zip(dst.chunks_exact_mut(QK_NVFP4)) {
+        for s in 0..4 {
+            let d = ue4m3(b[s]);
+            for j in 0..8 {
+                let q = b[4 + s * 8 + j];
+                out[s * 16 + j] = crate::weights::E2M1[(q & 15) as usize] * d;
+                out[s * 16 + j + 8] = crate::weights::E2M1[(q >> 4) as usize] * d;
+            }
+        }
+    }
+}
+
+pub fn dequant_q8_0(src: &[u8], dst: &mut [f32]) {
     dst.par_chunks_mut(QK8_0).zip(src.par_chunks(Q8_0_BLOCK)).for_each(|(out, blk)| {
         let d = f16_at(blk, 0);
         for (o, &q) in out.iter_mut().zip(&blk[2..]) {
@@ -899,7 +1095,14 @@ impl GgufSource {
         let layers = gguf.usize_key("block_count")? - gguf.nextn_layers();
         let mut names = HashMap::with_capacity(gguf.tensors.len());
         for name in gguf.tensors.keys() {
-            let hf = if qwen35 { hf_name(name, layers) } else { hf_name_lfm2(name) };
+            // inkling2: the model loads its tensors under their GGUF names
+            let hf = if qwen35 {
+                hf_name(name, layers)
+            } else if gguf.arch().starts_with("inkling2") {
+                Some(name.clone())
+            } else {
+                hf_name_lfm2(name)
+            };
             match hf {
                 Some(hf) => {
                     names.insert(hf, name.clone());
@@ -912,6 +1115,10 @@ impl GgufSource {
                 let proj = Gguf::open(&mm)?;
                 let mut map = HashMap::with_capacity(proj.tensors.len());
                 for name in proj.tensors.keys() {
+                    // inkling2v: the tower reads the projector's tensors by their GGUF names
+                    if proj.projector_type() == "inkling2v" {
+                        continue;
+                    }
                     match hf_vision_name(name) {
                         Some(hf) => {
                             map.insert(hf, name.clone());
@@ -967,11 +1174,26 @@ fn plain_f32(bytes: &[u8], ty: GgmlType) -> Result<Vec<f32>> {
         GgmlType::F32 => bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
         GgmlType::F16 => bytes.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
         GgmlType::Bf16 => bytes.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
-        GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q6K => bail!("quantized projector tensors are not supported"),
+        GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q6K | GgmlType::Nvfp4 => bail!("quantized projector tensors are not supported"),
     })
 }
 
+impl GgufSource {
+    /// The parsed file (models that read GGUF tensors as stored).
+    pub fn file(&self) -> &Gguf {
+        &self.gguf
+    }
+}
+
 impl WeightSource for GgufSource {
+    fn gguf(&self) -> Option<&Gguf> {
+        Some(&self.gguf)
+    }
+
+    fn mmproj(&self) -> Option<&Gguf> {
+        self.vision.as_ref().map(|(g, _)| g)
+    }
+
     fn load_raw(&self, name: &str) -> Result<Tensor> {
         if name.starts_with("model.visual.") {
             return self.load_vision(name);
@@ -989,6 +1211,14 @@ impl WeightSource for GgufSource {
                 }
                 let mut out = vec![0f32; n];
                 dequant_q8_0(bytes, &mut out);
+                out
+            }
+            GgmlType::Nvfp4 => {
+                if n % QK_NVFP4 != 0 {
+                    bail!("NVFP4 tensor '{name}' has {n} elements, not a multiple of {QK_NVFP4}");
+                }
+                let mut out = vec![0f32; n];
+                dequant_nvfp4(bytes, &mut out);
                 out
             }
             GgmlType::Q4K | GgmlType::Q6K => {

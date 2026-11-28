@@ -18,7 +18,7 @@ pub mod responses;
 use crate::images::ImageSpan;
 use crate::sampling::SamplingParams;
 use crate::scheduler::{EngineHandle, Event, FinishReason, Usage};
-use crate::tokenizer::{DecodeStream, StopChecker, TokenizerBundle};
+use crate::tokenizer::{DecodeStream, MarkerRewrite, Marked, StopChecker, TokenizerBundle};
 use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
@@ -247,6 +247,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/generate", post(generate))
         .layer(axum::middleware::from_fn_with_state(state.clone(), gate))
         .layer(axum::middleware::from_fn_with_state(state.clone(), cors))
+        // long-context prompts (a 500k-token prompt is several MB of JSON) past axum's 2 MB default
+        .layer(axum::extract::DefaultBodyLimit::max(256 << 20))
         .with_state(state)
 }
 
@@ -501,6 +503,8 @@ pub struct Generation {
     id: u64,
     rx: mpsc::UnboundedReceiver<Event>,
     detok: DecodeStream,
+    /// Models whose turn structure is special tokens (Inkling 2): mapped to parser tags.
+    markers: Option<MarkerRewrite>,
     stop: StopChecker,
     matched: Option<String>,
     pending: VecDeque<Chunk>,
@@ -534,6 +538,7 @@ impl Generation {
         tag: ReqTag,
     ) -> Self {
         let prompt_len = prompt.len();
+        let markers = MarkerRewrite::for_vocab(&state.tok);
         let (id, rx) = state.engine.submit_with_images(prompt, images, params);
         state.metrics.start(id);
         Self {
@@ -541,6 +546,7 @@ impl Generation {
             id,
             rx,
             detok: DecodeStream::new(true),
+            markers,
             stop: StopChecker::new(stops),
             matched: None,
             pending: VecDeque::new(),
@@ -610,7 +616,12 @@ impl Generation {
                     if self.matched.is_some() {
                         continue;
                     }
-                    if let Some(delta) = self.detok.step(&self.state.tok, t) {
+                    let delta = match self.markers.as_mut().map(|m| m.token(t)) {
+                        Some(Marked::Marker(s)) => (!s.is_empty()).then(|| s.to_string()),
+                        Some(Marked::Text { emit: false }) => None,
+                        _ => self.detok.step(&self.state.tok, t),
+                    };
+                    if let Some(delta) = delta {
                         let (emit, matched) = self.stop.push(&delta);
                         if !emit.is_empty() {
                             self.pending.push_back(Chunk::Text(emit));

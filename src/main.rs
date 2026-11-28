@@ -180,9 +180,10 @@ struct EngineArgs {
     /// Dequantize block-FP8 experts to bf16 at load (default: keep them FP8, half the memory).
     #[arg(long)]
     dequant_fp8_experts: bool,
-    /// Max concurrently running requests.
-    #[arg(long, default_value_t = 16)]
-    max_running_requests: usize,
+    /// Max concurrently running requests (default 16; 4 for Inkling 2, whose per-request
+    /// sliding-window state is large).
+    #[arg(long)]
+    max_running_requests: Option<usize>,
     /// Hybrid (Qwen3.5/3.6) models: recurrent-state snapshots kept for prefix reuse
     /// (default: max running requests; 0 disables prefix caching for them).
     #[arg(long)]
@@ -210,8 +211,9 @@ struct EngineArgs {
     /// per vector: half the memory and attention traffic), `turbo4` (TurboQuant: randomly
     /// rotated vectors at 4 bits per value, a quarter of the memory) or `rotor4` (RotorQuant:
     /// the same with 3D block rotations; `planar4` / `iso4` use 2D / 4D blocks). The packed
-    /// formats need a single local GPU, sm_80+; all are lossy.
-    #[arg(long, default_value = "model")]
+    /// formats need a single local GPU, sm_80+; all are lossy. Default `auto`: `model`, except
+    /// `q8` for Inkling 2 (twice the context).
+    #[arg(long, default_value = "auto")]
     kv_dtype: String,
     /// Confidence a draft needs for the head to draft one more (`--mtp-drafts` above 2).
     #[arg(long, default_value_t = 0.6)]
@@ -292,7 +294,8 @@ impl EngineArgs {
             max_seq_len: self.max_seq_len,
             moe: self.moe_options()?,
             rpc_token: self.rpc_token.clone(),
-            max_running: self.max_running_requests.max(1),
+            max_running: self.max_running_requests.unwrap_or(16).max(1),
+            max_running_explicit: self.max_running_requests.is_some(),
             state_snapshots: self.state_snapshots,
             cuda_graphs: self.cuda_graphs,
             hf_overrides: self.hf_overrides()?,
@@ -302,6 +305,7 @@ impl EngineArgs {
             mtp_drafts: self.mtp_drafts,
             mtp_min_prob: self.mtp_min_prob,
             max_prefill_tokens: self.max_prefill_tokens.max(16),
+            kv_format_auto: self.kv_dtype == "auto",
             kv_format: carbon_engine::kvcache::KvFormat::parse(&self.kv_dtype)
                 .ok_or_else(|| anyhow::anyhow!("unknown --kv-dtype '{}' (model | q8 | turbo4 | rotor4 | planar4 | iso4)", self.kv_dtype))?,
             text_only: self.text_only,
@@ -330,7 +334,7 @@ impl EngineArgs {
         let handle = scheduler::spawn(
             engine,
             SchedulerConfig {
-                max_running: self.max_running_requests.max(1),
+                max_running: self.max_running_requests.unwrap_or(16).max(1),
                 max_prefill_tokens: self.max_prefill_tokens.max(16),
                 eos_token_ids: eos.clone(),
                 anchor_token,
@@ -914,7 +918,7 @@ fn shell(a: ShellArgs) -> Result<()> {
     let mut argv = vec!["carbon-shell".to_string()];
     argv.extend(a.serve_args);
     let mut sa = ServeOnly::try_parse_from(argv)?.serve;
-    sa.engine.max_running_requests = 1;
+    sa.engine.max_running_requests = Some(1);
     let state = build_state(sa)?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -949,12 +953,13 @@ fn build_state(mut a: ServeArgs) -> Result<Arc<AppState>> {
     )?);
     let reasoning = parser_flag(
         &a.reasoning_parser,
-        tok.token_id("<think>").is_some(),
+        // Inkling 2 marks reasoning with a special token (mapped to <think> on output)
+        tok.token_id("<think>").is_some() || tok.token_id("<|content_thinking|>").is_some(),
         "reasoning parser",
     )?;
     let tools = parser_flag(
         &a.tool_call_parser,
-        tok.token_id("<tool_call>").is_some(),
+        tok.token_id("<tool_call>").is_some() || tok.token_id("<|content_invoke_tool_json|>").is_some(),
         "tool-call parser",
     )?;
     let anchor = a

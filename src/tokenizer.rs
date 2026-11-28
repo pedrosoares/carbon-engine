@@ -94,23 +94,58 @@ fn py_tojson(
 ) -> Result<minijinja::Value, JinjaError> {
     let indent: Option<usize> = kwargs.get("indent")?;
     let _: Option<bool> = kwargs.get("ensure_ascii")?;
-    let _: Option<bool> = kwargs.get("sort_keys")?;
+    let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
+    // `separators=(item, key)` as in json.dumps
+    let seps: Option<minijinja::Value> = kwargs.get("separators")?;
     kwargs.assert_all_used()?;
-    let v = serde_json::to_value(&value)
+    let mut v = serde_json::to_value(&value)
         .map_err(|e| JinjaError::new(ErrorKind::InvalidOperation, e.to_string()))?;
+    if sort_keys == Some(true) {
+        sort_json_keys(&mut v);
+    }
+    let (item_sep, key_sep) = match &seps {
+        Some(s) => {
+            let parts: Vec<String> = s
+                .try_iter()
+                .map_err(|e| JinjaError::new(ErrorKind::InvalidOperation, e.to_string()))?
+                .map(|x| x.as_str().unwrap_or_default().to_string())
+                .collect();
+            match parts.as_slice() {
+                [a, b] => (a.clone(), b.clone()),
+                _ => return Err(JinjaError::new(ErrorKind::InvalidOperation, "tojson: separators must be a pair")),
+            }
+        }
+        None if indent.is_some() => (",".to_string(), ": ".to_string()),
+        None => (", ".to_string(), ": ".to_string()),
+    };
     let mut out = String::new();
-    py_json(&v, indent, 0, &mut out);
+    py_json(&v, indent, 0, &mut out, &item_sep, &key_sep);
     Ok(minijinja::Value::from_safe_string(out))
 }
 
-fn py_json(v: &Value, indent: Option<usize>, depth: usize, out: &mut String) {
+fn sort_json_keys(v: &mut Value) {
+    match v {
+        Value::Object(o) => {
+            let mut items: Vec<(String, Value)> = std::mem::take(o).into_iter().collect();
+            items.sort_by(|a, b| a.0.cmp(&b.0));
+            for (k, mut x) in items {
+                sort_json_keys(&mut x);
+                o.insert(k, x);
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(sort_json_keys),
+        _ => {}
+    }
+}
+
+fn py_json(v: &Value, indent: Option<usize>, depth: usize, out: &mut String, item_sep: &str, key_sep: &str) {
     let (open_nl, sep, close_nl) = match indent {
         Some(n) => (
             format!("\n{}", " ".repeat(n * (depth + 1))),
-            format!(",\n{}", " ".repeat(n * (depth + 1))),
+            format!("{item_sep}\n{}", " ".repeat(n * (depth + 1))),
             format!("\n{}", " ".repeat(n * depth)),
         ),
-        None => (String::new(), ", ".to_string(), String::new()),
+        None => (String::new(), item_sep.to_string(), String::new()),
     };
     match v {
         Value::Array(a) if !a.is_empty() => {
@@ -120,7 +155,7 @@ fn py_json(v: &Value, indent: Option<usize>, depth: usize, out: &mut String) {
                 if i > 0 {
                     out.push_str(&sep);
                 }
-                py_json(x, indent, depth + 1, out);
+                py_json(x, indent, depth + 1, out, item_sep, key_sep);
             }
             out.push_str(&close_nl);
             out.push(']');
@@ -133,8 +168,8 @@ fn py_json(v: &Value, indent: Option<usize>, depth: usize, out: &mut String) {
                     out.push_str(&sep);
                 }
                 out.push_str(&Value::String(k.clone()).to_string());
-                out.push_str(": ");
-                py_json(x, indent, depth + 1, out);
+                out.push_str(key_sep);
+                py_json(x, indent, depth + 1, out, item_sep, key_sep);
             }
             out.push_str(&close_nl);
             out.push('}');
@@ -461,5 +496,99 @@ mod tests {
     fn strftime_format() {
         let s = strftime_now("%d %b %Y".into());
         assert_eq!(s.len(), 11, "{s}");
+    }
+}
+
+/// Inkling 2 writes its turn structure with special tokens: `<|message_model|>` opens a segment,
+/// `<|content_thinking|>` / `<|content_text|>` / `<|content_invoke_tool_json|>` say what it holds
+/// (a tool segment's name sits between the two), `<|end_message|>` closes it. The detokenizer
+/// skips special tokens, so this maps them to the tags the output parsers read: reasoning
+/// becomes `<think>..</think>`, a tool call `<tool_call>{json}</tool_call>`, text stays as is.
+#[derive(Clone, Debug)]
+pub struct MarkerRewrite {
+    open: u32,
+    thinking: u32,
+    text: u32,
+    tool: u32,
+    end: u32,
+    seg: Segment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Segment {
+    Idle,
+    /// After `<|message_model|>`: a name may follow before the content marker.
+    Header,
+    Thinking,
+    Text,
+    Tool,
+}
+
+/// What [`MarkerRewrite::token`] makes of a token.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Marked {
+    /// An ordinary token: detokenize it (or drop it while in a segment header).
+    Text { emit: bool },
+    /// A marker: emit this text instead.
+    Marker(&'static str),
+}
+
+impl MarkerRewrite {
+    /// The rewriter for a vocabulary that has Inkling's markers.
+    pub fn for_vocab(tok: &TokenizerBundle) -> Option<Self> {
+        let id = |t: &str| tok.token_id(t);
+        Some(Self {
+            open: id("<|message_model|>")?,
+            thinking: id("<|content_thinking|>")?,
+            text: id("<|content_text|>")?,
+            tool: id("<|content_invoke_tool_json|>")?,
+            end: id("<|end_message|>")?,
+            seg: Segment::Idle,
+        })
+    }
+
+    pub fn token(&mut self, t: u32) -> Marked {
+        let (next, out) = if t == self.open {
+            (Segment::Header, "")
+        } else if t == self.thinking {
+            (Segment::Thinking, "<think>")
+        } else if t == self.text {
+            (Segment::Text, "")
+        } else if t == self.tool {
+            (Segment::Tool, "<tool_call>")
+        } else if t == self.end {
+            let close = match self.seg {
+                Segment::Thinking => "</think>",
+                Segment::Tool => "</tool_call>",
+                _ => "",
+            };
+            (Segment::Idle, close)
+        } else {
+            // the tool name of a segment header is repeated inside the call's JSON
+            return Marked::Text { emit: self.seg != Segment::Header };
+        };
+        self.seg = next;
+        Marked::Marker(out)
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    #[test]
+    fn segments_map_to_parser_tags() {
+        let mut m = MarkerRewrite { open: 1, thinking: 2, text: 3, tool: 4, end: 5, seg: Segment::Idle };
+        let seq = [1, 2, 100, 5, 1, 3, 101, 5, 1, 102, 4, 103, 5];
+        let out: Vec<Marked> = seq.iter().map(|&t| m.token(t)).collect();
+        use Marked::*;
+        assert_eq!(
+            out,
+            vec![
+                Marker(""), Marker("<think>"), Text { emit: true }, Marker("</think>"),
+                Marker(""), Marker(""), Text { emit: true }, Marker(""),
+                Marker(""), Text { emit: false }, Marker("<tool_call>"), Text { emit: true }, Marker("</tool_call>"),
+            ]
+        );
     }
 }

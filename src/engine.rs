@@ -17,6 +17,18 @@ use candle_core::{DType, Tensor};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Inkling 2's default for `--max-running-requests`.
+const INKLING_DEFAULT_RUNNING: usize = 4;
+
+/// An image encoder.
+enum Vision {
+    /// The Qwen3.5 / 3.6 / 3.8 ViT.
+    Qwen(crate::model::vision::VisionTower),
+    /// Inkling 2's (`inkling2v` projector file).
+    #[cfg(feature = "cuda")]
+    Inkling(crate::model::inkling_vision::InklingVision),
+}
+
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub model_dir: PathBuf,
@@ -38,6 +50,8 @@ pub struct EngineConfig {
     pub rpc_token: Option<String>,
     /// Max concurrent sequences; sizes the recurrent-state pools of hybrid models.
     pub max_running: usize,
+    /// `max_running` was asked for (else a model may lower the default).
+    pub max_running_explicit: bool,
     /// Recurrent-state snapshots kept for prefix reuse on hybrid models (None = max_running).
     pub state_snapshots: Option<usize>,
     /// Replay single-GPU decode steps as CUDA graphs (local stages).
@@ -57,6 +71,8 @@ pub struct EngineConfig {
     pub mtp_min_prob: f32,
     /// Format of the KV pools on CUDA devices (`--kv-dtype`).
     pub kv_format: crate::kvcache::KvFormat,
+    /// `--kv-dtype auto`: a model may pick the format (Inkling 2: q8).
+    pub kv_format_auto: bool,
     /// Prefill chunk size the scheduler will use (sizes the activation reserve on GPUs).
     pub max_prefill_tokens: usize,
     /// Skip the checkpoint's vision tower (no image input, its VRAM left to the caches).
@@ -78,6 +94,7 @@ impl EngineConfig {
             moe: MoeOptions::default(),
             rpc_token: None,
             max_running: 16,
+            max_running_explicit: false,
             state_snapshots: None,
             cuda_graphs: false,
             hf_overrides: None,
@@ -87,6 +104,7 @@ impl EngineConfig {
             mtp_drafts: 1,
             mtp_min_prob: 0.6,
             kv_format: Default::default(),
+            kv_format_auto: false,
             max_prefill_tokens: crate::device::BASE_PREFILL_TOKENS,
             text_only: false,
         }
@@ -129,7 +147,7 @@ pub struct Engine {
     #[doc(hidden)]
     pub mtp_oracle: Option<MtpOracle>,
     /// The vision tower (image input), on the head device.
-    vision: Option<crate::model::vision::VisionTower>,
+    vision: Option<Vision>,
     /// Preprocessing for the tower's input (`preprocessor_config.json`).
     pub image_processor: Option<crate::images::ImageProcessor>,
     /// Qwen3.8 PLE: a thread that reads prompts' n-gram table rows from disk ahead of prefill.
@@ -179,6 +197,9 @@ impl Engine {
         let extended = cfg.rope_scaling.as_ref().and_then(|r| r.extended_context());
         let max_seq_len = if ec.max_seq_len > 0 {
             ec.max_seq_len
+        } else if cfg.inkling.is_some() {
+            // sized from the KV cache below (as long as the checkpoint allows)
+            cfg.max_position_embeddings
         } else if let Some(n) = extended {
             n
         } else {
@@ -190,7 +211,14 @@ impl Engine {
                 tracing::warn!("--max-seq-len {max_seq_len} is past the scaled rope context {n}");
             }
         }
-        let live_states = ec.max_running.max(1);
+        // Inkling 2 keeps ~170 MB of sliding-window and conv state per sequence: a smaller default
+        // leaves that memory to the KV cache (the long context)
+        let live_states = if cfg.inkling.is_some() && !ec.max_running_explicit {
+            tracing::info!("inkling2: up to {INKLING_DEFAULT_RUNNING} running requests (--max-running-requests raises it)");
+            ec.max_running.min(INKLING_DEFAULT_RUNNING).max(1)
+        } else {
+            ec.max_running.max(1)
+        };
         let snapshots = if cfg.is_hybrid() {
             ec.state_snapshots.unwrap_or(live_states)
         } else {
@@ -202,7 +230,13 @@ impl Engine {
             && ec.tp_size == 1
             && ec.rpc_workers.is_empty()
             && ec.devices[0].starts_with("cuda");
-        crate::kvcache::set_kv_format(ec.kv_format);
+        let kv_format = if cfg.inkling.is_some() && ec.kv_format_auto {
+            tracing::info!("inkling2: int8 KV cache (--kv-dtype model keeps bf16, half the context)");
+            crate::kvcache::KvFormat::Q8
+        } else {
+            ec.kv_format
+        };
+        crate::kvcache::set_kv_format(kv_format);
         crate::device::set_prefill_workspace(
             ec.max_prefill_tokens,
             crate::device::prefill_bytes_per_token(cfg.intermediate_size, ec.dtype.unwrap_or(DType::BF16)),
@@ -251,13 +285,18 @@ impl Engine {
         )?;
         // before the stages, so their memory sizing sees them
         let (vision, image_processor) = match (&cfg.vision, ec.text_only) {
+            #[cfg(feature = "cuda")]
+            (Some(vc), false) if vc.is_inkling() && src.mmproj().is_some() => {
+                let tower = crate::model::inkling_vision::InklingVision::load(src.mmproj().unwrap(), vc, &head_dev)?;
+                (Some(Vision::Inkling(tower)), Some(crate::images::ImageProcessor::load(&ec.model_dir, vc)))
+            }
             (Some(vc), false) if src.contains("model.visual.patch_embed.proj.weight") => {
                 let tower = crate::model::vision::VisionTower::load(
                     &*src,
                     vc,
                     &Placement::single(head_dev.clone(), head_dtype),
                 )?;
-                (Some(tower), Some(crate::images::ImageProcessor::load(&ec.model_dir, vc)))
+                (Some(Vision::Qwen(tower)), Some(crate::images::ImageProcessor::load(&ec.model_dir, vc)))
             }
             _ => (None, None),
         };
@@ -341,6 +380,12 @@ impl Engine {
         for s in &stages {
             s.alloc_kv(num_slots, num_states)?;
         }
+        // Inkling 2 without --max-seq-len: the longest context the KV cache holds
+        let max_seq_len = if cfg.inkling.is_some() && ec.max_seq_len == 0 {
+            num_slots.min(max_seq_len)
+        } else {
+            max_seq_len
+        };
         #[cfg(feature = "cuda")]
         if let (Some(m), Some(bank), Some(moe), false) = (
             mtp.as_mut(),
@@ -461,11 +506,27 @@ impl Engine {
     pub fn encode_image(&self, img: &crate::images::PreparedImage) -> Result<Tensor> {
         let tower = self.vision.as_ref().context("this server has no vision tower")?;
         let n = img.grid.0 * img.grid.1 * img.grid.2;
-        let pixels = Tensor::from_slice(&img.pixels, (n, img.pixels.len() / n.max(1)), &tower.device)?;
         let t0 = std::time::Instant::now();
-        let out = tower.forward(&pixels, img.grid)?.to_device(&self.head.device)?.to_dtype(self.dtype)?;
+        let out = match tower {
+            Vision::Qwen(tower) => {
+                let pixels = Tensor::from_slice(&img.pixels, (n, img.pixels.len() / n.max(1)), &tower.device)?;
+                tower.forward(&pixels, img.grid)?.to_device(&self.head.device)?.to_dtype(self.dtype)?
+            }
+            #[cfg(feature = "cuda")]
+            Vision::Inkling(tower) => {
+                // f32: the Inkling stack runs in f32 and takes the rows as they are
+                let pixels = Tensor::from_slice(&img.pixels, (n, img.pixels.len() / n.max(1)), &tower.device)?;
+                tower.forward(&pixels, img.grid)?.to_device(&self.head.device)?
+            }
+        };
         // (the copy back makes the timing include the tower's queued work)
         let tokens = out.dim(0)?;
+        // debugging: the encoder output as raw little-endian f32 rows
+        if let Ok(path) = std::env::var("CARBON_DUMP_IMAGE_FEATURES") {
+            let v = out.to_dtype(candle_core::DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(&path, bytes).with_context(|| format!("writing {path}"))?;
+        }
         out.narrow(0, 0, 1)?.to_dtype(candle_core::DType::F32)?.to_vec2::<f32>()?;
         tracing::info!("image encoded: {tokens} tokens ({:?} patches) in {:.0} ms", img.grid, t0.elapsed().as_secs_f64() * 1e3);
         Ok(out)
